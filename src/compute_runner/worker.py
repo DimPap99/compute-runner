@@ -214,8 +214,10 @@ class Worker:
             new_state = "needs_attention" if expired and (uncertain or missing) else job.state
             if uncertain:
                 attempt.state = "uncertain"
+            # expected: an operator may have resolved or cancelled the job during the remote call.
             self.store.update(
                 job.id,
+                expected={job.state},
                 state=new_state,
                 attempts=job.attempts,
                 error=safe_message(error),
@@ -230,6 +232,7 @@ class Worker:
         if state is None:
             self.store.update(
                 job.id,
+                expected={job.state},
                 remote_state=status.get("detail"),
                 last_polled_at=now,
                 state="needs_attention"
@@ -254,7 +257,7 @@ class Worker:
         if state in TERMINAL:
             changes["finished_at"] = now
             self.discovery[attempt.account].runs.pop(attempt.ref.lower(), None)
-        self.store.update(job.id, **changes)
+        self.store.update(job.id, expected={job.state}, **changes)
 
     def _refresh_inventory(self, account):
         found = self.discovery[account]
@@ -555,7 +558,8 @@ class Worker:
         """Another configured account that can read a dataset: (account, pinned ref), or None.
 
         An account that could not be asked for a passing reason makes "None" uncertain, so that
-        raises a transient error instead; one with definitive errors, such as bad keys, cannot read.
+        raises a transient error instead. One with definitive errors, or with credentials that do
+        not work (missing, or for another user), cannot read it.
         """
         unanswered = None
         for account in self.config.accounts:
@@ -564,7 +568,7 @@ class Worker:
             try:
                 pinned = self.provider(account.id).resolve_dataset(ref)
             except RemoteError as error:
-                if not error.definitive:
+                if not error.definitive and error.kind != "auth":
                     unanswered = unanswered or (account.id, error)
                 continue
             except ValueError:

@@ -4,6 +4,7 @@ import pytest
 
 from compute_runner import Account, JobSpec
 from compute_runner.providers import RemoteError
+from compute_runner.worker import outstanding
 from conftest import due
 
 
@@ -329,3 +330,41 @@ def test_unresolvable_auth_error_becomes_attention(setup):
     worker.tick()
     assert client.get(job.id).state == "needs_attention"
     assert len(backend.pushes) == 1
+
+
+def _accepted_run_disappears(client, backend, spec):
+    job = client.submit(spec)
+    client.worker().tick()
+    job = client.get(job.id)
+    del backend.remote[job.remote_ref]
+    job.attempts[-1].started_at -= 60  # Past the reconciliation window.
+    client.store.update(job.id, attempts=job.attempts, next_action_at=0)
+    return job
+
+
+def test_a_deleted_run_can_be_resolved_and_frees_its_slot(setup):
+    client, backend, spec = setup
+    job = _accepted_run_disappears(client, backend, spec)
+    client.worker().tick()
+    assert client.get(job.id).state == "needs_attention"
+    resolved = client.resolve_not_submitted(job.id)
+    assert resolved.state == "blocked" and not outstanding(resolved)
+    retried = client.retry(job.id)
+    client.worker().tick()
+    assert client.get(retried.id).state == "remote_queued"
+
+
+def test_polling_does_not_undo_a_resolution_made_during_the_remote_call(setup):
+    client, backend, spec = setup
+    job = _accepted_run_disappears(client, backend, spec)
+    client.worker().tick()
+    client.store.update(job.id, next_action_at=0)
+    missing = backend.status
+
+    def resolved_meanwhile(ref):
+        client.resolve_not_submitted(job.id)
+        return missing(ref)
+
+    backend.status = resolved_meanwhile
+    client.worker().tick()
+    assert client.get(job.id).state == "blocked"

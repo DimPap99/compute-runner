@@ -326,11 +326,12 @@ class Client:
     def resolve_not_submitted(self, job_id):
         """Operator assertion after independently confirming no remote execution exists.
 
-        Does not submit a replacement. Use retry() after this explicit resolution.
+        Covers an uncertain submission, and an accepted run the provider no longer knows, such as
+        a deleted notebook. Does not submit a replacement. Use retry() after this explicit resolution.
         """
         job = self.get(job_id)
-        if job.state != "needs_attention" or not job.attempts or job.attempts[-1].state == "accepted":
-            raise ValueError("Only an unresolved, unaccepted attempt can be marked not submitted")
+        if job.state != "needs_attention" or not job.attempts:
+            raise ValueError("Only a job that needs attention can be marked not submitted")
         job.attempts[-1].state = "rejected"
         job.attempts[-1].error = "Operator confirmed that no remote execution exists"
         return self.store.update(

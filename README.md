@@ -288,7 +288,7 @@ print(finished.state, finished.download_state, finished.result_dir)
 | `continue_batch(job_id, request_key=None, account=None)` | Create a continuation and return its single-job batch |
 | `move(job_id, account, transfer=False)` | Place a job that has not been submitted on another account; `transfer` allows copying datasets it cannot read |
 | `cancel(job_id)` | Cancel pending work locally, or ask the provider to stop a running job |
-| `resolve_not_submitted(job_id)` | Record an operator's confirmation that an unresolved attempt created no remote execution |
+| `resolve_not_submitted(job_id)` | Record an operator's confirmation that a job needing attention has no remote execution |
 | `quota(account=None)` | Query one account's accelerator quota, or every account's |
 | `provider(account=None)` | Return the provider adapter for an account |
 | `worker_health()` | Read worker lock ownership and heartbeat data |
@@ -549,7 +549,7 @@ Each attempt records its notebook slug before the remote request. The worker cre
 
 `retry` accepts a terminal or blocked job when no execution remains outstanding. It uses saved snapshots. Submit a new workload to change the code or settings.
 
-For an unresolved submission, inspect its URL first. If no remote execution exists, record that confirmation before retrying:
+For an unresolved submission, or a run the provider no longer knows (for example, a deleted notebook), inspect its URL first. If no remote execution exists, record that confirmation before retrying:
 
 ```bash
 compute-runner resolve JOB_ID --not-submitted

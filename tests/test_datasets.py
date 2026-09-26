@@ -118,6 +118,18 @@ def test_an_account_that_could_not_be_asked_keeps_the_job_retrying(two_accounts)
     assert client.get(job.id).state == "blocked"
 
 
+@pytest.mark.parametrize("definitive", [True, False])
+def test_an_account_whose_credentials_do_not_work_cannot_read(two_accounts, definitive):
+    # Local failures (a missing credentials file, keys for another user) are not definitive.
+    client, home, other, spec = two_accounts
+    home.unreadable = {"nobody/data"}
+    other.resolve_dataset = failing(RemoteError("authentication unavailable", "auth", definitive=definitive))
+    job = client.submit(spec.model_copy(update={"inputs": {"data": Path("kaggle:nobody/data")}}))
+    client.worker().tick()
+    job = client.get(job.id)
+    assert job.state == "blocked" and "No connected account can find" in job.error
+
+
 def test_unaliased_datasets_are_never_copied(two_accounts):
     client, home, other, spec = two_accounts
     client.config.transfer = True
