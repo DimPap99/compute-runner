@@ -57,9 +57,15 @@ class TimeoutAdapter(HTTPAdapter):
         return super().send(request, **kwargs)
 
 
+def _quiet():
+    """Kaggle's client prints setup help and banners to stdout, which carries the CLI's JSON."""
+    return contextlib.redirect_stdout(io.StringIO())
+
+
 def _api_class(credentials: Path | None):
     # Kaggle's package authenticates eagerly on import. Keep it out of public model/API imports.
-    from kaggle.api.kaggle_api_extended import AuthMethod, KaggleApi
+    with _quiet():
+        from kaggle.api.kaggle_api_extended import AuthMethod, KaggleApi
 
     class BoundedApi(KaggleApi):
         def build_kaggle_client(self):
@@ -124,7 +130,8 @@ class KaggleProvider:
         if self._api is None:
             try:
                 api = _api_class(self.account.credentials)()
-                api.authenticate()
+                with _quiet():
+                    api.authenticate()
             except (SystemExit, Exception) as error:
                 raise RemoteError(
                     f"Kaggle authentication unavailable for {self.account.id}; configure its credentials",
@@ -190,8 +197,8 @@ class KaggleProvider:
 
     def fetch_dataset(self, ref, destination: Path):
         try:
-            # The client prints the dataset's URL even when quiet; keep it out of the worker's output.
-            with contextlib.redirect_stdout(io.StringIO()):
+            # The client prints the dataset's URL even when quiet.
+            with _quiet():
                 self.api.dataset_download_files(ref, path=str(destination), quiet=True, unzip=True)
         except Exception as error:
             raise remote_error(error) from error

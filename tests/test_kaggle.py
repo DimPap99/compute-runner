@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace as Obj
 
@@ -406,3 +409,18 @@ def test_dataset_copies_keep_the_clients_url_banner_out_of_stdout(tmp_path, caps
     backend._api = Obj(dataset_download_files=download)
     backend.fetch_dataset("owner/data/1", tmp_path)
     assert (tmp_path / "rows.csv").is_file() and capsys.readouterr().out == ""
+
+
+def test_importing_and_authenticating_kaggle_prints_nothing_to_stdout(tmp_path):
+    # Without default credentials Kaggle's package prints setup help on import, which used to
+    # precede the JSON of every command; accounts configured by credentials file hit this.
+    code = (
+        "from compute_runner import Account\n"
+        "from compute_runner.providers.kaggle import KaggleProvider\n"
+        f"KaggleProvider(Account(user='x', credentials={str(tmp_path / 'token')!r}), None).api\n"
+    )
+    (tmp_path / "token").write_text('{"username": "x", "key": "local-only"}')
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KAGGLE")} | {"HOME": str(tmp_path)}
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""

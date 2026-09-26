@@ -82,9 +82,14 @@ def _unpack(archive_path, digest, target):
     return target
 
 
+def _mounts(ref, input_root):
+    """Where Kaggle may have mounted a dataset. It lowercases the path, whatever the reference's casing."""
+    owner, slug = ref.lower().split("/")[:2]
+    return [input_root / "datasets" / owner / slug, input_root / slug]
+
+
 def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
-    owner, slug = ref.split("/")[:2]
-    roots = [input_root / slug, input_root / "datasets" / owner / slug]
+    roots = _mounts(ref, input_root)
     candidates = []
     for root in roots:
         if not root.is_dir():
@@ -110,8 +115,7 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
 
 def _find_dataset(ref, *, input_root=Path("/kaggle/input")):
     """Where Kaggle mounted an attached dataset, under either of its mount conventions."""
-    owner, slug = ref.split("/")[:2]
-    for root in (input_root / "datasets" / owner / slug, input_root / slug):
+    for root in _mounts(ref, input_root):
         if root.is_dir():
             return root
     raise FileNotFoundError(f"Dataset {ref} is not attached; this account may not be able to read it")

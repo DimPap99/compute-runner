@@ -218,3 +218,25 @@ def test_kaggle_checks_access_even_for_pinned_datasets(tmp_path):
     with pytest.raises(RemoteError) as error:
         backend.resolve_dataset("down/data")
     assert error.value.kind == "transient"
+
+
+def test_mounts_are_found_whatever_the_owners_casing(tmp_path):
+    # Kaggle mounts /kaggle/input/datasets/OWNER/SLUG in lowercase; account names keep their casing.
+    import zipfile
+
+    from compute_runner.bundle import snapshot_bundle
+    from compute_runner.runtime import _find_bundle, _find_dataset
+
+    inputs = tmp_path / "input"
+    mount = inputs / "datasets/dimpap99/data"
+    mount.mkdir(parents=True)
+    assert _find_dataset("DimPap99/Data/3", input_root=inputs) == mount
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/train.py").write_text("print(1)\n")
+    bundle = snapshot_bundle(tmp_path / "src", ["train.py"], tmp_path / "bundles")
+    unzipped = inputs / f"datasets/dimpap99/kgr-b-{bundle['digest'][:40]}"
+    with zipfile.ZipFile(tmp_path / "bundles" / bundle["digest"] / "payload.zip") as archive:
+        archive.extractall(unzipped)
+    kind, location, _ = _find_bundle(f"DimPap99/kgr-b-{bundle['digest'][:40]}/1", bundle["digest"], input_root=inputs)
+    assert (kind, location) == ("directory", unzipped)
