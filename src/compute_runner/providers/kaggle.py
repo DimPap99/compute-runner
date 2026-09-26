@@ -224,8 +224,11 @@ class KaggleProvider:
         except Exception as error:
             converted = remote_error(error)
             if converted.kind == "auth":
-                if http_code(error) != 403 or self._owned_dataset_exists(ref):
+                if http_code(error) != 403:
                     raise converted from error
+                if self._owned_dataset_exists(ref):
+                    # Ours: Kaggle answers 403 while a new dataset is still processing.
+                    return None
             elif converted.kind != "missing":
                 raise converted from error
             folder = self.state_dir / "uploads" / digest

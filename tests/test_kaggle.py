@@ -285,7 +285,8 @@ def test_dataset_missing_403_reconciles_owned_inventory(tmp_path):
     assert len(creates) == 1 and creates[0]["public"] is False
 
 
-def test_existing_dataset_403_does_not_trigger_creation(tmp_path):
+def test_existing_dataset_403_waits_without_creating_another(tmp_path):
+    # Seen live: a dataset created moments ago answers 403 while Kaggle processes it.
     digest = "b" * 64
     response = requests.Response()
     response.status_code = 403
@@ -295,12 +296,11 @@ def test_existing_dataset_403_does_not_trigger_creation(tmp_path):
         raise requests.HTTPError("Permission denied", response=response)
 
     backend = KaggleProvider(Account(user="tester"), tmp_path)
+    # No dataset_create_new: creating would fail the test.
     backend._api = Obj(
         dataset_status=forbidden, dataset_list=lambda **k: [Obj(ref=f"tester/kgr-b-{digest[:40]}")]
     )
-    with pytest.raises(RemoteError) as error:
-        backend.ensure_bundle({"digest": digest})
-    assert error.value.kind == "auth"
+    assert backend.ensure_bundle({"digest": digest}) is None
 
 
 def test_dataset_inventory_failure_after_403_stays_retryable(tmp_path):
