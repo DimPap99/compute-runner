@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 PENDING = {"queued", "preparing"}
 # Jobs without a possible remote run; they can change account.
 MOVABLE = {"queued", "preparing", "blocked"}
+# How each provider's dataset references look, for errors that ask the user to check one.
+REFERENCE_FORMS = {"kaggle": "OWNER/SLUG or OWNER/SLUG/VERSION", "ssh": "MACHINE:/ABSOLUTE/PATH on that machine"}
 # Why preparation blocked a job, by error kind; the job's error has the details.
 BLOCKED_REASONS = {
     "access": "Move the job or allow copying its dataset; see error",
@@ -297,7 +299,8 @@ class Worker:
             return f"Run discovery on {account} unavailable; waiting before new launches"
         if self._full(account, pool, reserve=reserve):
             return waiting_for_capacity(account, pool)
-        if pool == "gpu" and found.gpu_seconds <= 0:
+        # None: the account has no GPU time limit.
+        if pool == "gpu" and found.gpu_seconds is not None and found.gpu_seconds <= 0:
             return f"Waiting for available GPU quota on {account}"
         return None
 
@@ -528,8 +531,9 @@ class Worker:
             if reader is None:
                 raise RemoteError(
                     f"No connected account can find dataset {ref}. Check the reference "
-                    "(OWNER/SLUG or OWNER/SLUG/VERSION) and that one of the accounts may read it; "
-                    "then submit the corrected workload, or retry this job if only access changed",
+                    f"({REFERENCE_FORMS.get(dataset_provider, 'as the provider names it')}) and that one "
+                    "of the accounts may read it; then submit the corrected workload, or retry this job "
+                    "if only access changed",
                     "dataset",
                     definitive=True,
                 )
@@ -623,7 +627,8 @@ class Worker:
             attempt.error = safe_message(error)
             attempt.state = "rejected" if error.definitive else "uncertain"
             job.attempts[-1] = attempt
-            retryable = error.kind in {"capacity", "quota", "rate_limit"}
+            # transient: a definitive failure that says nothing about the launch, such as a lost upload.
+            retryable = error.kind in {"capacity", "quota", "rate_limit", "transient"}
             state = ("queued" if retryable else "blocked") if error.definitive else "submitting"
             self.store.update(
                 job.id,

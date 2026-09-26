@@ -1,11 +1,11 @@
 ---
 name: compute-runner
-description: "Submit and monitor workloads with the local Compute Runner queue on the user's connected provider accounts (Kaggle today). Use for running Python scripts, notebooks, or project folders on remote CPU or GPU, choosing or switching accounts, checking batches, retrieving outputs and logs, resumable training with checkpoints, and diagnosing failed jobs."
+description: "Submit and monitor workloads with the local Compute Runner queue on the user's connected accounts: Kaggle accounts and SSH machines. Use for running Python scripts, notebooks, or project folders on remote CPU or GPU, choosing or switching accounts, checking batches, retrieving outputs and logs, resumable training with checkpoints, and diagnosing failed jobs."
 ---
 
 # Compute Runner
 
-Jobs run on provider accounts the user has connected, such as `kaggle:alice`. Kaggle is the only provider today; the user may have several Kaggle accounts.
+Jobs run on accounts the user has connected: Kaggle accounts such as `kaggle:alice`, and machines reached over SSH such as `ssh:lab`. Commands and responses are the same on both. `compute-runner agent accounts` lists them. On an SSH account, set `internet: true` (the machine cannot block network access, and a job without it is refused), use `gpu: true` without an accelerator ID, and give data already on the machine as `inputs: {data: "ssh:/path/on/machine"}` instead of uploading it; submission records it as `ssh:NAME:/path`, and a job elsewhere uses it only as a copy the user approves.
 
 Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent status`, which lists the newest jobs first.
 

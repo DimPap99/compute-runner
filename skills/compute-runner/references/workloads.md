@@ -33,18 +33,19 @@ Put the settings that distinguish runs in `params`, not in `args`. Each paramete
 
 ## Inputs
 
-Every input has an alias, and the workload reads it from `os.environ["KGR_INPUT_<ALIAS>"]` (for `data`, `KGR_INPUT_DATA`), or all of them from `KGR_INPUTS_JSON`. Never hardcode provider paths such as `/kaggle/input`. An input is one of:
+Every input has an alias, and the workload reads it from `os.environ["KGR_INPUT_<ALIAS>"]` (for `data`, `KGR_INPUT_DATA`), or all of them from `KGR_INPUTS_JSON`. Never hardcode provider paths such as `/kaggle/input` or a machine's folders. An input is one of:
 
 - A local file or folder. It becomes a private dataset of the job's account; identical snapshots reuse uploads.
 - `"kaggle:OWNER/SLUG[/VERSION]"`: an existing dataset, attached directly when the job's account can read it. If it cannot, and another connected account can, the queue copies it only when the user allowed copies (see the skill's Accounts section). If no connected account can find it, the job is blocked before it runs.
+- `"ssh:/ABSOLUTE/PATH"`: a file or folder already on the job's SSH machine, used where it is without an upload. Submission records the machine (`ssh:NAME:/ABSOLUTE/PATH`); a job on another account names it that way and uses the data only as a copy, which needs the user's approval like a dataset copy.
 - `"job:JOB_ID[/PATH]"`: files a finished job wrote to `KGR_OUTPUT_DIR`, after its downloads completed. Use this to chain runs, instead of writing a results path.
 
 Quote references in YAML. The older `datasets: [OWNER/SLUG/VERSION]` list still attaches datasets without an alias; they cannot be copied to another account, so prefer aliased inputs.
 
 ## Other fields
 
-Optional fields: `accelerator: NvidiaTeslaT4`, `env: {SEED: "42"}`, `requirements: requirements.txt` (requires internet), `exclude: [checkpoints/]`, `auto_download: true`, `output_patterns: ["outputs/*.json"]`. Leave GPU accelerator unspecified unless a particular accelerator is needed. `accelerator`, dataset references, and the timeout limit are provider-specific and are checked against the job's account at submission; on Kaggle the timeout is 1–43200 seconds. The account is chosen with `--account`, not in YAML.
+Optional fields: `accelerator: NvidiaTeslaT4`, `env: {SEED: "42"}`, `requirements: requirements.txt` (requires internet), `exclude: [checkpoints/]`, `auto_download: true`, `output_patterns: ["outputs/*.json"]`. Leave GPU accelerator unspecified unless a particular accelerator is needed. `accelerator`, dataset references, and the timeout limit are provider-specific and are checked against the job's account at submission; on Kaggle the timeout is 1–43200 seconds. SSH machines take no accelerator ID, require `internet: true`, and run notebooks only when the machine has `nbconvert`. The account is chosen with `--account`, not in YAML.
 
-The runner excludes credential filenames, virtual environments, caches, and Git metadata. The source folder respects its `.gitignore`, `.kgrignore`, and `exclude`; input folders respect only `.kgrignore`. It does not detect secrets embedded in ordinary code. `env` is persisted configuration, so use it for nonsecret values only. No local environment or virtual environment is automatically forwarded. Runtime output goes in `os.environ["KGR_OUTPUT_DIR"]`. CPU code can also use Kaggle's preinstalled libraries without internet.
+The runner excludes credential filenames, virtual environments, caches, and Git metadata. The source folder respects its `.gitignore`, `.kgrignore`, and `exclude`; input folders respect only `.kgrignore`. It does not detect secrets embedded in ordinary code. `env` is persisted configuration, so use it for nonsecret values only. No local environment or virtual environment is automatically forwarded. Runtime output goes in `os.environ["KGR_OUTPUT_DIR"]`. CPU code can also use Kaggle's preinstalled libraries without internet; on an SSH machine, packages installed in its Python are available, and `requirements` installs into a virtual environment of the run.
 
 The ordinary CLI and Python API retain full records for deeper diagnostics. Read `~/compute-runner/README.md` only for details outside this reference.

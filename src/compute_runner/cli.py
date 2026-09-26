@@ -19,7 +19,7 @@ from .agent import ERRORS
 from .agent_cli import agent_app
 from .client import Client
 from .models import Account, Config
-from .providers import safe_message
+from .providers import connect, safe_message
 from .security import redacted_env_record
 from .store import atomic_json, config_path, load_config
 from .workloads import workload_specs
@@ -27,8 +27,8 @@ from . import service
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Queue, run and monitor compute workloads on your provider accounts. Kaggle is the only provider "
-    "adapter today. LLM agents should use the bounded 'agent' commands.",
+    help="Queue, run and monitor compute workloads on your Kaggle accounts and SSH machines. "
+    "LLM agents should use the bounded 'agent' commands.",
 )
 worker_app = typer.Typer(no_args_is_help=True, help="Run the scheduler in this terminal or inspect it.")
 service_app = typer.Typer(no_args_is_help=True, help="Manage the worker as a systemd user service.")
@@ -148,36 +148,95 @@ def initialize(
     )
 
 
+def _secret_file(path: Path | None, label: str, *, private=False) -> Path | None:
+    """An existing file's absolute path; private files must not be readable by other users."""
+    if path is None:
+        return None
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"{label} not found: {path}")
+    if private and path.stat().st_mode & 0o077:
+        raise ValueError(f"{label} {path} is readable by other users; run: chmod 600 {path}")
+    return path
+
+
 @account_app.command("add")
 def account_add(
     ctx: typer.Context,
-    provider: str,
-    user: str,
+    provider: Annotated[str, typer.Argument(help="kaggle or ssh")],
+    user: Annotated[str, typer.Argument(help="Kaggle username, or a name you choose for an SSH machine")],
     credentials: Annotated[
         Path | None,
-        typer.Option(help="Credentials file for this account only; default: the provider's usual location"),
+        typer.Option(help="Kaggle: credentials file for this account only; default: Kaggle's usual location"),
     ] = None,
     cpu_limit: Annotated[int | None, typer.Option(help="Default 5; unchanged when omitted")] = None,
-    gpu_limit: Annotated[int | None, typer.Option(help="Default 1; unchanged when omitted")] = None,
+    gpu_limit: Annotated[
+        int | None,
+        typer.Option(help="Default 1 on Kaggle, 0 on SSH (GPUs the machine may use); unchanged when omitted"),
+    ] = None,
     default: Annotated[bool, typer.Option("--default", help="Prefer this account to the others")] = False,
+    host: Annotated[str | None, typer.Option(help="SSH: host name or address")] = None,
+    port: Annotated[int | None, typer.Option(help="SSH: port; default 22")] = None,
+    login: Annotated[str | None, typer.Option(help="SSH: user name on the machine")] = None,
+    key: Annotated[
+        Path | None, typer.Option(help="SSH: private key file; default: ssh-agent and ~/.ssh keys")
+    ] = None,
+    password_file: Annotated[
+        Path | None, typer.Option(help="SSH: file holding the password (chmod 600), instead of a key")
+    ] = None,
+    workdir: Annotated[
+        str | None,
+        typer.Option(help="SSH: work directory on the machine, relative to home; default .compute-runner"),
+    ] = None,
+    python: Annotated[
+        str | None, typer.Option(help="SSH: Python 3.9+ on the machine; default python3")
+    ] = None,
+    trust_new_host: Annotated[
+        bool,
+        typer.Option("--trust-new-host", help="SSH: accept the machine's host key if it is not known yet"),
+    ] = False,
 ):
-    """Add or update an account. Only the credentials file's path is saved."""
-    if credentials is not None:
-        credentials = credentials.expanduser().resolve()
-        if not credentials.is_file():
-            raise ValueError(f"Credentials file not found: {credentials}")
+    """Add or update an account. Only the paths of credential, key and password files are saved."""
+    if trust_new_host and provider != "ssh":
+        raise ValueError("--trust-new-host applies to SSH accounts only")
+    credentials = _secret_file(credentials, "Credentials file")
     accounts = _client(ctx).config.accounts
-    key = Account(provider=provider, user=user).id.casefold()
-    index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key), len(accounts))
+    key_id = f"{provider}:{user}".casefold()
+    index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key_id), len(accounts))
     saved = accounts[index].model_dump() if index < len(accounts) else {}
     changes = dict(credentials=credentials, cpu_limit=cpu_limit, gpu_limit=gpu_limit)
+    ssh = dict(
+        host=host,
+        port=port,
+        username=login,
+        key=_secret_file(key, "Key file"),
+        password_file=_secret_file(password_file, "Password file", private=True),
+        workdir=workdir,
+        python=python,
+    )
+    ssh = {name: value for name, value in ssh.items() if value is not None}
+    if ssh and provider != "ssh":
+        raise ValueError(f"--{next(iter(ssh)).replace('_', '-')} applies to SSH accounts only")
+    if provider == "ssh":
+        if key is not None and password_file is not None:
+            raise ValueError("Choose --key or --password-file, not both")
+        # A new key replaces a saved password file, and the other way round.
+        kept = {
+            k: v
+            for k, v in (saved.get("ssh") or {}).items()
+            if not (k in {"key", "password_file"} and (key or password_file))
+        }
+        changes["ssh"] = kept | ssh
     # An existing account keeps its saved ID, whatever the casing typed now; its jobs refer to it.
     values = dict(provider=provider, user=user) | saved | {k: v for k, v in changes.items() if v is not None}
     account = Account.model_validate(values)
-    others = [a.model_dump() for a in accounts if a.id.casefold() != key]
+    others = [a.model_dump() for a in accounts if a.id.casefold() != key_id]
     others.insert(0 if default else index, account.model_dump())
     config = _save(ctx, accounts=others)
-    _emit(ctx, dict(account=account.id, accounts=[a.id for a in config.accounts]))
+    result = dict(account=account.id, accounts=[a.id for a in config.accounts])
+    if trust_new_host:
+        result["host_key"] = connect(account, config).trust_host()
+    _emit(ctx, result)
 
 
 @account_app.command("remove")
@@ -404,9 +463,21 @@ def doctor(ctx: typer.Context, offline: bool = False):
         # Checked separately, so one broken account does not hide the others.
         info["remote"] = {}
         for account in client.config.accounts:
-            provider = client.provider(account.id)
             try:
-                info["remote"][account.id] = dict(quota=provider.quota(), active_runs=provider.active_runs())
+                provider = client.provider(account.id)
+                found = dict(quota=provider.quota(), active_runs=provider.active_runs())
+                if account.provider == "ssh":
+                    found["machine"] = machine = provider.info()
+                    if tuple(map(int, machine["python"].split(".")[:2])) < (3, 9):
+                        found["warning"] = (
+                            f"Python {machine['python']} on the machine; runs need 3.9 or newer"
+                        )
+                    elif account.gpu_limit > len(machine["gpus"]):
+                        found["warning"] = (
+                            f"gpu_limit is {account.gpu_limit}, but nvidia-smi lists "
+                            f"{len(machine['gpus'])} GPUs"
+                        )
+                info["remote"][account.id] = found
             except ERRORS as error:
                 info["remote"][account.id] = dict(error=safe_message(error))
     _emit(ctx, info)

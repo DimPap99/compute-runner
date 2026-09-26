@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from .bundle import describe, snapshot, snapshot_bundle
-from .models import BatchRecord, Config, JobRecord, JobSpec, input_reference
+from .models import SSH_PATH, BatchRecord, Config, JobRecord, JobSpec, input_reference
 from .providers import Provider, connect
 from .results import experiment_dir, outputs_dir, verified_checkpoint
 from .runtime import json_digest, safe_relative
@@ -53,13 +53,17 @@ class Client:
 
     def preview(self, spec: JobSpec, account: str | None = None):
         """The files a submission would upload and its experiment folder; no remote calls."""
-        spec = self._normalize(spec)
+        spec = self._normalize(spec, self.config.account(account))
         self.provider(account).check(spec)
         experiment = self._experiment(spec)
         return describe(self._local(spec), skip=[experiment.parent]) | {"experiment_dir": str(experiment)}
 
-    def _normalize(self, spec):
-        """Absolute paths, and job:ID inputs naming complete job IDs."""
+    def _normalize(self, spec, account=None):
+        """Absolute paths, job:ID inputs naming complete job IDs, and ssh inputs naming their machine.
+
+        An ssh:/PATH input means the account's own machine, so it keeps meaning that machine
+        if the job moves: elsewhere it can only be copied.
+        """
         spec = JobSpec.model_validate(spec.model_dump())
         spec.source = spec.source.expanduser().absolute()
         if spec.results_dir is not None:
@@ -73,6 +77,10 @@ class Client:
                 job_id, _, path = reference[1].partition("/")
                 job_id = self.store.resolve_id(job_id)
                 inputs[alias] = Path(f"job:{job_id}/{safe_relative(path)}" if path else f"job:{job_id}")
+            elif reference[0] == "ssh" and SSH_PATH.match(reference[1])["machine"] is None:
+                if account is None or account.provider != "ssh":
+                    raise ValueError(f"Name the machine of input {alias}: ssh:NAME:{reference[1]}")
+                inputs[alias] = Path(f"ssh:{account.user}:{reference[1]}")
             else:
                 inputs[alias] = value
         spec.inputs = inputs
@@ -147,7 +155,7 @@ class Client:
         """
         target = self.config.account(account).id
         self.check_batch_size(specs)
-        normalized = [self._normalize(spec) for spec in specs]
+        normalized = [self._normalize(spec, self.config.account(target)) for spec in specs]
         fingerprint = self._fingerprint(
             {"submit": [self._intent(spec) for spec in normalized]}, request_key, account and target
         )

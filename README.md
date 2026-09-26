@@ -2,7 +2,7 @@
 
 Submit, monitor, and resume Python workloads through a local Python API or CLI.
 
-Jobs run on provider accounts you connect. Kaggle is the only provider adapter today; you can connect several Kaggle accounts, and a job that cannot start on one can move to another.
+Jobs run on accounts you connect: Kaggle accounts, and your own machines over SSH. Every command, response and results folder works the same on both. You can connect several accounts, and a job that cannot start on one can move to another.
 
 A background worker manages uploads, execution status, resource admission, and output downloads. Jobs and submission attempts are stored in SQLite. Source files are snapshotted when a job is submitted. Resuming training requires checkpoint support in the workload.
 
@@ -14,6 +14,7 @@ The agent interface provides compact JSON responses, persistent batches, idempot
 - Linux with `systemd --user` for the background service
 - Credentials for each connected account, readable by the user running the worker
 - Accounts with access to the requested compute resources and datasets
+- For SSH machines: Linux with Python 3.9 or later, login by key or password, and `nbconvert` with `ipykernel` to run notebooks
 
 The worker can also run in a terminal without systemd. Local process locking uses `fcntl`.
 
@@ -33,6 +34,8 @@ compute-runner service install
 ```
 
 `compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](#accounts-and-failover). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
+
+The lock file includes `paramiko` for [SSH machines](#ssh-machines); an installation without it adds SSH support with `pip install 'compute-runner[ssh]'`.
 
 `compute-runner` is the primary command; `kgr` remains an alias for existing scripts. Python callers import `compute_runner`.
 
@@ -83,6 +86,8 @@ compute-runner account remove kaggle:bob
 
 Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone and can hold a `kaggle.json` username and key or a Kaggle access token. Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
 
+SSH machines are accounts too; see [SSH machines](#ssh-machines).
+
 The worker reads accounts and settings when it starts. After `account add`, `account remove`, or `init`, apply the change with `compute-runner service restart`; these commands print that reminder while a worker is running. Until then, a job submitted to a newly added account waits with a reason saying the running worker does not know its account.
 
 Each job records its account, and each attempt records the account, remote reference, and URL it ran on. Choose an account with `--account` on `submit` and `retry`, or move a job that has not been submitted yet:
@@ -121,6 +126,32 @@ A job can attach existing provider datasets, such as another account's private d
 Copies are off by default because they place the data in another account and take its storage. Allow them for one job with `compute-runner agent move JOB_ID --account ACCOUNT --transfer` (the job's own account also works), or for every job with `compute-runner init --transfer`. Only aliased inputs (`inputs: {data: "kaggle:owner/slug"}`) can be copied, because the workload finds a copy through `KGR_INPUT_DATA`; the unaliased `datasets` list cannot. A copied dataset version is cached in the state directory and reused. Check the dataset's license before copying it.
 
 Failover prefers an account that can read every dataset. Under `ask`, a suggested account that would need a copy is shown with `suggested_transfer: true`; under `auto`, the worker moves a job there only when copies are allowed.
+
+### SSH machines
+
+A machine you can log in to over SSH runs jobs like a Kaggle account: the same commands, responses, run folders and failover. Its account ID is `ssh:NAME`, where you choose the name:
+
+```bash
+compute-runner account add ssh lab --host 10.0.0.5 --login alice --key ~/.ssh/id_ed25519 --trust-new-host
+compute-runner account add ssh lab-cpu --host lab.example.org --port 2222 --login alice --password-file ~/.lab-password
+compute-runner account add ssh lab --gpu-limit 2        # the machine has two GPUs jobs may use
+compute-runner doctor                                   # Python version, GPUs and runs on each machine
+```
+
+Without `--key` or `--password-file`, the login uses ssh-agent and the default keys in `~/.ssh`. A password file must be readable by you alone (`chmod 600`). Only the paths of key and password files are saved. The machine's host key must be known: `--trust-new-host` accepts a host that is not in `known_hosts` yet and prints its fingerprint, and a host key that changes later is refused until you remove the old one. `~/.ssh/config` is not read, so give the host, port and login on the account.
+
+Each job runs as your login, in its own folder under the work directory on the machine (`~/.compute-runner`, or `--workdir`), started by a supervisor that keeps running when the connection or the worker stops. The supervisor enforces `timeout_seconds` and records how the run ended; `cancel` stops the workload's whole process group. Source and input bundles are uploaded once, verified, and kept read-only for later runs. A `requirements` file installs into a virtual environment of that run, which can still use packages installed on the machine. Notebooks run with `nbconvert` from the machine's Python, and the executed notebook is downloaded with the outputs.
+
+What differs from Kaggle:
+
+| | SSH machine |
+| --- | --- |
+| Network | Cannot be blocked, so SSH jobs must set `internet: true`; jobs without it are refused and never fail over to an SSH machine |
+| GPUs | `gpu: true` only, no accelerator IDs. GPU slots are the account's `--gpu-limit` (0 unless set), each GPU job gets its own device through `CUDA_VISIBLE_DEVICES`, and CPU jobs see no GPU. There is no GPU time quota |
+| Data on the machine | `inputs: {data: "ssh:/data/imagenet"}` attaches a folder already on the machine where it is, without uploading it. Submission records the machine, as `ssh:lab:/data/imagenet`, so the reference keeps meaning that machine: on another account, including another SSH machine with the same path, the folder is used only as a copy (see [Datasets across accounts](#datasets-across-accounts)), which is made again when its files change. A job on a Kaggle account names the machine itself: `ssh:lab:/data/imagenet` |
+| Kaggle datasets | Copied through a connected Kaggle account when copies are allowed |
+| Capacity | `--cpu-limit` and `--gpu-limit` count only this runner's jobs, not other work on the machine |
+| Cleanup | Run folders and bundles stay on the machine. Bundles are read-only; remove the work directory with `chmod -R u+w ~/.compute-runner && rm -rf ~/.compute-runner` |
 
 ## Workload configuration
 
@@ -161,11 +192,11 @@ Source and input paths are relative to the YAML file. Entrypoint and requirement
 | `params` | `{}` | Named settings, passed after `args` as `--NAME VALUE` (`true` as `--NAME`, `false` omitted), exposed as `KGR_PARAMS_JSON`, and recorded with the results |
 | `env` | `{}` | Persisted, nonsecret environment values |
 | `gpu` | `false` | Request a GPU |
-| `accelerator` | Unset | Provider accelerator ID; Kaggle accepts NVIDIA IDs. Setting this also enables GPU use |
-| `internet` | `false` | Enable network access in the workload |
+| `accelerator` | Unset | Provider accelerator ID; Kaggle accepts NVIDIA IDs, SSH machines none. Setting this also enables GPU use |
+| `internet` | `false` | Enable network access in the workload. SSH machines cannot block it and require `true` |
 | `timeout_seconds` | `43200` | Requested session timeout; Kaggle accepts 1 to 43200 seconds |
 | `datasets` | `[]` | Existing provider datasets without an alias; on Kaggle `owner/slug` or `owner/slug/version` |
-| `inputs` | `{}` | Named inputs: a local file or directory (uploaded as a private dataset), a provider dataset such as `kaggle:owner/slug/3`, or a finished job's outputs as `job:JOB_ID/PATH` |
+| `inputs` | `{}` | Named inputs: a local file or directory (uploaded as a private dataset), a provider dataset such as `kaggle:owner/slug/3`, a path on an SSH machine such as `ssh:/data/set` (on the job's machine) or `ssh:lab:/data/set`, or a finished job's outputs as `job:JOB_ID/PATH` |
 | `requirements` | Unset | Included requirements file to install with pip. Requires internet access |
 | `exclude` | `[]` | Additional source exclusion patterns |
 | `auto_download` | `true` | Download outputs after execution terminates |
@@ -603,6 +634,7 @@ Back up the database before upgrading. To restore an older application version, 
 - Only aliased dataset inputs can be copied between accounts, and copying runs in the dispatcher.
 - Job completion does not automatically resume an LLM conversation.
 - Custom containers and automatic offline dependency installation are not supported.
+- SSH machines run jobs as your login without isolation beyond a folder and virtual environment per run, and cannot block network access.
 
 ## Development
 
@@ -612,7 +644,7 @@ Back up the database before upgrading. To restore an older application version, 
 .venv/bin/python -m compileall -q src
 ```
 
-Tests use a Kaggle adapter with simulated network calls and local execution of generated launchers. They cover scheduling, restart recovery, submission ambiguity, batch transactions, idempotency, cursor pagination, packaging, downloads, and CLI behavior. Automated tests do not create remote resources.
+Tests use a Kaggle adapter with simulated network calls and local execution of generated launchers, and run the SSH adapter with its commands and SFTP served locally. `KGR_TEST_SSH=user@host:port` with `KGR_TEST_SSH_KEY` (and `KGR_TEST_SSH_CONFIG_DIR` holding a `known_hosts` that trusts the machine) also runs a job on a real SSH machine and removes its work directory afterwards. They cover scheduling, restart recovery, submission ambiguity, batch transactions, idempotency, cursor pagination, packaging, downloads, and CLI behavior. Automated tests do not create remote resources.
 
 ### Adding a provider
 
@@ -628,9 +660,9 @@ The queue talks to providers only through the `Provider` protocol in `src/comput
 | `submit(job)` | Launch the staged attempt; raise `RemoteError` with `definitive=True` only when nothing was launched |
 | `status(ref)` | Return a state of `queued`, `running`, `cancelling`, `succeeded`, `failed`, or `cancelled` (or `None`), the raw provider state, and an error |
 | `download(ref, sink)` | Give the run's log and files to an output sink, which decides what to fetch and where it goes |
-| `url`, `cancel`, `active_runs`, `quota`, `logs`, `live_log` | Links, cancellation, capacity discovery, quota, and logs |
+| `url`, `cancel`, `active_runs`, `quota`, `logs`, `live_log` | Links, cancellation, capacity discovery, quota (GPU `available_seconds: None` means no time limit), and logs |
 
-The reference returned by `stage` is saved before `submit` runs, so an interrupted submission is reconciled through `status` rather than launched twice. Workloads read the provider-neutral `KGR_*` runtime variables; `providers/downloads.py` verifies outputs exposed as signed HTTPS URLs.
+`providers/launch.py` builds the runtime configuration and launcher that every adapter ships; `providers/ssh.py` is the second adapter and a compact example. The reference returned by `stage` is saved before `submit` runs, so an interrupted submission is reconciled through `status` rather than launched twice. Workloads read the provider-neutral `KGR_*` runtime variables; `providers/downloads.py` verifies outputs exposed as signed HTTPS URLs.
 
 The Kaggle adapter pins `kaggle==2.2.4` and `kagglesdk==0.1.37`. SDK transport retries are disabled. The worker determines whether a remote operation can be retried. The Kaggle client is imported when a remote operation is required.
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import contextvars
 import io
@@ -14,17 +13,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import nbformat
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 
-from .. import runtime
 from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets, redacted_env_record
 from ..store import atomic_json
 from . import RemoteError, classify, http_code, paginate, remote_error
 from .downloads import download_outputs
+from .launch import launch_config, write_launcher
 
 DATASET = re.compile(r"[\w-]+/[\w-]+(?:/[1-9]\d*)?")
 # Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
@@ -511,42 +509,14 @@ def prepare_kernel(job: JobRecord, ref: str, folder: Path, state_dir: Path) -> P
     """Construct a private kernel from immutable local snapshots."""
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     snapshot = job.snapshot
-    source = snapshot["source"]
-    payload = state_dir / "bundles" / source["digest"] / "files"
     inputs = {}
     for alias, bundle in [*snapshot["inputs"].items(), *job.transfers.items()]:
         inputs[alias] = dict(ref=job.upload_refs["input:" + alias], digest=bundle["digest"])
     for alias in job.spec.dataset_inputs():
         # Attached directly; the runtime finds where Kaggle mounted it.
         inputs.setdefault(alias, dict(dataset=job.upload_refs["input:" + alias]))
-    config = dict(
-        job_id=job.id,
-        source_digest=source["digest"],
-        source_ref=job.upload_refs.get("source"),
-        inline=None,
-        inputs=inputs,
-        module=snapshot["module"],
-        entrypoint=snapshot["entrypoint"],
-        args=job.spec.command_args(),
-        params=job.spec.params,
-        env=job.spec.env,
-        requirements=job.spec.requirements,
-    )
-    if snapshot["single_file"]:
-        # Directory bundles carry their own manifest; only embedded files need their checksums here.
-        config["source_files"] = source["files"]
-        config["inline"] = {
-            name: base64.b64encode((payload / name).read_bytes()).decode() for name in source["files"]
-        }
-    bootstrap = Path(runtime.__file__).read_text() + "\n_KGR_CONFIG = " + repr(config) + "\n"
-    if snapshot["kind"] == "notebook":
-        notebook = nbformat.read(payload / snapshot["entrypoint"], as_version=4)
-        notebook.cells.insert(0, nbformat.v4.new_code_cell(bootstrap + "bootstrap(_KGR_CONFIG)\n"))
-        code_file = "workload.ipynb"
-        nbformat.write(notebook, folder / code_file)
-    else:
-        code_file = "workload.py"
-        (folder / code_file).write_text(bootstrap + "run_script(_KGR_CONFIG)\n")
+    config = launch_config(job, state_dir, inputs, source_ref=job.upload_refs.get("source"))
+    code_file = write_launcher(job, config, folder, state_dir)
     metadata = dict(
         id=ref,
         title=ref.split("/")[1].replace("-", " "),

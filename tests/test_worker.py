@@ -382,3 +382,17 @@ def test_polling_does_not_undo_a_resolution_made_during_the_remote_call(setup):
     backend.status = resolved_meanwhile
     client.worker().tick()
     assert client.get(job.id).state == "blocked"
+
+
+def test_a_definitive_transient_launch_failure_is_retried_not_blocked(setup):
+    # SSH reports a lost upload this way: nothing started, and trying again may work.
+    client, backend, spec = setup
+    backend.push_error = RemoteError("upload interrupted", "transient", definitive=True)
+    job = client.submit(spec)
+    client.worker().tick()
+    job = client.get(job.id)
+    assert job.state == "queued" and job.attempts[-1].state == "rejected"
+    backend.push_error = None
+    due(client, job.id)
+    client.worker().tick()
+    assert client.get(job.id).state == "remote_queued"

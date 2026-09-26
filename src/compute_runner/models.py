@@ -17,15 +17,28 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-PROVIDERS = ("kaggle",)
+PROVIDERS = ("kaggle", "ssh")
 # An input value naming data that is not a local path: another job's outputs, or a provider dataset.
-_REFERENCE = re.compile(rf"^(job|{'|'.join(PROVIDERS)}):([^/].*)$")
+_REFERENCE = re.compile(rf"^(job|{'|'.join(PROVIDERS)}):(.+)$")
+
+
+# A path on one SSH machine: NAME:/PATH, or /PATH on the job's own machine until submission names it.
+SSH_PATH = re.compile(r"^(?:(?P<machine>[A-Za-z0-9_-]+):)?(?P<path>/.*)$")
 
 
 def input_reference(value) -> tuple[str, str] | None:
-    """("job", "ID[/PATH]") or (provider, dataset reference); None for a local path."""
+    """("job", "ID[/PATH]") or (provider, dataset reference); None for a local path.
+
+    An ssh reference is an absolute path, optionally after its machine's name; the others are
+    never absolute.
+    """
     match = _REFERENCE.match(str(value))
-    return (match.group(1), match.group(2)) if match else None
+    if not match:
+        return None
+    kind, rest = match.groups()
+    if (SSH_PATH.match(rest) is None) if kind == "ssh" else rest.startswith("/"):
+        return None
+    return kind, rest
 
 
 class JobSpec(Model):
@@ -91,15 +104,48 @@ class JobSpec(Model):
         return {alias: ref for alias, ref in found.items() if ref and ref[0] != "job"}
 
 
+class SshSettings(Model):
+    """How to reach one machine over SSH. Secrets stay in files; only their paths are saved."""
+
+    host: str = Field(min_length=1)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = Field(min_length=1)
+    # A private key file; None tries ssh-agent and the default keys in ~/.ssh.
+    key: Path | None = None
+    # A file holding the password, for machines without key login.
+    password_file: Path | None = None
+    # Where runs, bundles and virtual environments live on the machine; relative to the home folder.
+    workdir: str = ".compute-runner"
+    python: str = "python3"
+
+
 class Account(Model):
     """One set of credentials on one provider. Provider-specific limits are checked by its adapter."""
 
-    provider: Literal["kaggle"] = "kaggle"
+    provider: Literal["kaggle", "ssh"] = "kaggle"
+    # The account's name: the Kaggle username, or a name chosen for an SSH machine.
     user: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     # A credentials file for this account only; None uses the provider's standard discovery.
     credentials: Path | None = None
     cpu_limit: int = Field(default=5, ge=0)
     gpu_limit: int = Field(default=1, ge=0)
+    ssh: SshSettings | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def ssh_defaults(cls, data):
+        # A machine offers GPU slots only when the user says how many GPUs it has.
+        if isinstance(data, dict) and data.get("provider") == "ssh" and data.get("gpu_limit") is None:
+            data = {**data, "gpu_limit": 0}
+        return data
+
+    @model_validator(mode="after")
+    def provider_settings(self):
+        if (self.provider == "ssh") != (self.ssh is not None):
+            raise ValueError("SSH accounts, and only they, need host settings")
+        if self.provider == "ssh" and self.credentials is not None:
+            raise ValueError("SSH accounts take a key or password file, not credentials")
+        return self
 
     @property
     def id(self) -> str:

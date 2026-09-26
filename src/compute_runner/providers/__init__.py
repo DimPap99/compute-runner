@@ -78,7 +78,10 @@ class Provider(Protocol):
         """Runs holding this account's capacity, including ones started elsewhere: {ref: cpu|gpu|unknown}."""
 
     def quota(self) -> dict:
-        """{"gpu": {"available_seconds": ...} or None, ...}"""
+        """{"gpu": {"available_seconds": ...} or None, ...}
+
+        gpu None means no GPU time is available; available_seconds None means GPU time is not limited.
+        """
 
     def logs(self, ref: str, *, follow: bool = False) -> Iterator[str]:
         """The stored log of a finished run, or a stream with follow=True."""
@@ -96,10 +99,11 @@ class Provider(Protocol):
 
 def connect(account: Account, config: Config) -> Provider:
     # Imported here: adapters load their SDKs lazily and must not burden model imports.
-    from .kaggle import KaggleProvider
-
-    adapters = {"kaggle": KaggleProvider}
-    return adapters[account.provider](account, config.state_dir, strict=config.strict)
+    if account.provider == "ssh":
+        from .ssh import SshProvider as adapter
+    else:
+        from .kaggle import KaggleProvider as adapter
+    return adapter(account, config.state_dir, strict=config.strict)
 
 
 class RemoteError(RuntimeError):

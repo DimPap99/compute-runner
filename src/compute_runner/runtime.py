@@ -1,4 +1,8 @@
-"""Standard-library-only bootstrap copied into Kaggle workloads."""
+"""Standard-library-only bootstrap copied into every workload's launch package.
+
+Runs on the provider's machine (Python 3.9 or newer). Paths in its configuration may be relative
+to the directory it starts in.
+"""
 
 import base64
 import hashlib
@@ -113,6 +117,12 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
     return candidates[0]
 
 
+def _local_bundle(path, digest):
+    """A bundle the provider already unpacked and verified on this machine."""
+    root = Path(os.path.abspath(path))
+    return "directory", root, _manifest(json.loads((root / MANIFEST).read_text()), digest)
+
+
 def _find_dataset(ref, *, input_root=Path("/kaggle/input")):
     """Where Kaggle mounted an attached dataset, under either of its mount conventions."""
     for root in _mounts(ref, input_root):
@@ -126,7 +136,7 @@ def bootstrap(config):
     session = re.search(r"-(\d+)-\w+$", os.environ.get("KAGGLE_CONTAINER_NAME", ""))
     if session:
         print(f"KGR workload {config['job_id']} session {session.group(1)}", flush=True)
-    project = Path(config.get("working_root", "/kaggle/working")) / "project"
+    project = Path(os.path.abspath(config.get("working_root", "/kaggle/working"))) / "project"
     project.mkdir(parents=True, exist_ok=False)
     if config.get("inline"):
         for name, value in config["inline"].items():
@@ -135,7 +145,10 @@ def bootstrap(config):
             target.write_bytes(base64.b64decode(value))
         _verify(project, config["source_files"])
     else:
-        kind, location, records = _find_bundle(config["source_ref"], config["source_digest"])
+        if config.get("source_local"):
+            kind, location, records = _local_bundle(config["source_local"], config["source_digest"])
+        else:
+            kind, location, records = _find_bundle(config["source_ref"], config["source_digest"])
         if kind == "archive":
             _unpack(location, config["source_digest"], project)
         else:
@@ -148,6 +161,12 @@ def bootstrap(config):
     for alias, bundle in config["inputs"].items():
         if "dataset" in bundle:
             inputs[alias] = str(_find_dataset(bundle["dataset"]))
+            continue
+        if "path" in bundle:  # Data already on this machine, attached where it is.
+            inputs[alias] = os.path.abspath(bundle["path"])
+            continue
+        if "local" in bundle:
+            inputs[alias] = str(_local_bundle(bundle["local"], bundle["digest"])[1])
             continue
         kind, location, _ = _find_bundle(bundle["ref"], bundle["digest"])
         if kind == "archive":
