@@ -3,7 +3,9 @@
 import hashlib
 import json
 import re
+import sqlite3
 import subprocess
+from contextlib import contextmanager
 import sys
 from pathlib import Path
 
@@ -95,6 +97,23 @@ def test_a_batch_that_fails_to_commit_leaves_no_run_folders(setup, tmp_path, mon
     monkeypatch.setattr(client.store, "_event", fail)
     with pytest.raises(RuntimeError):
         client.submit_many([spec, spec])
+    assert [p.name for p in (tmp_path / "results/workload").iterdir()] == [".lock"]
+    monkeypatch.undo()
+
+    # A failure of the commit itself, after every statement ran, also removes them.
+    connection = client.store.connection
+
+    @contextmanager
+    def failing_commit():
+        with connection() as db:
+            yield db
+            raise sqlite3.OperationalError("disk I/O error")
+
+    # Only add_batch opens a connection once the request-key lookup is out of the way.
+    monkeypatch.setattr(client.store, "request", lambda *args: None)
+    monkeypatch.setattr(client.store, "connection", failing_commit)
+    with pytest.raises(sqlite3.OperationalError):
+        client.submit(spec)
     assert [p.name for p in (tmp_path / "results/workload").iterdir()] == [".lock"]
     monkeypatch.undo()
     assert client.submit(spec).run == 1
