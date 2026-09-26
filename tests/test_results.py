@@ -101,6 +101,9 @@ def test_results_inside_a_project_are_not_uploaded_with_it(setup, tmp_path):
     assert list(job.snapshot["source"]["files"]) == ["train.py"] and job.run == 2
     with pytest.raises(ValueError, match="source folder itself"):
         client.submit(JobSpec(source=project, entrypoint="train.py", results_dir=project))
+    # Named like the source folder, the experiment folder would be the source itself.
+    with pytest.raises(ValueError, match="source folder itself"):
+        client.submit(JobSpec(source=project, entrypoint="train.py", name="project", results_dir=tmp_path))
 
 
 def test_params_reach_the_command_line_and_environment(setup, tmp_path):
@@ -129,6 +132,8 @@ def test_param_options_are_read_like_yaml_and_screened(tmp_path):
         specs("lr")
     with pytest.raises(ValueError, match="parameter api_key looks secret"):
         specs("api_key=abc")
+    with pytest.raises(ValueError, match="parameter hf-token looks secret"):
+        specs("hf-token=abc")
     with pytest.raises(ValueError, match="Invalid parameter name"):
         specs("--lr=1")
 
@@ -219,6 +224,7 @@ def test_continue_refuses_a_checkpoint_that_does_not_verify(setup):
         (["--resume", "auto", "--x"], {}, ["--resume", "required", "--x"], {}),
         (["--resume=never"], {}, ["--resume=required"], {}),
         ([], {}, ["--resume", "required"], {}),
+        (["--x", "--resume"], {}, ["--x", "--resume", "required"], {}),
         ([], {"resume": "auto"}, [], {"resume": "required"}),
     ],
 )

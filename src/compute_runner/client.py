@@ -24,8 +24,8 @@ def resume_required(spec: JobSpec) -> JobSpec:
         spec.params["resume"] = "required"
         return spec
     for index, arg in enumerate(spec.args):
-        if arg == "--resume" and index + 1 < len(spec.args):
-            spec.args[index + 1] = "required"
+        if arg == "--resume":
+            spec.args[index + 1 :] = ["required", *spec.args[index + 2 :]]
             return spec
         if arg.startswith("--resume="):
             spec.args[index] = "--resume=required"
@@ -102,8 +102,9 @@ class Client:
 
     def _experiment(self, spec):
         folder = experiment_dir(spec, self.config)
-        if spec.source.is_dir() and folder.parent.resolve() == spec.source.resolve():
-            raise ValueError("results_dir must not be the source folder itself")
+        # Run folders would land in the source, and later snapshots would upload them.
+        if spec.source.is_dir() and spec.source.resolve() in {folder.parent.resolve(), folder.resolve()}:
+            raise ValueError("results_dir must not be the source folder itself or its experiment folder")
         return folder
 
     @staticmethod
@@ -229,6 +230,7 @@ class Client:
             finished_at=time.time(),
             wait_reason="Cancelled locally",
             suggested_account=None,
+            suggested_transfer=False,
             download_state="disabled",
         )
         if updated is None:

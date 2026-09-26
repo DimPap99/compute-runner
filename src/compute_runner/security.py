@@ -30,7 +30,7 @@ SECRET_FILE_NAMES = {
 SECRET_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx", ".tfstate"}
 
 _SECRET_ENV_NAME = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTH|CREDENTIALS?|KEY|PASSWORD|PASSWD|PRIVATE_KEY|SECRET|TOKEN)(?:$|_)"
+    r"(?:^|[_-])(?:API[_-]KEY|AUTH|CREDENTIALS?|KEY|PASSWORD|PASSWD|PRIVATE[_-]KEY|SECRET|TOKEN)(?:$|[_-])"
 )
 _REDACT_FIELD = re.compile(
     r"(['\"]?[A-Z0-9_-]{0,64}(?:KAGGLE[_-]?KEY|API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|"

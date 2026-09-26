@@ -15,7 +15,7 @@ from pathlib import Path
 from .bundle import plain_files, snapshot_bundle
 from .models import ACTIVE, TERMINAL, Attempt, Config
 from .providers import RemoteError, safe_message
-from .results import JobOutputs, publish, source_copies  # noqa: F401  source_copies is re-exported
+from .results import JobOutputs, publish
 from .security import redacted_env_record
 from .store import Store, atomic_json
 

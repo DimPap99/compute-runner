@@ -119,6 +119,19 @@ def test_failover_offers_an_account_that_needs_a_copy(two_accounts):
     assert home.fetched == ["tester/private/7"] and len(other.pushes) == 1
 
 
+def test_cancelling_clears_a_suggested_copy(two_accounts):
+    client, home, other, spec = two_accounts
+    client.config.failover = "ask"
+    home.gpu_seconds = 0
+    other.unreadable = {"tester/private"}
+    job = client.submit(spec.model_copy(update={"gpu": True, "inputs": {"data": Path("kaggle:tester/private")}}))
+    client.worker().tick()
+    assert client.get(job.id).suggested_transfer
+    client.cancel(job.id)
+    summary = client.agent().status([job.id])["jobs"][0]
+    assert "suggested_account" not in summary and "suggested_transfer" not in summary
+
+
 def test_failover_prefers_an_account_that_can_read_the_data(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     config = make_config(tmp_path, "tester", "second", "third", failover="ask")

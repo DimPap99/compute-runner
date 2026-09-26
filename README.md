@@ -105,7 +105,7 @@ compute-runner init --failover auto
 compute-runner service restart
 ```
 
-Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account, and jobs queued behind it wait for it rather than failing over. An account that rejected one of a job's launches is not chosen for that job again, so a job cannot bounce between two full accounts. Moving a job uploads its inputs again, because private datasets belong to one account. Failover checks that the other account can read the job's provider datasets; see [Datasets across accounts](#datasets-across-accounts). Runs that have started never move; continue a stopped resumable run on another account with `compute-runner agent continue JOB_ID --account ID`, as described in [Optional resumable training](#optional-resumable-training).
+Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account, and jobs queued behind it wait for it rather than failing over. An account that rejected one of a job's launches is not chosen for that job again, so a job cannot bounce between two full accounts. Moving a job uploads its inputs again, because private datasets belong to one account. Failover checks that the other account can read the job's provider datasets; see [Datasets across accounts](#datasets-across-accounts). Runs that have started never move; continue a stopped resumable run on another account with `compute-runner continue JOB_ID --account ID`, as described in [Optional resumable training](#optional-resumable-training).
 
 ### Datasets across accounts
 
