@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace as Obj
 
 import pytest
@@ -394,3 +395,14 @@ def test_kaggle_rejects_specs_it_cannot_run_before_queueing(setup, update, messa
     with pytest.raises(ValueError, match=message):
         client.submit(spec.model_copy(update=update))
     assert client.list() == []
+
+
+def test_dataset_copies_keep_the_clients_url_banner_out_of_stdout(tmp_path, capsys):
+    def download(ref, path, quiet, unzip):
+        print(f"Dataset URL: https://www.kaggle.com/datasets/{ref}")
+        (Path(path) / "rows.csv").write_text("x\n")
+
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
+    backend._api = Obj(dataset_download_files=download)
+    backend.fetch_dataset("owner/data/1", tmp_path)
+    assert (tmp_path / "rows.csv").is_file() and capsys.readouterr().out == ""

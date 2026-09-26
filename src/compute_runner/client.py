@@ -290,10 +290,14 @@ class Client:
         checkpoint = verified_checkpoint(folder)
         self._check_saved(job)
         spec = resume_required(job.spec)
+        saved = dict(job.snapshot, inputs=dict(job.snapshot["inputs"]))
+        # The checkpoint replaces an input of that name in any casing; both would be KGR_INPUT_RESUME.
+        for alias in [alias for alias in spec.inputs if alias.upper() == "RESUME"]:
+            del spec.inputs[alias]
+            saved["inputs"].pop(alias, None)
         spec.inputs["resume"] = Path(f"job:{job.id}/checkpoints")
         target = explicit or self.config.account(job.account).id
         self.provider(target).check(spec)
-        saved = dict(job.snapshot, inputs=dict(job.snapshot["inputs"]))
         saved["inputs"]["resume"] = snapshot_bundle(
             folder, ["latest.json", checkpoint], self.config.state_dir / "bundles"
         )

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import contextvars
+import io
 import json
 import os
 import re
@@ -188,7 +190,9 @@ class KaggleProvider:
 
     def fetch_dataset(self, ref, destination: Path):
         try:
-            self.api.dataset_download_files(ref, path=str(destination), quiet=True, unzip=True)
+            # The client prints the dataset's URL even when quiet; keep it out of the worker's output.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.api.dataset_download_files(ref, path=str(destination), quiet=True, unzip=True)
         except Exception as error:
             raise remote_error(error) from error
 

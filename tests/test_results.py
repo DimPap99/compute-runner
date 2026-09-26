@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from compute_runner import JobSpec
+from compute_runner import Client, JobSpec
 from compute_runner.client import resume_required
 from compute_runner.workloads import load_specs, workload_specs
 from conftest import due, staged_launcher
@@ -34,8 +34,9 @@ def test_run_folders_are_numbered_at_submission_beside_the_code(setup, tmp_path)
     assert re.fullmatch(r"001_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d", first.result_dir.name)
     assert [job.result_dir.name[:4] for job in batch] == ["002_", "003_"]
     assert client.get(first.id).result_dir == first.result_dir
-    # Only the worker writes there.
-    assert not experiment.exists()
+    # Submission reserves each run folder empty; the worker fills it.
+    runs_on_disk = sorted(path for path in experiment.iterdir() if not path.name.startswith("."))
+    assert runs_on_disk == [job.result_dir for job in runs] and not any(any(p.iterdir()) for p in runs_on_disk)
 
     client.worker().tick()
     record = json.loads((first.result_dir / "job.json").read_text())
@@ -73,6 +74,30 @@ def test_numbers_continue_after_folders_already_on_disk(setup, tmp_path):
     (tmp_path / "results/workload/007_2020-01-01_00-00-00").mkdir(parents=True)
     (tmp_path / "results/workload/notes").mkdir()
     assert client.submit(spec).run == 8
+
+
+def test_queues_of_different_state_directories_never_share_a_run_number(setup, tmp_path):
+    client, backend, spec = setup
+    other = Client(
+        config=client.config.model_copy(update={"state_dir": tmp_path / "other-state"}),
+        providers={"kaggle:tester": backend},
+    )
+    numbers = [client.submit(spec).run, other.submit(spec).run, client.submit(spec).run]
+    assert numbers == [1, 2, 3]
+
+
+def test_a_batch_that_fails_to_commit_leaves_no_run_folders(setup, tmp_path, monkeypatch):
+    client, _, spec = setup
+
+    def fail(*args):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(client.store, "_event", fail)
+    with pytest.raises(RuntimeError):
+        client.submit_many([spec, spec])
+    assert [p.name for p in (tmp_path / "results/workload").iterdir()] == [".lock"]
+    monkeypatch.undo()
+    assert client.submit(spec).run == 1
 
 
 def test_results_folder_is_the_workloads_then_the_configured_one(setup, tmp_path):
@@ -200,6 +225,18 @@ def test_continue_resumes_from_the_verified_checkpoint_as_the_next_run(two_accou
     client.worker().tick()
     assert len(other.pushes) == 1
     assert "| 001 |" in (job.result_dir.parent / "runs.md").read_text()
+
+
+def test_continue_replaces_an_input_named_resume_in_any_casing(setup, tmp_path):
+    client, backend, spec = setup
+    checkpoints(backend)
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old/weights.txt").write_text("old")
+    job = client.submit(spec.model_copy(update={"inputs": {"RESUME": tmp_path / "old"}}))
+    client.worker().tick()
+    finish(client, backend, state="ERROR")
+    resumed = client.continue_run(job.id)
+    assert list(resumed.spec.inputs) == ["resume"] and list(resumed.snapshot["inputs"]) == ["resume"]
 
 
 def test_continue_refuses_a_checkpoint_that_does_not_verify(setup):

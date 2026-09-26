@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -227,29 +228,44 @@ class Store:
                 "INSERT INTO batches VALUES (?,?,?,?)",
                 (batch.id, batch.created_at, request_key, fingerprint),
             )
-            for position, job in enumerate(batch.jobs):
-                if experiments and job.id in experiments:
-                    self._number(db, job, experiments[job.id])
-                db.execute(
-                    "INSERT INTO jobs VALUES (?,?,?,?)",
-                    (job.id, job.created_at, job.state, job.model_dump_json()),
-                )
-                self._event(db, job, "submitted locally")
-                db.execute("INSERT INTO batch_jobs VALUES (?,?,?)", (batch.id, job.id, position))
+            created = []
+            try:
+                for position, job in enumerate(batch.jobs):
+                    if experiments and job.id in experiments:
+                        created.append(self._number(db, job, experiments[job.id]))
+                    db.execute(
+                        "INSERT INTO jobs VALUES (?,?,?,?)",
+                        (job.id, job.created_at, job.state, job.model_dump_json()),
+                    )
+                    self._event(db, job, "submitted locally")
+                    db.execute("INSERT INTO batch_jobs VALUES (?,?,?)", (batch.id, job.id, position))
+            except BaseException:
+                # The batch rolls back; so do the run folders it reserved, which are still empty.
+                for folder in created:
+                    with contextlib.suppress(OSError):
+                        folder.rmdir()
+                raise
         return batch
 
     @staticmethod
     def _number(db, job, experiment: Path):
-        """Give a new job the next run number in its experiment folder, and that run's folder.
+        """Give a new job the next run number in its experiment folder, and create that run's folder.
 
-        Inside the batch transaction, so concurrent submitters never share a number. Folders
-        already on disk count too, such as runs recorded by another state directory.
+        Inside the batch transaction, so submitters to one queue never share a number. Folders
+        on disk count too, and the folder is created under a lock in the experiment folder, so
+        queues of other state directories writing to the same experiment cannot share one either.
+        Returns the new folder, still empty.
         """
-        row = db.execute("SELECT MAX(number) FROM runs WHERE experiment=?", (str(experiment),)).fetchone()
-        seen = [run_number(path.name) for path in experiment.iterdir()] if experiment.is_dir() else []
-        job.run = max([row[0] or 0, *(number for number in seen if number is not None)]) + 1
-        job.result_dir = experiment / run_folder(job.run, job.created_at)
+        experiment.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (experiment / ".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            row = db.execute("SELECT MAX(number) FROM runs WHERE experiment=?", (str(experiment),)).fetchone()
+            seen = [run_number(path.name) for path in experiment.iterdir()]
+            job.run = max([row[0] or 0, *(number for number in seen if number is not None)]) + 1
+            job.result_dir = experiment / run_folder(job.run, job.created_at)
+            job.result_dir.mkdir(mode=0o700)
         db.execute("INSERT INTO runs VALUES (?,?,?)", (str(experiment), job.run, job.id))
+        return job.result_dir
 
     def experiment(self, folder: Path) -> list[JobRecord]:
         """The jobs numbered in an experiment folder, by run number."""

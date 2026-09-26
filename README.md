@@ -225,7 +225,7 @@ The skill includes a framework-neutral helper at `skills/compute-runner/assets/c
 
 ## Results
 
-Each job's run folder is fixed when it is submitted, before anything runs, and returned by every status response as `run_dir`:
+Each job's run folder is fixed and created, still empty, when it is submitted, before anything runs, and returned by every status response as `run_dir`:
 
 ```text
 RESULTS/NAME/
@@ -243,7 +243,7 @@ RESULTS/NAME/
 - The run number counts up within the folder. The queue hands it out when the batch commits, so concurrent submitters never share one, and it continues after folders already on disk. The timestamp is the submission time in local time.
 - `job.json` records the job ID, parameters, command, account, run URL, state, attempts, inputs and download state. `runs.md` lists every run of the experiment with its state, parameters, download state, parent run (for retries and continuations) and job ID.
 
-Only the queue writes there. The worker downloads outputs into the folder (as does `compute-runner download`) and rewrites `job.json` and `runs.md` from the queue whenever a job changes, following the queue's change cursor, so a restart resumes where it stopped and edits to those two files are overwritten. Retries and continuations are the next runs of the same experiment. Jobs saved before run folders keep `STATE_DIR/results/JOB_ID/`, with `outputs/outputs/NAME` and `provenance.json`.
+Only the queue writes there. A hidden `.lock` file in each experiment folder keeps run numbers unique, also between queues of different state directories. The worker downloads outputs into the folder (as does `compute-runner download`) and rewrites `job.json` and `runs.md` from the queue whenever a job changes, following the queue's change cursor, so a restart resumes where it stopped and edits to those two files are overwritten. Retries and continuations are the next runs of the same experiment. Jobs saved before run folders keep `STATE_DIR/results/JOB_ID/`, with `outputs/outputs/NAME` and `provenance.json`.
 
 ## Python API
 
