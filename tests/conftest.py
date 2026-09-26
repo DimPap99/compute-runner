@@ -1,4 +1,5 @@
 import json
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,9 @@ class FakeBackend:
         self.download_error = None
         self.download_calls = 0
         self.discovery_error = None
+        self.output_files = {"outputs/result.json": '{"ok": true}'}
+        self.live_text = "epoch 1\n"
+        self.live_calls = 0
 
     def active_runs(self):
         if self.discovery_error:
@@ -51,16 +55,31 @@ class FakeBackend:
             raise RemoteError("not found", "missing", definitive=True)
         return self.remote[ref]
 
-    def download(self, ref, destination, patterns):
+    def download(self, ref, destination, patterns, skip=None):
         self.download_calls += 1
         if self.download_error:
             raise self.download_error
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "run.log").write_text("remote completed\n")
-        return {}
+        # Remote names are relative to /kaggle/working, as on Kaggle.
+        receipts = {}
+        for name, text in self.output_files.items():
+            if (skip and skip(name)) or (
+                patterns is not None and not any(fnmatchcase(name, p) for p in patterns)
+            ):
+                continue
+            target = destination / "outputs" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            receipts[name] = {"bytes": len(text)}
+        return receipts
 
     def logs(self, ref, follow=False):
         yield "example log\n"
+
+    def live_log(self, ref):
+        self.live_calls += 1
+        return self.live_text
 
 
 @pytest.fixture

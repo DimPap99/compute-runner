@@ -107,16 +107,20 @@ def inventory(source: Path, exclude: list[str]) -> tuple[Path, list[Path]]:
 
 
 def clean_notebook(path: Path) -> bytes:
-    notebook = nbformat.read(path, as_version=4)
-    language = notebook.metadata.get("kernelspec", {}).get("language", "python")
-    if language.lower() != "python":
-        raise ValueError("Only Python notebooks are supported")
-    for cell in notebook.cells:
-        if cell.cell_type == "code":
-            cell.outputs = []
-            cell.execution_count = None
-    notebook.metadata.pop("widgets", None)
-    nbformat.validate(notebook)
+    # nbformat raises jsonschema's ValidationError, not a ValueError, while reading and validating.
+    try:
+        notebook = nbformat.read(path, as_version=4)
+        language = notebook.metadata.get("kernelspec", {}).get("language", "python")
+        if language.lower() != "python":
+            raise ValueError("Only Python notebooks are supported")
+        for cell in notebook.cells:
+            if cell.cell_type == "code":
+                cell.outputs = []
+                cell.execution_count = None
+        notebook.metadata.pop("widgets", None)
+        nbformat.validate(notebook)
+    except nbformat.ValidationError as error:
+        raise ValueError(f"Invalid notebook {path.name}: {error.message}") from None
     return nbformat.writes(notebook).encode()
 
 

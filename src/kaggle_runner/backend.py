@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import contextvars
 import fnmatch
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 
 from .store import atomic_json
@@ -86,10 +90,17 @@ def remote_error(error, *, mutation=False):
     return RemoteError(message, "uncertain" if mutation else "transient")
 
 
+# Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
+ACTIVE_HORIZON = timedelta(hours=24)
+
+# Read timeout for calls without an explicit timeout; lowered while snapshotting a live log stream.
+READ_TIMEOUT = contextvars.ContextVar("kgr_read_timeout", default=90)
+
+
 class TimeoutAdapter(HTTPAdapter):
     def send(self, request, **kwargs):
         if kwargs.get("timeout") is None:
-            kwargs["timeout"] = (15, 90)
+            kwargs["timeout"] = (15, READ_TIMEOUT.get())
         return super().send(request, **kwargs)
 
 
@@ -140,7 +151,7 @@ class KaggleBackend:
             rows = self.api.dataset_list(mine=True, page=page)
             if not rows:
                 return False
-            if any(row is not None and row.ref == ref for row in rows):
+            if any(row is not None and (row.ref or "").lower() == ref.lower() for row in rows):
                 return True
             page += 1
 
@@ -235,10 +246,16 @@ class KaggleBackend:
             raise remote_error(error) from error
 
     def active_runs(self):
-        """Best-effort account inventory; no metadata or source is written locally."""
+        """Best-effort account inventory; no metadata or source is written locally.
+
+        One status call per kernel quickly hits Kaggle's rate limit on accounts with many
+        notebooks. The listing is newest run first and a session lasts at most 12 hours,
+        so scanning stops at the first kernel whose last run is older than ACTIVE_HORIZON.
+        """
         result = {}
         token = None
         seen = set()
+        cutoff = datetime.now(timezone.utc) - ACTIVE_HORIZON
         try:
             while True:
                 response = self.api.kernels_list_with_response(
@@ -247,6 +264,13 @@ class KaggleBackend:
                 for kernel in response.kernels or []:
                     if kernel is None:
                         continue
+                    last_run = kernel.last_run_time
+                    if last_run is not None:
+                        # The service returns naive UTC timestamps.
+                        if last_run.tzinfo is None:
+                            last_run = last_run.replace(tzinfo=timezone.utc)
+                        if last_run < cutoff:
+                            return result
                     ref = kernel.ref
                     if not ref or ref.split("/")[0].lower() != self.owner.lower():
                         continue
@@ -306,8 +330,6 @@ class KaggleBackend:
                 return
             seen = 0
             failures = 0
-            import time
-
             while failures < 5:
                 before = seen
                 try:
@@ -327,6 +349,35 @@ class KaggleBackend:
             )
         except Exception as error:
             raise remote_error(error) from error
+
+    def live_log(self, ref, *, idle_seconds=5, max_seconds=20):
+        """Bounded snapshot of a session's log, including one that is still running.
+
+        Persisted logs appear only after a session ends. The stream endpoint replays the
+        log from the start, so read until it goes idle, ends, or max_seconds elapse.
+        """
+        chunks = []
+        deadline = time.monotonic() + max_seconds
+        token = READ_TIMEOUT.set(idle_seconds)
+        try:
+            stream = self.api.kernels_logs_stream(ref)
+            try:
+                for event in stream:
+                    if event.get("data") is not None:
+                        chunks.append(str(event["data"]))
+                    if time.monotonic() >= deadline:
+                        break
+            finally:
+                stream.close()
+        except requests.RequestException as error:
+            # An idle stream ends the snapshot; other failures before any output are errors.
+            if not chunks and not _read_timeout(error):
+                raise remote_error(error) from error
+        except Exception as error:
+            raise remote_error(error) from error
+        finally:
+            READ_TIMEOUT.reset(token)
+        return "".join(chunks)
 
     def output_pages(self, ref):
         from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
@@ -352,8 +403,14 @@ class KaggleBackend:
                 raise RemoteError("Repeated output pagination token")
             seen.add(token)
 
-    def download(self, ref, destination: Path, patterns=None):
-        return download_outputs(self.output_pages(ref), destination, patterns)
+    def download(self, ref, destination: Path, patterns=None, *, skip=None):
+        return download_outputs(self.output_pages(ref), destination, patterns, skip=skip)
+
+
+def _read_timeout(error):
+    return isinstance(error, requests.ReadTimeout) or any(
+        isinstance(arg, urllib3.exceptions.ReadTimeoutError) for arg in error.args
+    )
 
 
 def render_log(raw):
@@ -375,7 +432,8 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def download_outputs(pages, destination, patterns=None, *, get=requests.get):
+def download_outputs(pages, destination, patterns=None, *, skip=None, get=requests.get):
+    """Download session outputs; names matching the skip predicate are not fetched."""
     from .bundle import safe_relative
 
     destination = Path(destination)
@@ -395,6 +453,8 @@ def download_outputs(pages, destination, patterns=None, *, get=requests.get):
             target = root / name
             if not target.resolve().is_relative_to(root.resolve()):
                 raise ValueError("Output resolves outside the destination")
+            if skip is not None and skip(name):
+                continue
             if patterns is not None and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
                 continue
             if name in receipts and target.is_file() and sha256(target) == receipts[name]["sha256"]:

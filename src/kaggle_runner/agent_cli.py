@@ -28,6 +28,8 @@ def response(function):
             if isinstance(error, ValidationError):
                 detail = error.errors(include_input=False, include_url=False)[0]
                 message = f"Invalid {'.'.join(map(str, detail['loc']))}: {detail['msg']}"
+            elif isinstance(error, KeyError) and error.args:
+                message = str(error.args[0])  # str(KeyError) would add repr quotes
             else:
                 message = str(error)
             typer.echo(json.dumps({"schema_version": 1, "error": short(message)}, ensure_ascii=False))
@@ -98,6 +100,28 @@ def changes(ctx: typer.Context, after: int = 0, batch: str | None = None, limit:
 def logs(ctx: typer.Context, job_id: str, tail: int = 50, max_bytes: int = 8192, refresh: bool = False):
     """Bounded log tail plus path to full cached logs; --refresh fetches a fresh remote snapshot."""
     return ctx.obj["client"].agent().logs(job_id, tail=tail, max_bytes=max_bytes, refresh=refresh)
+
+
+@agent_app.command("wait")
+@response
+def wait(
+    ctx: typer.Context,
+    job_ids: Annotated[list[str] | None, typer.Argument()] = None,
+    batch: str | None = None,
+    timeout: float = 300,
+    downloads: Annotated[bool, typer.Option("--downloads/--no-downloads")] = True,
+    limit: int = 20,
+):
+    """Block until the selected jobs settle or --timeout seconds pass; check timed_out, not the exit code."""
+    agent = ctx.obj["client"].agent()
+    return agent.wait(job_ids, batch_id=batch, timeout=timeout, downloads=downloads, limit=limit)
+
+
+@agent_app.command("outputs")
+@response
+def outputs(ctx: typer.Context, job_id: str, limit: int = 100, offset: int = 0):
+    """List downloaded output files (paths relative to root) and the run log path."""
+    return ctx.obj["client"].agent().outputs(job_id, limit=limit, offset=offset)
 
 
 @agent_app.command("retry")

@@ -169,15 +169,22 @@ class Store:
             return self._batch(db, batch_id)
 
     def resolve_id(self, prefix):
-        if not prefix:
+        return self.resolve_ids([prefix])[0]
+
+    def resolve_ids(self, prefixes):
+        """Resolve unambiguous job ID prefixes using one connection."""
+        if not all(prefixes):
             raise ValueError("A job ID is required")
+        result = []
         with self.connection() as db:
-            rows = db.execute(
-                "SELECT id FROM jobs WHERE substr(id,1,?)=? LIMIT 2", (len(prefix), prefix)
-            ).fetchall()
-        if len(rows) != 1:
-            raise ValueError(f"Expected one matching job for {prefix}; found {len(rows)}")
-        return rows[0][0]
+            for prefix in prefixes:
+                rows = db.execute(
+                    "SELECT id FROM jobs WHERE substr(id,1,?)=? LIMIT 2", (len(prefix), prefix)
+                ).fetchall()
+                if len(rows) != 1:
+                    raise ValueError(f"Expected one matching job for {prefix}; found {len(rows)}")
+                result.append(rows[0][0])
+        return result
 
     @staticmethod
     def _filters(db, batch_id=None, job_ids=None, states=None):

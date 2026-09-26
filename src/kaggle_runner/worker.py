@@ -30,7 +30,9 @@ def collect_outputs(store, backend, job_id):
             return store.get(job_id)
         try:
             store.update(job_id, download_state="downloading", download_error=None)
-            backend.download(job.remote_ref, job.result_dir, job.spec.output_patterns)
+            backend.download(
+                job.remote_ref, job.result_dir, job.spec.output_patterns, skip=source_copies(job)
+            )
             updated = store.update(job_id, download_state="complete", download_error=None)
             atomic_json(job.result_dir / "provenance.json", updated.model_dump(mode="json"))
             return updated
@@ -46,12 +48,29 @@ def collect_outputs(store, backend, job_id):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def source_copies(job):
+    """Match output names of the project copy the runtime made; saved bundles already hold them.
+
+    Files the workload creates under the project folder are still downloaded, except
+    __pycache__ bytecode. In-place edits of snapshot files are not collected.
+    """
+    names = {f"project/{name}" for name in job.snapshot["source"]["files"]}
+    return lambda name: name in names or (name.startswith("project/") and "__pycache__" in name.split("/"))
+
+
 def outstanding(job):
     return bool(
         job.attempts
         and job.attempts[-1].state in {"submitting", "accepted", "uncertain"}
         and job.state not in TERMINAL
     )
+
+
+def settled(job, *, downloads=True):
+    """Nothing further happens without operator action, apart from download retries."""
+    if job.state in {"blocked", "needs_attention"}:
+        return True
+    return job.terminal and (not downloads or job.download_state in {"complete", "disabled", "error"})
 
 
 class Worker:
@@ -346,7 +365,7 @@ class Worker:
             result = self.backend.push(
                 folder, timeout_seconds=job.spec.timeout_seconds, accelerator=job.spec.accelerator
             )
-            if result["ref"] != ref:
+            if result["ref"].lower() != ref.lower():
                 raise RemoteError(
                     "Kaggle returned an unexpected notebook identity; reconcile manually", "uncertain"
                 )

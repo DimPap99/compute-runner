@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from kaggle_runner import AgentClient, Client, JobSpec
 from kaggle_runner.cli import app
 from kaggle_runner.store import Store
+from conftest import due
 
 
 def test_request_replay_survives_restart_missing_source_and_completion(setup):
@@ -218,6 +219,9 @@ def test_bounded_utf8_logs_are_cached_and_failed_refresh_keeps_old_copy(setup):
     client, backend, spec = setup
     job = client.submit(spec)
     client.worker().tick()
+    backend.remote[client.get(job.id).remote_ref]["state"] = "COMPLETE"
+    due(client, job.id)
+    client.worker().tick()
     calls = []
     data = "".join(f"line {i}: Ελληνικά 🌍\n" for i in range(200))
 
@@ -294,7 +298,8 @@ def test_cli_agent_batch_workflow_and_structured_errors(setup, tmp_path, monkeyp
     assert changed["has_more"]
     client.worker().tick()
     assert len(backend.pushes) == 2
-    assert command(["logs", job_id])["text"] == "example log\n"
+    running_log = command(["logs", job_id])
+    assert running_log["text"] == "epoch 1\n" and running_log["live"]
     assert "error" in command(["cancel", job_id], code=1)
     assert "error" in command(["status", "--limit", "101"], code=1)
     assert "error" in command(["changes", "--batch", "unknown"], code=1)

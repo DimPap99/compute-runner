@@ -138,7 +138,7 @@ Single files are embedded in a generated private kernel. Project directories and
 
 Unversioned dataset references are resolved when the worker prepares the job. Supply a version to select a specific dataset revision. The runtime accepts expanded Kaggle inputs or archives and verifies bundle contents before execution.
 
-Project code runs from `/kaggle/working/project`. Write result files under `KGR_OUTPUT_DIR`, which points to `/kaggle/working/outputs`. Named inputs are exposed through `KGR_INPUT_<UPPERCASE_ALIAS>` and the `KGR_INPUTS_JSON` mapping. Existing Kaggle dataset attachments remain under `/kaggle/input`.
+Project code runs from `/kaggle/working/project`. Write result files under `KGR_OUTPUT_DIR`, which points to `/kaggle/working/outputs`. Output names are relative to `/kaggle/working`, so a file written to `KGR_OUTPUT_DIR` is saved locally as `results/JOB_ID/outputs/outputs/NAME`. Downloads skip the runtime's copy of the snapshot files under `project/` and its `__pycache__` bytecode; new files the workload writes under `project/` are still collected. Named inputs are exposed through `KGR_INPUT_<UPPERCASE_ALIAS>` and the `KGR_INPUTS_JSON` mapping. Existing Kaggle dataset attachments remain under `/kaggle/input`.
 
 The workload uses Kaggle's Python environment. A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. Do not put credentials in `env`, as those values are stored with the job.
 
@@ -176,8 +176,8 @@ print(finished.state, finished.download_state, finished.result_dir)
 | `submit_batch(specs, request_key=None)` | Queue a batch and return a `BatchRecord` |
 | `batch(batch_id)` | Read a batch and its current job records |
 | `get(job_id)`, `list(states=None)` | Read saved job records |
-| `wait(job_id, timeout=None, downloads=True)` | Wait for execution and downloads. Return early for blocked or unresolved work |
-| `logs(job_id, follow=False)` | Yield persisted logs or follow the remote log stream |
+| `wait(job_id, timeout=None, downloads=True)` | Wait for execution and downloads. Return early for blocked or unresolved work, or when output collection failed |
+| `logs(job_id, follow=False)` | Yield persisted logs of a finished run, a bounded snapshot of an unfinished one, or follow the remote log stream |
 | `download(job_id)` | Collect outputs from a submitted job whose execution has terminated |
 | `retry(job_id, request_key=None)` | Create a job from the original saved files and settings |
 | `retry_batch(job_id, request_key=None)` | Create a retry and return its single-job batch |
@@ -190,7 +190,7 @@ print(finished.state, finished.download_state, finished.result_dir)
 
 Use complete job IDs with `Client`. Optional parameters shown after the first argument are keyword arguments. Creating a client or reading local state does not authenticate to Kaggle. Submission is local, while logs, downloads, and quota queries access Kaggle when needed.
 
-`wait` raises `TimeoutError` when its local wait deadline expires. This does not cancel the job. With `downloads=False`, it returns after execution terminates. A blocked or uncertain job is returned for inspection. Waiting on unfinished work without a running worker raises an error.
+`wait` raises `TimeoutError` when its local wait deadline expires. This does not cancel the job. With `downloads=False`, it returns after execution terminates. A blocked or uncertain job is returned for inspection, as is a finished job whose `download_state` is `error`; the worker keeps retrying that download. Waiting on unfinished work without a running worker raises an error.
 
 ## Agent interface
 
@@ -204,6 +204,8 @@ kgr agent status JOB_ID_1 JOB_ID_2
 kgr agent status --state running --state failed
 kgr agent changes --batch BATCH_ID --after 0
 kgr agent logs JOB_ID --tail 50 --max-bytes 8192
+kgr agent wait --batch BATCH_ID --timeout 300
+kgr agent outputs JOB_ID
 kgr agent health
 ```
 
@@ -271,11 +273,31 @@ kgr agent logs JOB_ID --tail 50 --max-bytes 8192
 kgr agent logs JOB_ID --refresh
 ```
 
-The first call fetches the remote log and saves a private local copy. Later calls read that copy unless `--refresh` is supplied. A failed refresh preserves the existing cache.
+Kaggle stores a session's log only after it ends. While a submitted job is unfinished, every call reads a live snapshot from Kaggle's log stream, which replays the log from the start. The read stops after 5 idle seconds or 20 seconds in total, and the response has `live: true`.
 
-The response contains `text`, `bytes`, `total_bytes`, `truncated`, `path`, `fetched`, and `cached_at`, together with `schema_version` and the job `id`. `path` identifies the full cached log. `cached_at` is its modification time as a Unix timestamp.
+For a finished job, the first call fetches the stored log and saves a private local copy. Later calls read that copy unless `--refresh` is supplied or the job has finished since the copy was saved. A failed refresh preserves the existing cache.
 
-The default response contains at most 50 lines and 8192 UTF-8 bytes. The maximum permitted limits are 500 lines and 65536 bytes. Byte truncation can leave a partial first line. The size limit applies to the returned text, not the download from Kaggle. Agent log retrieval does not follow a stream.
+The response contains `text`, `bytes`, `total_bytes`, `truncated`, `path`, `fetched`, `cached_at`, and `live`, together with `schema_version` and the job `id`. `path` identifies the full cached log. `cached_at` is its modification time as a Unix timestamp.
+
+The default response contains at most 50 lines and 8192 UTF-8 bytes. The maximum permitted limits are 500 lines and 65536 bytes. Lines are split on `\n` only, so carriage-return progress bars count as one line. Byte truncation can leave a partial first line. The size limit applies to the returned text, not the download from Kaggle. Agent log retrieval does not follow a stream.
+
+### Waiting
+
+```bash
+kgr agent wait --batch BATCH_ID --timeout 300
+kgr agent wait JOB_ID_1 JOB_ID_2 --timeout 600 --no-downloads
+```
+
+`wait` blocks until every selected job settles or the timeout passes, then returns the same fields as `status` plus `settled`, `timed_out`, and `waited_seconds`. A job is settled when it is terminal and its downloads are complete, disabled, or failed, or when it is `blocked` or `needs_attention`. With `--no-downloads`, terminal state is enough. A timeout is not an error, so check `timed_out` and call again if needed. The timeout can be 0 to 86400 seconds. Keep it below the command timeout of the calling tool. `wait` reads local state only. It fails if the worker stays stopped for 30 seconds.
+
+### Outputs
+
+```bash
+kgr agent outputs JOB_ID
+kgr agent outputs JOB_ID --limit 100 --offset 100
+```
+
+`outputs` lists downloaded files without reading them. The response contains `root`, `total`, `files` (each with `path` relative to `root` and `bytes`), `next_offset`, `state`, `downloads`, `outputs_ready`, and, when available, `download_error` and `log_path`. Files written to `KGR_OUTPUT_DIR` appear as `outputs/NAME`. Read them from `root` with ordinary file tools. The listing can be partial until `outputs_ready` is true.
 
 ### Python access
 
@@ -304,6 +326,8 @@ cursor = page["cursor"]
 | `status(job_ids=None, batch_id=None, states=None, limit=20, offset=0)` | Paginated job summaries and counts |
 | `changes(after=0, batch_id=None, limit=20)` | Changed jobs and the next event cursor |
 | `logs(job_id, tail=50, max_bytes=8192, refresh=False)` | Bounded text and cache metadata |
+| `wait(job_ids=None, batch_id=None, timeout=300, downloads=True, limit=20)` | Status once the selection settles or the timeout passes |
+| `outputs(job_id, limit=100, offset=0)` | Downloaded file listing |
 | `retry(job_id, request_key=...)` | Retry batch status and replay flag |
 | `cancel(job_id)` | Updated job status. Repeated cancellation of a cancelled job is accepted |
 | `health()` | Worker lock and heartbeat summary |
@@ -346,7 +370,7 @@ kgr init --owner YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1 --poll-seconds
 kgr service restart
 ```
 
-A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
+A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing does not report whether an external run uses a GPU, so external runs count against the CPU limit. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
 Dataset preparation and uploads run in the dispatcher and can extend a polling cycle. Output downloads run separately.
 

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
+import time
 from pathlib import Path
 from typing import get_args
 
 from .backend import safe_message
 from .models import JobState
+from .worker import settled
 
 
 def short(value, limit=400):
@@ -88,7 +91,7 @@ class AgentClient:
         if job_ids is not None:
             if isinstance(job_ids, str) or not 1 <= len(job_ids) <= 100:
                 raise ValueError("job_ids must contain between 1 and 100 IDs")
-            job_ids = list(dict.fromkeys(self.client.store.resolve_id(j) for j in job_ids))
+            job_ids = list(dict.fromkeys(self.client.store.resolve_ids(list(job_ids))))
         if states is not None:
             if isinstance(states, str) or not states or not set(states) <= set(get_args(JobState)):
                 raise ValueError("states must be a nonempty list or set of valid job states")
@@ -120,8 +123,7 @@ class AgentClient:
 
     def preview(self, specs):
         """Small upload inventory; no snapshots, queue writes, or remote calls."""
-        if not 1 <= len(specs) <= 1000:
-            raise ValueError("A batch must contain between 1 and 1000 jobs")
+        self.client.check_batch_size(specs)
         plans = [self.client.preview(spec) for spec in specs]
         return dict(
             schema_version=1,
@@ -169,16 +171,26 @@ class AgentClient:
     def logs(self, job_id, *, tail=50, max_bytes=8192, refresh=False):
         """Cache full logs privately on disk; return at most tail lines and max_bytes UTF-8 bytes.
 
-        First use or refresh=True makes one remote read (never follows a stream).
-        Cached reads work offline. Cache replacement is atomic even on fetch failure.
+        An unfinished job gets a bounded live snapshot on every call (live=True). For a
+        finished job, first use, refresh=True, or a cache saved before it finished makes one
+        remote read (never follows a stream). Other cached reads work offline.
+        Cache replacement is atomic even on fetch failure.
         """
         if type(tail) is not int or not 1 <= tail <= 500:
             raise ValueError("tail must be an integer between 1 and 500")
         if type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
             raise ValueError("max_bytes must be an integer between 1 and 65536")
         job_id = self.client.store.resolve_id(job_id)
+        job = self.client.get(job_id)
         path = self.client.config.state_dir / "logs" / f"{job_id}.log"
-        fetched = refresh or not path.exists()
+        # An unfinished run's log keeps growing, so it is always re-read as a bounded live snapshot.
+        live = job.remote_ref is not None and not job.terminal
+        fetched = (
+            refresh
+            or live
+            or not path.exists()
+            or (job.finished_at is not None and path.stat().st_mtime < job.finished_at)
+        )
         if fetched:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             descriptor, temporary = tempfile.mkstemp(prefix=f".{job_id}-", dir=path.parent)
@@ -195,8 +207,10 @@ class AgentClient:
             stat = os.fstat(stream.fileno())
             stream.seek(max(0, stat.st_size - max_bytes))
             data = stream.read(max_bytes)
-        # ignore only an incomplete UTF-8 code point at the leading byte boundary.
-        text = "".join(data.decode("utf-8", errors="ignore").splitlines(keepends=True)[-tail:])
+        # Drops undecodable bytes (e.g. a code point split at the leading byte boundary).
+        # Lines split on "\n" only, so "\r" progress-bar updates do not consume the tail.
+        decoded = data.decode("utf-8", errors="ignore")
+        text = "".join(re.findall(r"[^\n]*\n|[^\n]+", decoded)[-tail:])
         size = len(text.encode("utf-8"))
         return dict(
             schema_version=1,
@@ -208,4 +222,72 @@ class AgentClient:
             path=str(path),
             fetched=fetched,
             cached_at=stat.st_mtime,
+            live=live,
         )
+
+    def wait(self, job_ids=None, *, batch_id=None, timeout=300, downloads=True, limit=20):
+        """Block until every selected job settles or timeout seconds pass; a timeout is not an error.
+
+        Settled means terminal with downloads complete, disabled or failed (or downloads=False),
+        or blocked/needs_attention. Reads local state only; the worker does the remote work.
+        """
+        _page_bounds(limit)
+        if type(timeout) not in (int, float) or not 0 <= timeout <= 86400:
+            raise ValueError("timeout must be between 0 and 86400 seconds")
+        if (job_ids is None) == (batch_id is None):
+            raise ValueError("Select either job IDs or a batch")
+        if job_ids is not None:
+            if isinstance(job_ids, str) or not 1 <= len(job_ids) <= 100:
+                raise ValueError("job_ids must contain between 1 and 100 IDs")
+            job_ids = list(dict.fromkeys(self.client.store.resolve_ids(list(job_ids))))
+        started = time.monotonic()
+        stopped_since = None
+        while True:
+            _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
+            done = all(settled(job, downloads=downloads) for job in jobs)
+            elapsed = time.monotonic() - started
+            if done or elapsed >= timeout:
+                break
+            if self.client.worker_health()["running"]:
+                stopped_since = None
+            else:
+                # Tolerate a service restart; a worker that stays down would make this wait pointless.
+                stopped_since = stopped_since or time.monotonic()
+                if time.monotonic() - stopped_since >= 30:
+                    raise RuntimeError("No worker is running. Start kgr service start or kgr worker run")
+            time.sleep(min(2, self.client.config.poll_seconds, max(0.1, timeout - elapsed)))
+        return self.status(job_ids, batch_id=batch_id, limit=limit) | dict(
+            settled=done, timed_out=not done, waited_seconds=round(elapsed)
+        )
+
+    def outputs(self, job_id, *, limit=100, offset=0):
+        """List downloaded output files, relative to root, without reading them.
+
+        Remote names are relative to /kaggle/working, so KGR_OUTPUT_DIR files appear as outputs/NAME.
+        """
+        _page_bounds(limit, offset)
+        job = self.client.get(self.client.store.resolve_id(job_id))
+        root = job.result_dir / "outputs"
+        files = sorted(
+            (path.relative_to(root).as_posix(), path.stat().st_size)
+            for path in (root.rglob("*") if root.is_dir() else [])
+            if path.is_file() and not path.name.startswith(".kgr-")
+        )
+        page = files[offset : offset + limit]
+        log = job.result_dir / "run.log"
+        value = dict(
+            schema_version=1,
+            id=job.id,
+            state=job.state,
+            downloads=job.download_state,
+            outputs_ready=job.download_state == "complete",
+            root=str(root),
+            total=len(files),
+            files=[{"path": name, "bytes": size} for name, size in page],
+            next_offset=offset + len(page) if offset + len(page) < len(files) else None,
+        )
+        if job.download_error:
+            value["download_error"] = short(job.download_error)
+        if log.is_file():
+            value["log_path"] = str(log)
+        return value

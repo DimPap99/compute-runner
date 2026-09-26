@@ -14,7 +14,7 @@ from .backend import KaggleBackend
 from .bundle import describe, snapshot
 from .models import BatchRecord, Config, JobRecord, JobSpec
 from .store import Store, load_config
-from .worker import Worker, collect_outputs, outstanding
+from .worker import Worker, collect_outputs, outstanding, settled
 
 
 class Client:
@@ -45,6 +45,11 @@ class Client:
         return self.submit_batch([spec], request_key=request_key).jobs[0]
 
     @staticmethod
+    def check_batch_size(specs):
+        if not 1 <= len(specs) <= 1000:
+            raise ValueError("A batch must contain between 1 and 1000 jobs")
+
+    @staticmethod
     def _fingerprint(value, request_key):
         if request_key is not None and (
             not isinstance(request_key, str)
@@ -63,8 +68,7 @@ class Client:
         """
         if not self.config.owner:
             raise ValueError("Configure your account first: kgr init --owner YOUR_USERNAME")
-        if not 1 <= len(specs) <= 1000:
-            raise ValueError("A batch must contain between 1 and 1000 jobs")
+        self.check_batch_size(specs)
         normalized = []
         for spec in specs:
             spec = JobSpec.model_validate(spec.model_dump())
@@ -177,12 +181,11 @@ class Client:
         )
 
     def wait(self, job_id, *, timeout=None, downloads=True):
+        """Return once the job settles; a failed download is returned too (the worker retries it)."""
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             job = self.get(job_id)
-            if job.state in {"blocked", "needs_attention"}:
-                return job
-            if job.terminal and (not downloads or job.download_state in {"complete", "disabled"}):
+            if settled(job, downloads=downloads):
                 return job
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Waiting for {job_id} timed out; the job remains tracked")
@@ -191,9 +194,14 @@ class Client:
             time.sleep(min(self.config.poll_seconds, 2))
 
     def logs(self, job_id, *, follow=False):
+        """Persisted logs of a finished run, a bounded snapshot of an unfinished one, or a stream."""
         job = self.get(job_id)
         if not job.remote_ref:
             raise ValueError("This job has not been submitted to Kaggle yet")
+        if not follow and not job.terminal:
+            # Kaggle persists logs only after a session ends.
+            yield self.backend.live_log(job.remote_ref)
+            return
         yield from self.backend.logs(job.remote_ref, follow=follow)
 
     def download(self, job_id):
