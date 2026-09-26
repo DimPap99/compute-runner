@@ -450,11 +450,19 @@ def test_remote_cancel_uses_the_session_id_logged_by_this_job(tmp_path):
     backend.live_log = lambda ref: (
         "KGR workload other session 1\nKGR workload job1 session 352993764\ntick 3\n"
     )
-    backend.cancel("tester/kgr-x", "job1")
+    assert backend.cancel("tester/kgr-x", "job1") is False
     assert sent == [("cancel_kernel_session", 352993764)]
+    # Started but not yet logged its session: nothing safe to do yet.
     backend.live_log = lambda ref: "KGR workload other session 1\n"
+    backend.status = lambda ref: dict(state="running")
     with pytest.raises(ValueError, match="No session ID"):
         backend.cancel("tester/kgr-x", "job1")
+    # Still queued: no session exists, so the attempt's launch notebook is deleted.
+    deleted = []
+    backend.status = lambda ref: dict(state="queued")
+    backend._kernels = lambda method, request, ref=None: deleted.append((method, ref)) or Obj(error_message="")
+    assert backend.cancel("tester/kgr-x", "job1") is True
+    assert deleted == [("delete_kernel", "tester/kgr-x")]
     backend.live_log = lambda ref: "KGR workload job1 session 5\n"
     backend._kernels = lambda *args, **kwargs: Obj(error_message="Session already finished")
     with pytest.raises(RemoteError, match="already finished"):

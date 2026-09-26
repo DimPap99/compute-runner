@@ -232,6 +232,20 @@ def test_pending_cancel_is_local_and_active_cancel_stops_the_remote_run(setup):
         client.cancel(active.id)
 
 
+def test_cancelling_a_run_still_queued_on_the_provider_ends_it_at_once(setup):
+    client, backend, spec = setup
+    backend.delete_queued = True
+    job = client.submit(spec)
+    client.worker().tick()
+    cancelled = client.cancel(job.id)
+    assert cancelled.state == "cancelled" and cancelled.download_state == "disabled"
+    assert cancelled.wait_reason == "Cancelled before it started on kaggle:tester"
+    # The worker has nothing left to poll, and a retry is allowed.
+    client.worker().tick()
+    assert client.get(job.id).state == "cancelled"
+    assert client.retry(job.id).state == "queued"
+
+
 def test_cancel_refuses_unconfirmed_submissions(setup):
     client, backend, spec = setup
     backend.push_error = RemoteError("timeout", "uncertain")

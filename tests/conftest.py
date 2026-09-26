@@ -31,6 +31,7 @@ class FakeProvider(KaggleProvider):
         self.live_calls = 0
         self.cancelled = []
         self.cancel_error = None
+        self.delete_queued = False
         # owner/slug datasets this account cannot read, and the files fetch_dataset returns.
         self.unreadable = set()
         self.dataset_files = {"train.csv": "a,b\n1,2\n"}
@@ -94,7 +95,11 @@ class FakeProvider(KaggleProvider):
         if self.cancel_error:
             raise self.cancel_error
         self.cancelled.append(ref)
+        if self.remote[ref]["state"] == "QUEUED" and self.delete_queued:
+            del self.remote[ref]
+            return True
         self.remote[ref] = dict(state="CANCEL_REQUESTED", error=None)
+        return False
 
     def live_log(self, ref):
         self.live_calls += 1

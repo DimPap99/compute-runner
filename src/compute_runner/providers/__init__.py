@@ -70,7 +70,9 @@ class Provider(Protocol):
         state is queued, running, cancelling, succeeded, failed or cancelled; None if unrecognized.
         """
 
-    def cancel(self, ref: str, job_id: str) -> None: ...
+    def cancel(self, ref: str, job_id: str) -> bool:
+        """Stop a run. True when it was removed before it started, so it is cancelled now;
+        False when a stop was requested and polling reports the outcome."""
 
     def active_runs(self) -> dict[str, str]:
         """Runs holding this account's capacity, including ones started elsewhere: {ref: cpu|gpu|unknown}."""

@@ -560,7 +560,7 @@ compute-runner agent retry JOB_ID --request-key resolved-retry-v1
 
 `compute-runner logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
 
-`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
+`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job still queued on Kaggle has no session yet: cancellation deletes that attempt's launch notebook instead, which removes the run from Kaggle's queue, and the job becomes `cancelled` at once with the reason `Cancelled before it started on ACCOUNT`. A job that is starting but has not printed its session ID yet, or was submitted by an older version of the runner, cannot be cancelled; try again shortly or stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
 ## State and outputs
 
@@ -598,7 +598,7 @@ Back up the database before upgrading. To restore an older application version, 
 
 - Scheduling starts jobs when capacity becomes available. Start times, recurring schedules, and dependency graphs are not implemented.
 - Checkpoint continuation requires the stopped run's outputs to be downloaded first.
-- Remote cancellation needs the run to have started and to have been submitted by this version of the runner.
+- Remote cancellation of a running job needs its session ID, printed at startup by this version of the runner; a job still queued on Kaggle is cancelled by deleting its launch notebook.
 - HTTP and MCP servers are not included.
 - Only aliased dataset inputs can be copied between accounts, and copying runs in the dispatcher.
 - Job completion does not automatically resume an LLM conversation.

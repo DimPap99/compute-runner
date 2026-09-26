@@ -219,7 +219,15 @@ class Client:
             attempt = job.attempts[-1]
             if attempt.state != "accepted":
                 raise ValueError(f"The submission is unconfirmed; inspect it first: {job.url}")
-            self.provider(attempt.account).cancel(attempt.ref, job.id)
+            if self.provider(attempt.account).cancel(attempt.ref, job.id):
+                # Removed before it started: no run remains for the worker to poll.
+                return self.store.update(
+                    job_id,
+                    state="cancelled",
+                    finished_at=time.time(),
+                    wait_reason=f"Cancelled before it started on {attempt.account}",
+                    download_state="disabled",
+                )
             return self.store.update(
                 job_id, wait_reason=f"Cancellation requested on {attempt.account}", next_action_at=0
             )

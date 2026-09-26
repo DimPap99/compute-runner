@@ -321,19 +321,33 @@ class KaggleProvider:
         return "gpu" if metadata.enable_gpu else "cpu"
 
     def cancel(self, ref, job_id):
-        """Stop a running session. The runtime logs its session ID, which the public API never returns."""
-        from kagglesdk.kernels.types.kernels_api_service import ApiCancelKernelSessionRequest
+        """Stop a run; True when it was removed before it started.
+
+        A running session is cancelled by the ID its runtime logged, which the public API never
+        returns. A run still queued has no session yet, so the attempt's own launch notebook is
+        deleted instead, which drops it from Kaggle's queue.
+        """
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiCancelKernelSessionRequest,
+            ApiDeleteKernelRequest,
+        )
 
         found = re.search(rf"^KGR workload {job_id} session (\d+)$", self.live_log(ref), re.M)
-        if not found:
+        if found:
+            request = ApiCancelKernelSessionRequest()
+            request.kernel_session_id = int(found.group(1))
+            response = self._kernels("cancel_kernel_session", request)
+            if response.error_message:
+                raise RemoteError(response.error_message, "invalid", definitive=True)
+            return False
+        if self.status(ref)["state"] != "queued":
             raise ValueError(
-                "No session ID in this run's log yet (it has not started, or predates remote cancellation)"
+                "No session ID in this run's log yet (it is starting, or predates remote cancellation)"
             )
-        request = ApiCancelKernelSessionRequest()
-        request.kernel_session_id = int(found.group(1))
-        response = self._kernels("cancel_kernel_session", request)
+        response = self._kernels("delete_kernel", ApiDeleteKernelRequest(), ref)
         if response.error_message:
             raise RemoteError(response.error_message, "invalid", definitive=True)
+        return True
 
     def active_runs(self):
         """Best-effort account inventory; no metadata or source is written locally.
