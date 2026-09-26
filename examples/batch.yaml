@@ -1,0 +1,9 @@
+jobs:
+  - name: hello-one
+    source: hello.py
+    timeout_seconds: 300
+  - name: project-two
+    source: project
+    module: demo.train
+    args: ["--value", "12"]
+    timeout_seconds: 300

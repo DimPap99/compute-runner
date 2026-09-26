@@ -1,0 +1,8 @@
+name: project-example
+source: project
+module: demo.train
+args: ["--value", "9"]
+gpu: false
+internet: false
+timeout_seconds: 300
+output_patterns: ["outputs/*.json"]

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggle-runner-local"
+version = "0.1.0"
+description = "Persistent local queue, Python API and CLI for private Kaggle workloads"
+requires-python = ">=3.12"
+dependencies = ["kaggle==2.2.4", "kagglesdk==0.1.37", "pydantic>=2,<3", "typer>=0.12,<1", "rich>=13,<15", "PyYAML>=6,<7", "pathspec>=0.12,<1", "nbformat>=5,<6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.6,<1"]
+
+[project.scripts]
+kgr = "kaggle_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -1,0 +1,158 @@
+"""Standard-library-only bootstrap copied into Kaggle workloads."""
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+
+def _safe_name(name):
+    p = PurePosixPath(name)
+    if p.is_absolute() or ".." in p.parts or "\\" in name or not p.parts:
+        raise ValueError("Unsafe bundle path: " + name)
+    return p.as_posix()
+
+
+def _manifest(data, digest):
+    records = data["files"]
+    actual = hashlib.sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if actual != digest or data.get("digest") != digest or data.get("schema_version") != 1:
+        raise ValueError("Bundle manifest hash mismatch")
+    for name in records:
+        _safe_name(name)
+    return records
+
+
+def _verify(root, records):
+    for name, record in records.items():
+        file = root / name
+        if (
+            file.is_symlink()
+            or not file.is_file()
+            or not file.resolve().is_relative_to(root.resolve())
+            or file.stat().st_size != record["size"]
+        ):
+            raise ValueError("Bundle file invalid: " + name)
+        digest = hashlib.sha256()
+        with file.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("Bundle checksum mismatch: " + name)
+
+
+def _unpack(archive_path, digest, target):
+    with zipfile.ZipFile(archive_path) as archive:
+        manifest = json.loads(archive.read("kgr-manifest.json"))
+        records = _manifest(manifest, digest)
+        names = archive.namelist()
+        if len(names) != len(set(names)) or set(names) != set(records) | {"kgr-manifest.json"}:
+            raise ValueError("Unexpected or duplicate archive members")
+        for info in archive.infolist():
+            _safe_name(info.filename)
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise ValueError("Symlinks are forbidden in bundles")
+            if info.filename == "kgr-manifest.json":
+                continue
+            if info.file_size != records[info.filename]["size"]:
+                raise ValueError("Archive size differs from manifest")
+            output = target / info.filename
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, output.open("wb") as sink:
+                shutil.copyfileobj(source, sink, 1024 * 1024)
+    _verify(target, records)
+    return target
+
+
+def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
+    owner, slug = ref.split("/")[:2]
+    roots = [input_root / slug, input_root / "datasets" / owner / slug]
+    candidates = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for manifest_file in root.rglob("kgr-manifest.json"):
+            try:
+                records = _manifest(json.loads(manifest_file.read_text()), digest)
+            except (KeyError, ValueError):
+                continue
+            _verify(manifest_file.parent, records)
+            candidates.append(("directory", manifest_file.parent, records))
+        if not candidates:
+            for archive_file in root.rglob("payload.zip"):
+                with zipfile.ZipFile(archive_file) as archive:
+                    records = _manifest(json.loads(archive.read("kgr-manifest.json")), digest)
+                candidates.append(("archive", archive_file, records))
+    # Resolve duplicate paths if two mount conventions alias the same location.
+    candidates = list({str(item[1].resolve()): item for item in candidates}.values())
+    if len(candidates) != 1:
+        raise FileNotFoundError(f"Expected one verified bundle for {ref}; found {len(candidates)}")
+    return candidates[0]
+
+
+def bootstrap(config):
+    project = Path(config.get("working_root", "/kaggle/working")) / "project"
+    project.mkdir(parents=True, exist_ok=False)
+    if config.get("inline"):
+        for name, value in config["inline"].items():
+            target = project / _safe_name(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(base64.b64decode(value))
+        _verify(project, config["source_files"])
+    else:
+        kind, location, records = _find_bundle(config["source_ref"], config["source_digest"])
+        if kind == "archive":
+            _unpack(location, config["source_digest"], project)
+        else:
+            for name in records:
+                target = project / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(location / name, target)
+            _verify(project, records)
+    inputs = {}
+    for alias, bundle in config["inputs"].items():
+        kind, location, _ = _find_bundle(bundle["ref"], bundle["digest"])
+        if kind == "archive":
+            location = _unpack(location, bundle["digest"], Path(tempfile.mkdtemp(prefix="kgr-input-")))
+        inputs[alias] = str(location)
+    os.environ.update(config["env"])
+    os.environ["KGR_INPUTS_JSON"] = json.dumps(inputs)
+    for alias, location in inputs.items():
+        os.environ["KGR_INPUT_" + alias.upper()] = location
+    output = project.parent / "outputs"
+    output.mkdir(exist_ok=True)
+    os.environ["KGR_OUTPUT_DIR"] = str(output)
+    os.environ["KGR_JOB_ID"] = config["job_id"]
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    os.chdir(project)
+    sys.path.insert(0, str(project))
+    if config.get("requirements"):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "-r",
+                str(project / _safe_name(config["requirements"])),
+            ],
+            check=True,
+        )
+    sys.argv = [config.get("entrypoint") or config["module"], *config["args"]]
+    print("KGR workload", config["job_id"], "inputs", json.dumps(inputs), flush=True)
+    return project
+
+
+def run_script(config):
+    bootstrap(config)
+    command = [sys.executable, "-u"]
+    command += ["-m", config["module"]] if config.get("module") else [config["entrypoint"]]
+    subprocess.run(command + config["args"], check=True)
