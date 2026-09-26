@@ -46,8 +46,13 @@ class Client:
 
     @staticmethod
     def _fingerprint(value, request_key):
-        if request_key is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", request_key):
-            raise ValueError("Request key must be 1–128 letters, digits, dots, underscores, colons, slashes or hyphens")
+        if request_key is not None and (
+            not isinstance(request_key, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", request_key)
+        ):
+            raise ValueError(
+                "Request key must be 1–128 letters, digits, dots, underscores, colons, slashes or hyphens"
+            )
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def submit_batch(self, specs: list[JobSpec], *, request_key: str | None = None) -> BatchRecord:
@@ -147,7 +152,8 @@ class Client:
         new = self._new_job(job.spec.model_copy(deep=True), job.snapshot, parent_id=job.id)
         return self.store.add_batch(
             BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=[new]),
-            request_key=request_key, fingerprint=fingerprint,
+            request_key=request_key,
+            fingerprint=fingerprint,
         )
 
     def resolve_not_submitted(self, job_id):

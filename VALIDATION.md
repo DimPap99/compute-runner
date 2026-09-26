@@ -2,11 +2,23 @@
 
 Verified on 2026-09-26 using the installed Python 3.12 environment.
 
-- 52 automated tests passed. These use fake remote services and local execution of generated launchers.
+- 78 automated tests passed. These use fake remote services, transactional local queues, and local execution of generated launchers.
 - Ruff checks, Python compilation, and `pip check` passed.
 - The systemd user unit passed `systemd-analyze --user verify`; the service is enabled and running.
 - `kgr` is installed at `~/.local/bin/kgr` and points to this project's isolated environment.
 - The original `/home/dimpap/LocEstim` repository remains clean.
+
+## Agent interface (v0.2.0)
+
+- Tested atomic batch submission on snapshot and database failures, concurrent same-key submissions, conflicting request keys, explicit retries, restart/completion replay, and replay after source files change or disappear.
+- Tested bounded status pages, deterministic batch order, per-batch cursors, coalesced changes during pagination, download-error events, quiet polling, and v1 queue migration.
+- Tested bounded Unicode log tails, private full-log caching, offline cache reuse, and preserving an existing cache when a refresh fails. CLI tests cover structured operation errors and CPU overrides of GPU workload files.
+- Validated the installed `~/.codex/skills/kaggle-runner` skill; its copy under `skills/kaggle-runner` matches. Command examples were exercised by the CLI integration tests and read-only live checks.
+- Backed up the live v1 database to `~/.local/share/kaggle-runner/queue.pre-agent-v1.sqlite3` before upgrading. All seven existing local records were preserved. Four pages of changes returned those seven jobs; a subsequent query returned no changed jobs.
+- On those existing records, the full JSON was 12,057 bytes and compact status was 2,920 bytes (about 76% smaller). This is a response-size measurement on that sample, not a universal token-saving guarantee. A live three-line log query returned 187 bytes from a 528-byte log, retaining the full private cache.
+- The systemd user service was restored and remains enabled. No additional Kaggle workloads were launched for this interface update; submission/worker integration was exercised with the fake backend, and remote log retrieval was checked against an existing successful run.
+
+The agent interface is a CLI/Python API plus a Codex skill. It does not provide an MCP server, timed/recurring jobs, or automatic conversation wakeups.
 
 ## Live Kaggle checks
 

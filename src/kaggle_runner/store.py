@@ -120,10 +120,13 @@ class Store:
             raise KeyError(f"No batch {batch_id}")
         rows = db.execute(
             "SELECT j.record FROM batch_jobs b JOIN jobs j ON j.id=b.job_id "
-            "WHERE b.batch_id=? ORDER BY b.position", (batch_id,),
+            "WHERE b.batch_id=? ORDER BY b.position",
+            (batch_id,),
         ).fetchall()
         return BatchRecord(
-            id=batch_id, created_at=row[0], replayed=replayed,
+            id=batch_id,
+            created_at=row[0],
+            replayed=replayed,
             jobs=[JobRecord.model_validate_json(row[0]) for row in rows],
         )
 
@@ -131,9 +134,7 @@ class Store:
     def _request(cls, db, request_key, fingerprint):
         if request_key is None:
             return None
-        row = db.execute(
-            "SELECT id,fingerprint FROM batches WHERE request_key=?", (request_key,)
-        ).fetchone()
+        row = db.execute("SELECT id,fingerprint FROM batches WHERE request_key=?", (request_key,)).fetchone()
         if row:
             if row[1] != fingerprint:
                 raise ValueError("Request key already belongs to a different request; use a new key")
@@ -201,11 +202,16 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN")
             where, args = self._filters(db, batch_id, job_ids, states)
-            counts = dict(db.execute(
-                f"SELECT j.state,COUNT(*) FROM jobs j WHERE {where} GROUP BY j.state", args
-            ).fetchall())
+            counts = dict(
+                db.execute(
+                    f"SELECT j.state,COUNT(*) FROM jobs j WHERE {where} GROUP BY j.state", args
+                ).fetchall()
+            )
+            order = (
+                "(SELECT position FROM batch_jobs b WHERE b.job_id=j.id)" if batch_id else "j.created,j.id"
+            )
             rows = db.execute(
-                f"SELECT j.record FROM jobs j WHERE {where} ORDER BY j.created,j.id LIMIT ? OFFSET ?",
+                f"SELECT j.record FROM jobs j WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 [*args, limit, offset],
             ).fetchall()
         return counts, [JobRecord.model_validate_json(row[0]) for row in rows]
@@ -217,7 +223,9 @@ class Store:
             where, args = self._filters(db, batch_id)
             high = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
             if after > high:
-                raise ValueError("Cursor is ahead of this queue; use the original state directory or reset to 0")
+                raise ValueError(
+                    "Cursor is ahead of this queue; use the original state directory or reset to 0"
+                )
             rows = db.execute(
                 f"SELECT MAX(e.id),j.record FROM events e JOIN jobs j ON j.id=e.job_id "
                 f"WHERE e.id>? AND {where} GROUP BY j.id ORDER BY MAX(e.id) LIMIT ?",
@@ -267,8 +275,14 @@ class Store:
     @staticmethod
     def _observable(job):
         return (
-            job.state, job.remote_state, job.wait_reason, job.error, job.download_state,
-            job.download_error, job.attempts, job.finished_at,
+            job.state,
+            job.remote_state,
+            job.wait_reason,
+            job.error,
+            job.download_state,
+            job.download_error,
+            job.attempts,
+            job.finished_at,
         )
 
     @contextmanager

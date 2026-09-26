@@ -59,10 +59,7 @@ def _emit(ctx, value):
 
 
 def _id(ctx, value):
-    matches = [job.id for job in _client(ctx).list() if job.id.startswith(value)]
-    if len(matches) != 1:
-        raise ValueError(f"Expected one matching job for {value}; found {len(matches)}")
-    return matches[0]
+    return _client(ctx).store.resolve_id(value)
 
 
 def load_specs(path: Path):
@@ -84,6 +81,15 @@ def load_specs(path: Path):
             result.append(spec)
         return result
     return [JobSpec(source=path, name=path.stem)]
+
+
+def override_specs(specs, overrides):
+    values = {key: value for key, value in overrides.items() if value is not None}
+    if overrides.get("gpu") is False:
+        if overrides.get("accelerator") is not None:
+            raise ValueError("--cpu cannot be combined with a GPU accelerator")
+        values["accelerator"] = None
+    return [JobSpec.model_validate(spec.model_dump() | values) for spec in specs]
 
 
 @app.command("init")
@@ -114,6 +120,7 @@ def submit(
     timeout: int | None = None,
     arg: Annotated[list[str] | None, typer.Option("--arg")] = None,
     dry_run: bool = False,
+    request_key: str | None = None,
 ):
     specs = load_specs(source)
     overrides = dict(
@@ -125,14 +132,11 @@ def submit(
         timeout_seconds=timeout,
         args=arg,
     )
-    specs = [
-        JobSpec.model_validate(spec.model_dump() | {k: v for k, v in overrides.items() if v is not None})
-        for spec in specs
-    ]
+    specs = override_specs(specs, overrides)
     if dry_run:
         _emit(ctx, [_client(ctx).preview(spec) for spec in specs])
     else:
-        jobs = _client(ctx).submit_many(specs)
+        jobs = _client(ctx).submit_many(specs, request_key=request_key)
         if ctx.obj["json"]:
             _emit(ctx, [_job_dict(job) for job in jobs])
         else:
@@ -316,3 +320,9 @@ def main():
 
         typer.echo("Error: " + safe_message(error), err=True)
         raise SystemExit(1) from None
+
+
+# Import after load_specs is defined; the agent CLI reuses workload-file parsing.
+from .agent_cli import agent_app  # noqa: E402
+
+app.add_typer(agent_app, name="agent")

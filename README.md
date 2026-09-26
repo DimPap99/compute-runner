@@ -61,7 +61,9 @@ Available operations:
 | Operation | Behavior |
 | --- | --- |
 | `preview(spec)` | Inspect selected paths, sizes, resources, and attachments without uploading |
-| `submit(spec)`, `submit_many(specs)` | Save snapshots and queue independent jobs; return persistent IDs |
+| `submit(spec, request_key=None)`, `submit_many(specs, request_key=None)` | Snapshot and atomically queue jobs; optionally deduplicate requests |
+| `submit_batch(specs, request_key=None)`, `batch(id)` | Submit/read a durable batch with ordered jobs and a stable batch ID |
+| `agent()` | Compact, bounded JSON-compatible API for LLMs and other automation |
 | `get(id)`, `list(states=None)` | Read the worker's saved state |
 | `wait(id, timeout=None, downloads=True)` | Wait for execution and automatic downloads; return early for blocked/uncertain work |
 | `logs(id, follow=False)` | Yield persisted logs or attach to the live log stream |
@@ -71,7 +73,82 @@ Available operations:
 | `quota()` | Query GPU/TPU usage, reservations, remaining time, and refresh time |
 | `worker_health()` | Report lock ownership, heartbeat age, and current worker activity |
 
-Retries do not reread the original project. To change code or configuration, submit a new `JobSpec`. Batch submission validates all specifications first, then queues them independently; it is not an all-or-nothing transaction if disk or snapshot operations fail partway through.
+Retries do not reread the original project. To change code or configuration, submit a new `JobSpec`. Batch submission snapshots every specification before committing jobs and their batch receipt in one SQLite transaction. If snapshotting or insertion fails, no jobs in that batch are queued (unused local content-addressed bundles may remain). Runs progress independently after the batch is committed.
+
+## Agent interface
+
+`kgr agent` emits one compact JSON object without needing `--json`. It uses the same persistent worker as the normal CLI; it does not call any model or consume LLM tokens for background monitoring. Full job records, source inventories, and environment values are omitted from summaries. The ordinary CLI's output remains compatible.
+
+```bash
+# One request can contain many jobs, with their own GPU/internet settings.
+kgr agent submit examples/batch.yaml --request-key experiment-v1 --dry-run
+kgr agent submit examples/batch.yaml --request-key experiment-v1
+
+# Recover current state even in a new conversation.
+kgr agent status
+kgr agent status --batch BATCH_ID
+kgr agent status JOB_ID_1 JOB_ID_2
+kgr agent status --state running --state failed
+
+# Start from 0, then reuse the returned cursor with the same batch filter.
+kgr agent changes --batch BATCH_ID --after 0
+kgr agent changes --batch BATCH_ID --after RETURNED_CURSOR
+
+# First call fetches a snapshot; later reads use the private cache.
+kgr agent logs JOB_ID --tail 50 --max-bytes 8192
+kgr agent logs JOB_ID --refresh
+kgr agent health
+
+# Explicit retry of the saved code. Repeating this retry key is safe.
+kgr agent retry JOB_ID --request-key experiment-retry-v1
+kgr agent cancel JOB_ID
+```
+
+The submit command also accepts `--gpu/--cpu`, `--internet/--no-internet`, `--module`, `--entrypoint`, `--accelerator`, `--timeout`, and repeated `--arg`. CLI overrides apply to every job in the input YAML. `--dry-run` reports total files/bytes and resource counts; use ordinary `kgr submit --dry-run` when the full upload inventory is needed.
+
+### Response and cursor contract
+
+- All successful agent responses have `schema_version: 1`. Operation errors return a short JSON `error` and exit status 1. CLI syntax errors use the standard CLI error output.
+- Job summaries contain `id`, `batch_id`, `name`, `state`, `resource`, `internet`, `downloads`, and `outputs_ready`. Jobs belonging to a batch also carry a zero-based `batch_index` matching their input position; batch status preserves that order. When available, summaries include a Kaggle `url`, bounded `reason`/`error`/`download_error`, and `output_dir` after downloads complete. A computation finishing successfully does not imply its downloads are ready.
+- Status and submission responses include `total`, aggregate `counts`, `jobs`, `next_offset`, and compact worker health. Default page size is 20, maximum 100. Follow `next_offset` with `status --batch ID --offset N`; counts cover the whole selected batch. Job-ID selections accept at most 100 IDs. Global status includes older jobs whose `batch_id` is null.
+- `changes` returns `cursor`, `has_more`, and the latest summary of each job with an event after the input cursor. Repeated events for a job are coalesced; this is not a historical event log. Read more pages while `has_more` is true. Each page and cursor share a SQLite read snapshot, so changes occurring during a read remain visible on a later call. A job that changes between pages may appear again.
+- Keep a cursor per state directory and batch filter. Reset to 0 after changing filters or losing the cursor. Unrelated batches can advance a filtered cursor without returning jobs. Idle polls and worker heartbeats do not create job events; download errors do. Do not poll through an LLM for every worker cycle.
+- Log `text` defaults to the last 50 lines, capped at 8192 UTF-8 bytes (maximum 500 lines / 65536 bytes). Results indicate `truncated`, `total_bytes`, cache time, and a `path` to the full text. A byte boundary can leave a partial first line. Log retrieval never follows a stream. `--refresh` fetches again; otherwise cached reads work offline. A failed refresh preserves the old cache. Full log fetching may still transfer a large response from Kaggle; only the agent-facing output is bounded.
+
+### Duplicate-safe requests
+
+Agent submit and retry require `--request-key`; ordinary `kgr submit` also accepts it. Keys are 1–128 letters, digits, dots, underscores, colons, slashes, or hyphens, starting with a letter or digit. They are unique within the state directory and shared by submit/retry operations.
+
+Use one stable key for one intended submission. Replaying the same normalized specs with the same key returns the original batch and `replayed: true`, including after process restarts or completion. Concurrent replays commit only one batch. A key reused with different settings fails. The key identifies the request, **not current source contents**: changed or missing local files do not change an already accepted request. Use a new key for new code or an intentional rerun. Receipts remain on disk; no automatic expiration or deletion is performed.
+
+Python callers can use the same compact interface:
+
+```python
+from kaggle_runner import Client, JobSpec
+
+agent = Client().agent()  # Or AgentClient() for the default configuration.
+submitted = agent.submit([
+    JobSpec(source="/path/analyze.py"),
+    JobSpec(source="/path/train.py", gpu=True, internet=True),
+], request_key="experiment-v1")
+batch_id = submitted["batch_id"]
+page = agent.changes(batch_id=batch_id, after=0)
+cursor = page["cursor"]
+# Later: agent.changes(batch_id=batch_id, after=cursor)
+# If page["has_more"], read the remaining pages immediately with that cursor.
+```
+
+`agent.status(job_ids=None, batch_id=None, states=None, limit=20, offset=0)`, `agent.logs(id, tail=50, max_bytes=8192, refresh=False)`, `agent.retry(id, request_key=...)`, `agent.cancel(id)`, and `agent.health()` round out the API. Read/status/change operations do not contact Kaggle. Submission is local, with remote work performed by the daemon.
+
+### Codex skill
+
+The reusable skill is in `skills/kaggle-runner/` and is installed locally at `~/.codex/skills/kaggle-runner/`. It teaches compact commands, batching, cursor use, and recovery. Use `$kaggle-runner` or ask to run/monitor Kaggle workloads in a session that discovers the skill. If the current skill list is already loaded, start a new session or explicitly reference the installed `SKILL.md`.
+
+For another local installation, copy that skill folder into your Codex skills directory. The skill expects `kgr` on PATH or `~/kaggle-runner/.venv/bin/kgr`. Any agent with local shell access can use the CLI; no MCP server or LLM API key is needed. An MCP wrapper for clients without shell access is not included.
+
+This interface queues jobs as capacity allows. Timed/recurring schedules and a trigger to resume an LLM conversation when jobs finish are not implemented. The worker continues while it is running, independently of the conversation.
+
+Existing v1 queue databases are migrated additively to schema v2, retaining job IDs, events, and snapshots. Older application versions cannot open the upgraded database. Stop the worker and back up the SQLite database before downgrading.
 
 ## Workload definitions
 

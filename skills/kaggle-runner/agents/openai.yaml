@@ -1,0 +1,3 @@
+interface:
+  display_name: "Kaggle Runner"
+  short_description: "Queue Kaggle workloads and inspect compact job updates"

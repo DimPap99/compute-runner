@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaggle-runner-local"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent local queue, Python API and CLI for private Kaggle workloads"
 requires-python = ">=3.12"
 dependencies = ["kaggle==2.2.4", "kagglesdk==0.1.37", "pydantic>=2,<3", "typer>=0.12,<1", "rich>=13,<15", "PyYAML>=6,<7", "pathspec>=0.12,<1", "nbformat>=5,<6"]

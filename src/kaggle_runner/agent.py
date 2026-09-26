@@ -23,7 +23,7 @@ def summary(job):
         id=job.id,
         name=short(job.spec.name, 100),
         state=job.state,
-        resource=job.spec.accelerator or ("gpu" if job.spec.gpu else "cpu"),
+        resource=short(job.spec.accelerator, 100) or ("gpu" if job.spec.gpu else "cpu"),
         internet=job.spec.internet,
         downloads=job.download_state,
         outputs_ready=job.download_state == "complete",
@@ -36,7 +36,7 @@ def summary(job):
         "output_dir": str(job.result_dir) if job.download_state == "complete" else None,
         "parent_id": job.parent_id,
     }.items():
-        if item is not None:
+        if item not in (None, ""):
             value[key] = item
     return value
 
@@ -62,16 +62,22 @@ class AgentClient:
         if not jobs:
             return []
         with self.client.store.connection() as db:
-            batches = dict(db.execute(
-                "SELECT job_id,batch_id FROM batch_jobs WHERE job_id IN ("
-                + ",".join("?" for _ in jobs) + ")", [job.id for job in jobs],
-            ).fetchall())
-        return [summary(job) | {"batch_id": batches.get(job.id)} for job in jobs]
+            rows = db.execute(
+                "SELECT job_id,batch_id,position FROM batch_jobs WHERE job_id IN ("
+                + ",".join("?" for _ in jobs)
+                + ")",
+                [job.id for job in jobs],
+            ).fetchall()
+        batches = {row[0]: {"batch_id": row[1], "batch_index": row[2]} for row in rows}
+        return [summary(job) | batches.get(job.id, {"batch_id": None}) for job in jobs]
 
     def health(self):
         health = self.client.worker_health()
         age = health["heartbeat_age_seconds"]
-        value = {"running": health["running"], "heartbeat_age_seconds": round(age) if age is not None else None}
+        value = {
+            "running": health["running"],
+            "heartbeat_age_seconds": round(age) if age is not None else None,
+        }
         if health.get("error"):
             value["error"] = short(health["error"])
         return value
@@ -88,12 +94,20 @@ class AgentClient:
                 raise ValueError("states must be a nonempty list or set of valid job states")
             states = sorted(set(states))
         counts, jobs = self.client.store.page(
-            job_ids=job_ids, batch_id=batch_id, states=states, limit=limit, offset=offset,
+            job_ids=job_ids,
+            batch_id=batch_id,
+            states=states,
+            limit=limit,
+            offset=offset,
         )
         total = sum(counts.values())
         return dict(
-            schema_version=1, batch_id=batch_id, total=total, counts=counts,
-            jobs=self._jobs(jobs), next_offset=offset + len(jobs) if offset + len(jobs) < total else None,
+            schema_version=1,
+            batch_id=batch_id,
+            total=total,
+            counts=counts,
+            jobs=self._jobs(jobs),
+            next_offset=offset + len(jobs) if offset + len(jobs) < total else None,
             worker=self.health(),
         )
 
@@ -103,6 +117,22 @@ class AgentClient:
             raise ValueError("request_key is required for agent submissions")
         batch = self.client.submit_batch(specs, request_key=request_key)
         return self.status(batch_id=batch.id) | {"replayed": batch.replayed}
+
+    def preview(self, specs):
+        """Small upload inventory; no snapshots, queue writes, or remote calls."""
+        if not 1 <= len(specs) <= 1000:
+            raise ValueError("A batch must contain between 1 and 1000 jobs")
+        plans = [self.client.preview(spec) for spec in specs]
+        return dict(
+            schema_version=1,
+            dry_run=True,
+            total=len(specs),
+            files=sum(len(p["files"]) + sum(len(i["files"]) for i in p["inputs"].values()) for p in plans),
+            bytes=sum(p["bytes"] + sum(i["bytes"] for i in p["inputs"].values()) for p in plans),
+            gpu_jobs=sum(spec.gpu for spec in specs),
+            internet_jobs=sum(spec.internet for spec in specs),
+            private=True,
+        )
 
     def retry(self, job_id, *, request_key):
         if request_key is None:
@@ -128,8 +158,12 @@ class AgentClient:
             raise ValueError("after must be a nonnegative event cursor")
         cursor, more, jobs = self.client.store.changes(after=after, batch_id=batch_id, limit=limit)
         return dict(
-            schema_version=1, batch_id=batch_id, cursor=cursor, has_more=more,
-            jobs=self._jobs(jobs), worker=self.health(),
+            schema_version=1,
+            batch_id=batch_id,
+            cursor=cursor,
+            has_more=more,
+            jobs=self._jobs(jobs),
+            worker=self.health(),
         )
 
     def logs(self, job_id, *, tail=50, max_bytes=8192, refresh=False):
@@ -165,6 +199,13 @@ class AgentClient:
         text = "".join(data.decode("utf-8", errors="ignore").splitlines(keepends=True)[-tail:])
         size = len(text.encode("utf-8"))
         return dict(
-            schema_version=1, id=job_id, text=text, bytes=size, total_bytes=stat.st_size,
-            truncated=size < stat.st_size, path=str(path), fetched=fetched, cached_at=stat.st_mtime,
+            schema_version=1,
+            id=job_id,
+            text=text,
+            bytes=size,
+            total_bytes=stat.st_size,
+            truncated=size < stat.st_size,
+            path=str(path),
+            fetched=fetched,
+            cached_at=stat.st_mtime,
         )
