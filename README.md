@@ -146,6 +146,14 @@ Downloads use the environment's proxy and certificate settings by default. [Stri
 
 The workload uses Kaggle's Python environment. A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. `env` is only for nonsecret configuration: secret-like variable names and recognizable credential values are rejected because these values must be stored with the job and embedded in the private Kaggle workload.
 
+### Optional resumable training
+
+Resumability is a workload-code decision, not a runner default. When an agent is preparing a stateful workload and the user's choice is unclear, the bundled skill tells it to ask whether the job should be resumable. If the answer is yes and no cadence was given, it then asks whether to checkpoint by elapsed minutes or completed epochs and for the interval. An explicit non-resumable choice is respected.
+
+Resumable scripts should expose `--resume auto|required|never|PATH`, `--checkpoint-mode minutes|epochs`, and `--checkpoint-every NUMBER`. Write checkpoints below `KGR_OUTPUT_DIR/checkpoints`; attach a downloaded checkpoint directory to a replacement job as the named input `resume`, which becomes `KGR_INPUT_RESUME`. Use `required` for an intended continuation so a missing or invalid checkpoint cannot silently restart training.
+
+The skill includes a framework-neutral helper at `skills/kaggle-runner/assets/checkpointing.py`. It provides cadence checks, atomic numbered files, a checksummed `latest.json`, compatibility validation, and resume discovery. Training code must still serialize and restore its framework-specific model, optimizer, scheduler, scaler, progress, RNG, and data-loader state. See `skills/kaggle-runner/references/resumability.md` for the complete agent and migration contract.
+
 ## Python API
 
 Install the package into the calling environment with `pip install -e /path/to/kaggle-runner`.

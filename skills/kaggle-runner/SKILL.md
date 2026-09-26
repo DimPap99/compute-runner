@@ -7,6 +7,17 @@ description: "Submit and monitor private Kaggle workloads with the local kaggle-
 
 Run `kgr agent ...` from any shell; if `kgr` is not on PATH, use `~/kaggle-runner/.venv/bin/kgr`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. Job state lives on disk outside the current repository, so a new conversation can recover it with `kgr agent status`.
 
+## Decide resumability
+
+Resumability is an explicit user choice, not a default. For training, optimization, generation, long preprocessing, or another workload with meaningful intermediate state:
+
+- If the user already chose resumable or non-resumable, follow that choice.
+- If the choice is absent or ambiguous, ask whether the job should be resumable before changing its checkpoint behavior or submitting it.
+- If the user chooses resumable but did not give a checkpoint cadence, ask whether to checkpoint by elapsed minutes or completed epochs and ask for the positive interval. Do not invent a cadence.
+- If the user chooses non-resumable, do not add checkpoint code merely because the job is long.
+
+Do not ask this question for a stateless workload that has no meaningful progress to restore. When resumability is chosen, or when inspecting or migrating an already resumable job, read [references/resumability.md](references/resumability.md) before editing or submitting it. The reusable helper is [assets/checkpointing.py](assets/checkpointing.py); adapt or copy it into the workload source rather than assuming `kaggle_runner` is installed inside the Kaggle session.
+
 ## Submit
 
 For one file, use `kgr agent submit /path/train.py --request-key experiment-v1`. For folders or multiple jobs, write a workload YAML; read [references/workloads.md](references/workloads.md) only when creating or changing workload definitions. GPU and internet are disabled by default and can be set per job in YAML.
