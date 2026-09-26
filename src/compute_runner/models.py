@@ -172,11 +172,11 @@ class Config(Model):
     discovery_seconds: float = Field(default=300, ge=1)
     retry_seconds: float = Field(default=60, ge=1)
     reconcile_seconds: float = Field(default=300, ge=1)
-    # Broad log redaction and locked-down output downloads; see README "Strict mode".
+    # Broad log redaction and locked-down output downloads; see docs/operations.md, "Strict mode".
     strict: bool = False
     # Parent of the experiment folders; None puts results/ beside each workload's code.
     results_dir: Path | None = None
-    # Copy a dataset the job's account cannot read from an account that can; see README "Datasets".
+    # Copy a dataset the job's account cannot read from an account that can; see docs/accounts.md, "Datasets across accounts".
     transfer: bool = False
     state_dir: Path = Field(default_factory=lambda: application_dir("STATE"))
 

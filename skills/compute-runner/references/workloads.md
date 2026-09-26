@@ -50,4 +50,4 @@ Optional fields: `accelerator: NvidiaTeslaT4`, `env: {SEED: "42"}`, `requirement
 
 The runner excludes credential filenames, virtual environments, caches, and Git metadata. The source folder respects its `.gitignore`, `.kgrignore`, and `exclude`; input folders respect only `.kgrignore`. It does not detect secrets embedded in ordinary code. `env` is persisted configuration, so use it for nonsecret values only. No local environment or virtual environment is automatically forwarded. Runtime output goes in `os.environ["KGR_OUTPUT_DIR"]`. On Kaggle, code can use its preinstalled libraries without internet; on an SSH machine, packages installed in its Python are available, and `requirements` installs into a virtual environment of the run.
 
-The ordinary CLI and Python API retain full records for deeper diagnostics. Read the project's `README.md` only for details outside this reference.
+The ordinary CLI and Python API retain full records for deeper diagnostics. Read the project's `docs/` guides (such as `docs/workloads.md`) only for details outside this reference.
