@@ -116,7 +116,7 @@ A job can attach existing provider datasets, such as another account's private d
 | The job's account can read it | Attach it directly, pinned to its current version |
 | Another connected account can read it, and copies are allowed | Download it once through that account, then upload the copy to the job's account like a local input |
 | Another connected account can read it, and copies are not allowed | Block the job; the error names the account that can read it |
-| No connected account can read it | Attach it as given; the provider or the run reports the failure |
+| No connected account can read it, or that version does not exist | Block the job before it runs; the error asks to check the reference or the accounts' access |
 
 Copies are off by default because they place the data in another account and take its storage. Allow them for one job with `compute-runner agent move JOB_ID --account ACCOUNT --transfer` (the job's own account also works), or for every job with `compute-runner init --transfer`. Only aliased inputs (`inputs: {data: "kaggle:owner/slug"}`) can be copied, because the workload finds a copy through `KGR_INPUT_DATA`; the unaliased `datasets` list cannot. A copied dataset version is cached in the state directory and reused. Check the dataset's license before copying it.
 
@@ -541,6 +541,7 @@ Error messages saved with jobs always receive the strict redaction, because they
 | Transient upload error | Keep the job preparing on its account; completed uploads are kept and the rest retried |
 | Nonretryable upload or authentication error | Set `blocked` and retain the diagnostic message |
 | Dataset the job's account cannot read | Copy it when allowed; otherwise set `blocked` and name an account that can read it. See [Datasets across accounts](#datasets-across-accounts) |
+| Dataset no connected account can find | Set `blocked` before launching; nothing runs without its data |
 | Job's account unknown to the running worker | Keep the job queued with that reason; restart the worker after adding the account, or move the job |
 | Download failure | Preserve execution status and retry output collection independently after 1, 2, 4, … minutes, then hourly |
 

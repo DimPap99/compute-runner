@@ -78,14 +78,44 @@ def test_unreadable_dataset_is_copied_only_when_allowed(two_accounts):
     assert other.fetched == ["other/private/7"] and client.get(second.id).state == "remote_queued"
 
 
-def test_dataset_no_account_can_read_is_launched_as_given(two_accounts):
+@pytest.mark.parametrize("update", [{"inputs": {"data": Path("kaggle:nobody/data")}}, {"datasets": ["nobody/data/2"]}])
+def test_dataset_no_account_can_find_blocks_before_launch(two_accounts, update):
     client, home, other, spec = two_accounts
     home.unreadable = other.unreadable = {"nobody/data"}
-    update = {"inputs": {"data": Path("kaggle:nobody/data")}, "datasets": ["nobody/data/2"]}
     job = client.submit(spec.model_copy(update=update))
     client.worker().tick()
-    assert client.get(job.id).state == "remote_queued"
-    assert {"nobody/data", "nobody/data/2"} <= set(home.pushes[0]["dataset_sources"])
+    summary = client.agent().status([job.id])["jobs"][0]
+    assert summary["state"] == "blocked" and home.pushes == [] and other.fetched == []
+    assert "No connected account can find dataset nobody/data" in summary["error"]
+    assert summary["reason"].startswith("Check the dataset reference")
+    # Once an account may read it, a retry runs.
+    home.unreadable = set()
+    retried = client.retry(job.id)
+    client.worker().tick()
+    assert client.get(retried.id).state == "remote_queued"
+
+
+def failing(error):
+    def resolve_dataset(ref):
+        raise error
+
+    return resolve_dataset
+
+
+def test_an_account_that_could_not_be_asked_keeps_the_job_retrying(two_accounts):
+    client, home, other, spec = two_accounts
+    home.unreadable = other.unreadable = {"nobody/data"}
+    other.resolve_dataset = failing(RemoteError("timed out", "transient"))
+    job = client.submit(spec.model_copy(update={"inputs": {"data": Path("kaggle:nobody/data")}}))
+    client.worker().tick()
+    job = client.get(job.id)
+    assert job.state == "preparing" and job.wait_reason == "Upload retry pending"
+    assert "Could not check whether kaggle:other can read" in job.error and home.pushes == []
+    # Bad keys are a definitive answer: that account cannot read it.
+    other.resolve_dataset = failing(RemoteError("401", "auth", definitive=True))
+    client.store.update(job.id, next_action_at=0)
+    client.worker().tick()
+    assert client.get(job.id).state == "blocked"
 
 
 def test_unaliased_datasets_are_never_copied(two_accounts):
@@ -170,6 +200,8 @@ def test_kaggle_checks_access_even_for_pinned_datasets(tmp_path):
     backend._api = Obj(dataset_status=status)
     assert backend.resolve_dataset("me/data/2") == "me/data/2" and calls == ["me/data"]
     assert backend.resolve_dataset("me/data") == "me/data/4"
+    # A version past the latest does not exist.
+    assert backend.resolve_dataset("me/data/4") == "me/data/4" and backend.resolve_dataset("me/data/5") is None
     assert backend.resolve_dataset("them/data/1") is None and backend.resolve_dataset("gone/data") is None
     with pytest.raises(RemoteError) as error:
         backend.resolve_dataset("down/data")

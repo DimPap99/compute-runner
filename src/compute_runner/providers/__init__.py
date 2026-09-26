@@ -39,7 +39,8 @@ class Provider(Protocol):
     def resolve_dataset(self, ref: str) -> str | None:
         """Pin a dataset this account can read to an immutable version; None if it cannot read it.
 
-        Every call checks access, even for a pinned reference, so the worker can ask any account.
+        None also covers a dataset or pinned version that does not exist. Every call checks
+        access, even for a pinned reference, so the worker can ask any account.
         Raise RemoteError for failures that say nothing about access.
         """
 

@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 PENDING = {"queued", "preparing"}
 # Jobs without a possible remote run; they can change account.
 MOVABLE = {"queued", "preparing", "blocked"}
+# Why preparation blocked a job, by error kind; the job's error has the details.
+BLOCKED_REASONS = {
+    "access": "Move the job or allow copying its dataset; see error",
+    "dataset": "Check the dataset reference or its access with the user; see error",
+}
 REMOTE_STATES = {
     "queued": "remote_queued",
     "running": "running",
@@ -497,9 +502,7 @@ class Worker:
                 error=safe_message(error),
                 wait_reason="Upload retry pending"
                 if transient
-                else "Move the job or allow copying its dataset; see error"
-                if kind == "access"
-                else "Fix the reported issue, then retry this job",
+                else BLOCKED_REASONS.get(kind, "Fix the reported issue, then retry this job"),
                 next_action_at=time.time() + self.config.retry_seconds,
                 upload_refs=refs,
             )
@@ -508,8 +511,8 @@ class Worker:
     def _attach(self, job, key, dataset_provider, ref):
         """What to attach for one dataset: pinned on the job's account, or an uploaded copy.
 
-        None while a copy is still processing. A dataset that no configured account can read
-        is attached as given, so the provider or the run reports what is wrong.
+        None while a copy is still processing. A dataset that no configured account can find
+        blocks the job before anything runs, so a wrong reference is fixed instead of launched.
         """
         account = self.config.account(job.account)
         provider = self.provider(account.id)
@@ -520,7 +523,13 @@ class Worker:
                 return pinned
             reader = self._reader(job, dataset_provider, ref)
             if reader is None:
-                return ref
+                raise RemoteError(
+                    f"No connected account can find dataset {ref}. Check the reference "
+                    "(OWNER/SLUG or OWNER/SLUG/VERSION) and that one of the accounts may read it; "
+                    "then submit the corrected workload, or retry this job if only access changed",
+                    "dataset",
+                    definitive=True,
+                )
             owner, source = reader
             if alias is None:
                 raise RemoteError(
@@ -543,16 +552,28 @@ class Worker:
         return provider.ensure_bundle(copied)
 
     def _reader(self, job, dataset_provider, ref):
-        """Another configured account that can read a dataset: (account, pinned ref), or None."""
+        """Another configured account that can read a dataset: (account, pinned ref), or None.
+
+        An account that could not be asked for a passing reason makes "None" uncertain, so that
+        raises a transient error instead; one with definitive errors, such as bad keys, cannot read.
+        """
+        unanswered = None
         for account in self.config.accounts:
             if account.id == job.account or account.provider != dataset_provider:
                 continue
             try:
                 pinned = self.provider(account.id).resolve_dataset(ref)
-            except (RemoteError, ValueError):
+            except RemoteError as error:
+                if not error.definitive:
+                    unanswered = unanswered or (account.id, error)
+                continue
+            except ValueError:
                 continue
             if pinned:
                 return account.id, pinned
+        if unanswered:
+            account_id, error = unanswered
+            raise RemoteError(f"Could not check whether {account_id} can read dataset {ref}: {error}")
         return None
 
     def _copy(self, account, ref):

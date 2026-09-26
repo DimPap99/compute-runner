@@ -181,7 +181,10 @@ class KaggleProvider:
             if http_code(error) in {403, 404}:
                 return None
             raise remote_error(error) from error
-        return ref if version else f"{ref}/{result['current_version_number']}"
+        current = result["current_version_number"]
+        if version and int(version[0]) > current:
+            return None  # That version does not exist.
+        return ref if version else f"{ref}/{current}"
 
     def fetch_dataset(self, ref, destination: Path):
         try:
