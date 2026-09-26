@@ -36,3 +36,6 @@ id_ed25519
 *.keystore
 *.tfstate
 *.tfstate.*
+
+# Results of running the examples
+examples/**/results/
