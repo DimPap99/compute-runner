@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import time
 from typing import get_args
+
+import yaml
 
 from .models import ACTIVE, JobState
 from .providers import safe_message
 from .store import atomic_write
 from .worker import MOVABLE, occupancy
+
+# Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
+ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
 
 
 def short(value, limit=400):
@@ -87,6 +93,7 @@ class AgentClient:
         return self.status(batch_id=batch.id) | {"replayed": batch.replayed}
 
     def health(self):
+        """Whether a worker holds the queue, and its heartbeat age; local only."""
         health = self.client.worker_health()
         age = health["heartbeat_age_seconds"]
         value = {
@@ -164,10 +171,10 @@ class AgentClient:
             raise ValueError("request_key is required for agent submissions")
         return self._batch_status(self.client.submit_batch(specs, request_key=request_key, account=account))
 
-    def preview(self, specs):
+    def preview(self, specs, *, account=None):
         """Small upload inventory; no snapshots, queue writes, or remote calls."""
         self.client.check_batch_size(specs)
-        plans = [self.client.preview(spec) for spec in specs]
+        plans = [self.client.preview(spec, account) for spec in specs]
         return dict(
             schema_version=1,
             dry_run=True,
@@ -180,6 +187,7 @@ class AgentClient:
         )
 
     def retry(self, job_id, *, request_key, account=None):
+        """Queue a finished or blocked job's saved code as a new job, on its account unless one is given."""
         if request_key is None:
             raise ValueError("request_key is required for agent retries")
         job_id = self.client.store.resolve_id(job_id)
@@ -188,7 +196,7 @@ class AgentClient:
     def move(self, job_ids=None, *, batch_id=None, account, limit=20):
         """Move the selected jobs that have not been submitted to another account.
 
-        Submitted and finished jobs stay where they are; not_moved lists jobs the account rejected.
+        Submitted and finished jobs, and jobs already there, stay; not_moved lists jobs the account rejected.
         """
         _page_bounds(limit)
         if (job_ids is None) == (batch_id is None):
@@ -198,7 +206,7 @@ class AgentClient:
         _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
         moved, rejected = 0, []
         for job in jobs:
-            if job.state not in MOVABLE:
+            if job.state not in MOVABLE or job.account == target:
                 continue
             try:
                 self.client.move(job.id, target)
@@ -209,6 +217,7 @@ class AgentClient:
         return value | {"not_moved": rejected} if rejected else value
 
     def cancel(self, job_id):
+        """Cancel pending work locally, or ask the provider to stop a running job; repeating is harmless."""
         job_id = self.client.store.resolve_id(job_id)
         job = self.client.get(job_id)
         if job.state != "cancelled":

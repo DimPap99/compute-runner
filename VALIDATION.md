@@ -1,12 +1,15 @@
 # Verification record
 
-Verified on 2026-09-26 using the installed Python 3.12 environment.
+Verified on 2026-09-26 using the installed Python 3.12 environment. Sections are newest first.
 
-- 150 automated tests passed after the Compute Runner rename. These use fake remote services, transactional local queues, and local execution of generated launchers.
-- Ruff checks, Python compilation, and `pip check` passed.
-- The systemd user unit passed `systemd-analyze --user verify`; the service is enabled and running.
-- `compute-runner` is installed at `~/.local/bin/compute-runner` and points to this project's isolated environment.
-- The original `/home/dimpap/LocEstim` repository remains clean.
+## Review of the rename and accounts changes
+
+- 179 automated tests passed; Ruff and compilation passed. Each regression test below fails on the previous code.
+- Failover under `auto`: a job no longer bounces between two full accounts, because an account that rejected one of its launches is not chosen again. A job that is retrying uploads stays on its account and keeps completed uploads, and jobs queued behind it no longer fail over with a false capacity reason. Suggestions and moves see slots taken earlier in the same cycle. GPU quota is read with each discovery instead of every cycle on every account.
+- A job submitted to an account added after the worker started now waits for a worker restart instead of being blocked; configuration commands remind a running worker to restart. `account add` in other casing keeps the saved ID. A one-off `--state-dir` is no longer saved by `account` or `init`. Dry runs check the spec against the account. `agent changes` reports new failover suggestions. Moving a job to its own account is refused. Failed downloads for a removed account are not retried until it returns. The legacy `kaggle-runner` unit can no longer be started, since its package is gone.
+- The queue schema is now version 3 so versions without accounts refuse to open it; the package version is 0.3.0.
+- Workload-file parsing moved to `workloads.py` and the shared operation errors to `agent.py`, removing the import cycle between the two CLIs. Every command has help text, and the skill lists which actions need the user's approval.
+- No remote workloads were submitted; the running service was not restarted.
 
 ## Provider accounts and failover
 
@@ -18,7 +21,9 @@ Verified on 2026-09-26 using the installed Python 3.12 environment.
 
 ## Compute Runner rename
 
-- Renamed the Python distribution, source package, CLI, documentation, notebook example, installed skill, project directory, and systemd user service. The README and command help state: "Currently support only Kaggle."
+- 150 automated tests passed after the rename. These use fake remote services, transactional local queues, and local execution of generated launchers. Ruff checks, Python compilation, and `pip check` passed.
+- `compute-runner` is installed at `~/.local/bin/compute-runner` and points to this project's isolated environment. The original `/home/dimpap/LocEstim` repository remains clean.
+- Renamed the Python distribution, source package, CLI, documentation, notebook example, installed skill, project directory, and systemd user service. The README and command help say that Kaggle is the only supported provider.
 - Rebuilt the virtual environment at `/home/dimpap/compute-runner/.venv` and installed the renamed package. Both `compute-runner` and the `kgr` compatibility alias work from outside the project directory.
 - Moved local configuration and state to the new default directories. Compatibility links preserve paths in existing job records and source snapshots. All seven job records remain byte-for-byte identical, all six downloaded output directories remain accessible, and the queue database checksum was unchanged by the move.
 - Added nine regression cases covering existing-queue discovery, request-key replay, saved outputs, new and legacy environment overrides, and service migration. The renamed service is enabled and running; its unit passed `systemd-analyze --user verify`.

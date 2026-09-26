@@ -81,7 +81,9 @@ compute-runner account list
 compute-runner account remove kaggle:bob
 ```
 
-Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone and can hold a `kaggle.json` username and key or a Kaggle access token. Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it.
+Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone and can hold a `kaggle.json` username and key or a Kaggle access token. Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
+
+The worker reads accounts and settings when it starts. After `account add`, `account remove`, or `init`, apply the change with `compute-runner service restart`; these commands print that reminder while a worker is running. Until then, a job submitted to a newly added account waits with a reason saying the running worker does not know its account.
 
 Each job records its account, and each attempt records the account, remote reference, and URL it ran on. Choose an account with `--account` on `submit` and `retry`, or move a job that has not been submitted yet:
 
@@ -96,14 +98,14 @@ When a waiting job cannot start on its account, because its slots are busy, its 
 | --- | --- |
 | `off` | The job waits on its account |
 | `ask` (default) | The job waits and shows `suggested_account`: the first other account, in preference order, that can start it now. An agent asks the user before moving it |
-| `auto` | The worker moves the job to that account and records `Moved from ACCOUNT: reason` |
+| `auto` | The worker moves the job to that account. Its `account` changes, and its event history records `Moved from ACCOUNT: reason` |
 
 ```bash
 compute-runner init --failover auto
 compute-runner service restart
 ```
 
-Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account. Moving a job uploads its inputs again, because private datasets belong to one account. Runs that have started never move; continue a stopped resumable run with a new submission on another account, as described in [Optional resumable training](#optional-resumable-training).
+Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account, and jobs queued behind it wait for it rather than failing over. An account that rejected one of a job's launches is not chosen for that job again, so a job cannot bounce between two full accounts. Moving a job uploads its inputs again, because private datasets belong to one account. Failover does not check access to existing datasets, so keep jobs that use one account's private dataset on that account (`failover: off` or `ask`). Runs that have started never move; continue a stopped resumable run with a new submission on another account, as described in [Optional resumable training](#optional-resumable-training).
 
 ## Workload configuration
 
@@ -224,7 +226,7 @@ print(finished.state, finished.download_state, finished.result_dir)
 
 | Method | Behavior |
 | --- | --- |
-| `preview(spec)` | Return the selected files, sizes, inputs, and resource settings without uploading |
+| `preview(spec, account=None)` | Check the spec against the account and return the selected files, sizes, inputs, and resource settings without uploading |
 | `submit(spec, request_key=None, account=None)` | Queue one job and return its record |
 | `submit_many(specs, request_key=None, account=None)` | Queue a batch and return its jobs in input order |
 | `submit_batch(specs, request_key=None, account=None)` | Queue a batch and return a `BatchRecord` |
@@ -289,7 +291,7 @@ compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 
 `agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used` and `limit`), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check, and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
 
-`agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs stay where they are; `not_moved` lists jobs the target account cannot run.
+`agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run.
 
 ### Status and pagination
 
@@ -332,7 +334,7 @@ Responses contain `schema_version`, `batch_id`, `cursor`, `has_more`, `jobs`, an
 
 Events for the same job are coalesced. A job that changes between pages can appear again. The returned records describe current state rather than every historical transition. Each query reads its records and cursor from one SQLite snapshot, so later changes remain visible to a subsequent query.
 
-Keep a separate cursor for each state directory and batch filter. Reset to 0 when changing filters or recovering a lost cursor. Events from other batches may advance a filtered cursor without returning jobs. Unchanged status polls and worker heartbeats produce no job events. Download state and error changes do.
+Keep a separate cursor for each state directory and batch filter. Reset to 0 when changing filters or recovering a lost cursor. Events from other batches may advance a filtered cursor without returning jobs. Unchanged status polls and worker heartbeats produce no job events. Download state, error, account, and `suggested_account` changes do.
 
 ### Log retrieval
 
@@ -392,7 +394,7 @@ cursor = page["cursor"]
 | Method | Result |
 | --- | --- |
 | `submit(specs, request_key=..., account=None)` | Batch status and replay flag |
-| `preview(specs)` | Aggregate upload inventory |
+| `preview(specs, account=None)` | Aggregate upload inventory |
 | `status(job_ids=None, batch_id=None, states=None, limit=20, offset=0)` | Paginated job summaries and counts |
 | `changes(after=0, batch_id=None, limit=20)` | Changed jobs and the next event cursor |
 | `logs(job_id, tail=50, max_bytes=8192, refresh=False)` | Bounded text and cache metadata |
@@ -408,7 +410,7 @@ Agent methods return JSON-compatible dictionaries and raise Python exceptions on
 
 ### Agent skill
 
-The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
+The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, which actions need the user's approval, request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
 
 ```bash
 ln -s ~/compute-runner/skills/compute-runner ~/.claude/skills/compute-runner  # Claude Code
@@ -450,7 +452,7 @@ compute-runner init --failover ask --poll-seconds 30
 compute-runner service restart
 ```
 
-A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
+A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. Each discovery also reads the account's GPU quota, and the worker accounts for discovered external runs and quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
 Dataset preparation and uploads run in the dispatcher and can extend a polling cycle. Output downloads run separately.
 
@@ -474,12 +476,13 @@ Error messages saved with jobs always receive the strict redaction, because they
 
 | Condition | Behavior |
 | --- | --- |
-| Capacity rejection | Back off and retry with a fresh notebook slug |
+| Capacity or quota rejection | Back off and retry with a fresh notebook slug; the failover policy can move the job to another account |
 | Uncertain submission | Query the recorded notebook reference before attempting another submission |
 | Unresolved remote execution | Set `needs_attention` and continue reserving capacity |
 | Workload failure | Set `failed` and collect available outputs without rerunning the computation |
+| Transient upload error | Keep the job preparing on its account; completed uploads are kept and the rest retried |
 | Nonretryable upload or authentication error | Set `blocked` and retain the diagnostic message |
-| Job's account no longer configured | Set `blocked`; add the account again or move the job |
+| Job's account unknown to the running worker | Keep the job queued with that reason; restart the worker after adding the account, or move the job |
 | Download failure | Preserve execution status and retry output collection independently after 1, 2, 4, … minutes, then hourly |
 
 Each attempt records its notebook slug before the remote request. The worker creates a new slug for each attempt and does not overwrite an existing experiment notebook.
@@ -509,6 +512,7 @@ Default locations:
 | `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, and events |
 | `~/.local/share/compute-runner/bundles/` | Immutable source and input snapshots |
 | `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
+| `~/.local/share/compute-runner/accounts.json` | Each account's last run discovery and GPU quota, written by the worker |
 | `~/.local/share/compute-runner/results/JOB_ID/` | Downloaded files and provenance |
 
 Global `--config-dir` and `--state-dir` options select alternate CLI locations. Python callers can use `Client(config=Config(...))` or a `state_dir` override. One state directory can hold jobs for several accounts.
@@ -537,7 +541,7 @@ No automatic cleanup removes notebooks, datasets, snapshots, logs, or results. S
 
 ### Database upgrades
 
-Version 0.2 upgrades schema version 1 to version 2 by adding batch and request records. Existing job IDs, events, and snapshots are preserved. Older application versions cannot open the upgraded database.
+Version 0.2 upgrades schema version 1 to version 2 by adding batch and request records. Version 0.3 upgrades it to version 3, whose job records name their account. Existing job IDs, events, and snapshots are preserved. Older application versions cannot open the upgraded database.
 
 Back up the database before upgrading. To restore an older application version, stop the worker and restore a compatible backup. Preserve any jobs and artifacts created after that backup separately.
 
@@ -547,6 +551,7 @@ Back up the database before upgrading. To restore an older application version, 
 - Checkpoint continuation requires downloading a checkpoint and attaching it to a new job.
 - Remote cancellation needs the run to have started and to have been submitted by this version of the runner.
 - HTTP and MCP servers are not included.
+- Failover does not check whether the other account can read a job's existing datasets.
 - Job completion does not automatically resume an LLM conversation.
 - Custom containers and automatic offline dependency installation are not supported.
 

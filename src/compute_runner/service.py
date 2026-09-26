@@ -48,6 +48,9 @@ def control(action):
     unit = UNIT_NAME
     legacy = root / LEGACY_UNIT_NAME
     if not (root / UNIT_NAME).exists() and legacy.is_file() and LEGACY_DESCRIPTION in legacy.read_text():
+        # The previous unit runs a package that no longer exists; it can only be inspected or stopped.
+        if action in {"start", "restart"}:
+            raise ValueError("The installed service predates the rename; run: compute-runner service install")
         unit = LEGACY_UNIT_NAME
     return subprocess.run(["systemctl", "--user", action, unit, "--no-pager"], check=action != "status")
 

@@ -104,6 +104,9 @@ def test_service_control_works_before_reinstallation(isolated_paths, monkeypatch
     monkeypatch.setattr(service.subprocess, "run", lambda command, **_: calls.append(command))
     service.control("status")
     assert calls[-1][3] == service.LEGACY_UNIT_NAME
+    # Its ExecStart names the removed kaggle_runner package, so it must not be started again.
+    with pytest.raises(ValueError, match="service install"):
+        service.control("start")
     (root / service.UNIT_NAME).write_text(service.DESCRIPTION)
     service.control("status")
     assert calls[-1][3] == service.UNIT_NAME

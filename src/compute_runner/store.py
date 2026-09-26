@@ -127,7 +127,8 @@ class Store:
                 );
             """)
             version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            if version not in {"1", "2"}:
+            # 3: job records name an account; older versions must not open them.
+            if version not in {"1", "2", "3"}:
                 raise RuntimeError(f"Unsupported state schema {version}; do not open with this version")
             db.executescript("""
                 BEGIN IMMEDIATE;
@@ -140,7 +141,7 @@ class Store:
                     PRIMARY KEY (batch_id, position)
                 );
                 CREATE INDEX IF NOT EXISTS event_job ON events(job_id, id);
-                UPDATE meta SET value='2' WHERE key='schema_version';
+                UPDATE meta SET value='3' WHERE key='schema_version';
                 COMMIT;
             """)
         os.chmod(self.db, 0o600)
@@ -333,6 +334,8 @@ class Store:
     def _observable(job):
         return (
             job.state,
+            job.account,
+            job.suggested_account,
             job.remote_state,
             job.wait_reason,
             job.error,

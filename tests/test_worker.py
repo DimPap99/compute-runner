@@ -37,7 +37,7 @@ def test_account_inventory_matches_own_runs_ignoring_case(setup):
     worker = client.worker()
     worker.tick()
     backend.external = {ref.upper(): "cpu" for ref in backend.remote}
-    worker.inventory_at = None
+    worker.discovery["kaggle:tester"].checked_at = None  # Discover again now.
     client.submit_many([spec] * 3)
     worker.tick()
     assert len(backend.pushes) == 5
@@ -60,7 +60,7 @@ def test_gpu_block_does_not_block_cpu_and_recovers(setup):
     assert len(backend.pushes) == 1 and not backend.pushes[0]["enable_gpu"]
     assert client.get(gpu.id).state == "queued"
     backend.gpu_seconds = 3600
-    due(client, gpu.id)
+    worker.discovery["kaggle:tester"].checked_at = None  # Quota is read with the next discovery.
     worker.tick()
     assert len(backend.pushes) == 2 and backend.pushes[1]["enable_gpu"]
 
@@ -249,14 +249,19 @@ def test_only_one_worker_holds_lock(setup):
             client.worker().tick()
 
 
-def test_job_on_an_unconfigured_account_is_blocked(setup):
+def test_job_on_an_account_the_worker_does_not_know_waits_for_a_restart(setup):
     client, backend, spec = setup
     job = client.submit(spec)
-    client.config.accounts = [Account(user="someoneelse")]
+    # The worker started before the account was added.
+    accounts, client.config.accounts = client.config.accounts, [Account(user="someoneelse")]
     client.worker().tick()
-    blocked = client.get(job.id)
-    assert blocked.state == "blocked" and "kaggle:tester is not configured" in blocked.error
+    waiting = client.get(job.id)
+    assert waiting.state == "queued"
+    assert "kaggle:tester is unknown to the running worker" in waiting.wait_reason
     assert not backend.pushes
+    client.config.accounts = accounts
+    client.worker().tick()
+    assert client.get(job.id).state == "remote_queued"
 
 
 def test_fifo_waits_for_inputs_but_other_resource_pool_progresses(setup, tmp_path):

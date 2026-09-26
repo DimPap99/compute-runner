@@ -206,6 +206,8 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
         run("account", "add", "kaggle", "other", "--credentials", str(missing))
     run("account", "add", "kaggle", "tester")
     assert run("account", "add", "kaggle", "other", "--default")["accounts"] == ["kaggle:other", "kaggle:tester"]
+    # Updating an account typed in other casing keeps the ID its jobs refer to.
+    assert run("account", "add", "kaggle", "TESTER", "--cpu-limit", "3")["account"] == "kaggle:tester"
     script = tmp_path / "hello.py"
     script.write_text("print(42)")
     job_id = run("submit", str(script))[0]["id"]
@@ -253,3 +255,116 @@ def test_account_token_file_wins_over_the_environment_token(tmp_path, monkeypatc
     assert api.config_values["token"] == "KGAT_file_token_value"
     with api.build_kaggle_client() as client:
         assert client._http_client._session.auth.token == "KGAT_file_token_value"
+
+
+def test_auto_failover_does_not_bounce_a_job_between_full_accounts(two_accounts):
+    client, home, other, spec = two_accounts
+    client.config.failover = "auto"
+    client.config.retry_seconds = 60
+    home.push_error = other.push_error = RemoteError("Maximum CPU session count reached", "capacity", definitive=True)
+    job = client.submit(spec)
+    worker = client.worker()
+    for _ in range(4):
+        worker.tick()
+    job = client.get(job.id)
+    # Rejected on tester, moved once, rejected on other; it retries there instead of moving back.
+    assert [attempt.account for attempt in job.attempts] == ["kaggle:tester", "kaggle:other"]
+    assert job.account == "kaggle:other" and job.state == "queued" and job.suggested_account is None
+
+
+def test_a_job_retrying_uploads_keeps_its_account_and_does_not_push_others_away(two_accounts, tmp_path):
+    client, home, other, spec = two_accounts
+    client.config.failover = "auto"
+    client.config.retry_seconds = 60
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("print('hi')\n")
+    data = tmp_path / "data.txt"
+    data.write_text("input")
+    uploaded = home.ensure_bundle
+
+    def second_upload_fails(bundle):
+        if home.uploads:
+            raise RemoteError("Connection reset")
+        return uploaded(bundle)
+
+    home.ensure_bundle = second_upload_fails
+    first = client.submit(spec.model_copy(update={"source": project, "entrypoint": "main.py", "inputs": {"data": data}}))
+    later = client.submit_many([spec] * 2)
+    worker = client.worker()
+    worker.tick()
+    worker.tick()
+    first = client.get(first.id)
+    assert first.state == "preparing" and first.account == "kaggle:tester" and "input:data" in first.upload_refs
+    for job in map(client.get, [job.id for job in later]):
+        assert job.account == "kaggle:tester" and job.state == "queued" and job.suggested_account is None
+        assert job.wait_reason == "Queued behind a job preparing on kaggle:tester"
+    assert not other.pushes and not other.uploads
+
+
+def test_a_new_failover_suggestion_is_reported_as_a_change(two_accounts):
+    client, home, other, spec = two_accounts
+    home.gpu_seconds = other.gpu_seconds = 0
+    job = client.submit(spec.model_copy(update={"gpu": True}))
+    worker = client.worker()
+    worker.tick()
+    cursor = client.agent().changes()["cursor"]
+    other.gpu_seconds = 3600
+    worker.discovery["kaggle:other"].checked_at = None
+    worker.tick()
+    changed = client.agent().changes(after=cursor)["jobs"]
+    assert [(item["id"], item["suggested_account"]) for item in changed] == [(job.id, "kaggle:other")]
+
+
+def test_waiting_jobs_do_not_query_other_accounts_every_cycle(two_accounts):
+    client, home, other, spec = two_accounts
+    calls = []
+    quota = other.quota
+    other.quota = lambda: calls.append(1) or quota()
+    home.gpu_seconds = 0
+    client.submit(spec.model_copy(update={"gpu": True}))
+    worker = client.worker()
+    for _ in range(5):
+        worker.tick()
+    assert len(calls) == 1
+
+
+def test_suggestions_see_slots_taken_earlier_in_the_same_cycle(two_accounts):
+    client, home, other, spec = two_accounts
+    for account in client.config.accounts:
+        account.cpu_limit = 1
+    home.external = {"tester/own-notebook": "cpu"}
+    first = client.submit(spec)
+    client.submit(spec, account="kaggle:other")
+    last = client.submit(spec)
+    client.worker().tick()
+    assert client.get(first.id).suggested_account == "kaggle:other"
+    # The job native to kaggle:other took its only slot, so nothing else is suggested there.
+    assert len(other.pushes) == 1 and client.get(last.id).suggested_account is None
+
+
+def test_moving_a_job_to_its_own_account_is_refused(two_accounts):
+    client, home, other, spec = two_accounts
+    job = client.submit(spec)
+    with pytest.raises(ValueError, match="already on kaggle:tester"):
+        client.move(job.id, "kaggle:tester")
+    assert client.agent().move([job.id], account="kaggle:tester")["moved"] == 0
+
+
+def test_downloads_for_a_removed_account_wait_until_it_returns(two_accounts):
+    client, home, other, spec = two_accounts
+    job = client.submit(spec, account="kaggle:other")
+    worker = client.worker()
+    worker.tick()
+    other.remote[client.get(job.id).remote_ref] = dict(state="COMPLETE", error=None)
+    other.download_error = RemoteError("Output listing unavailable")
+    due(client, job.id)
+    worker.tick()
+    assert client.get(job.id).download_state == "error" and other.download_calls == 1
+    accounts, client.config.accounts = client.config.accounts, client.config.accounts[:1]
+    due(client, job.id)
+    worker.tick()
+    assert other.download_calls == 1
+    client.config.accounts, other.download_error = accounts, None
+    worker.tick()
+    assert client.get(job.id).download_state == "complete"

@@ -12,28 +12,31 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-import yaml
 from rich.console import Console
 from rich.table import Table
 
+from .agent import ERRORS
+from .agent_cli import agent_app
 from .client import Client
-from .models import Account, Config, JobSpec
+from .models import Account, Config
 from .providers import safe_message
 from .security import redacted_env_record
-from .store import atomic_json, config_path
+from .store import atomic_json, config_path, load_config
+from .workloads import workload_specs
 from . import service
 
 app = typer.Typer(
     no_args_is_help=True,
     help="Queue, run and monitor compute workloads on your provider accounts. Kaggle is the only provider "
-    "adapter today.",
+    "adapter today. LLM agents should use the bounded 'agent' commands.",
 )
-worker_app = typer.Typer(no_args_is_help=True)
-service_app = typer.Typer(no_args_is_help=True)
+worker_app = typer.Typer(no_args_is_help=True, help="Run the scheduler in this terminal or inspect it.")
+service_app = typer.Typer(no_args_is_help=True, help="Manage the worker as a systemd user service.")
 account_app = typer.Typer(no_args_is_help=True, help="Connect provider accounts; the first is the default.")
 app.add_typer(worker_app, name="worker")
 app.add_typer(service_app, name="service")
 app.add_typer(account_app, name="account")
+app.add_typer(agent_app, name="agent")
 console = Console()
 
 
@@ -73,40 +76,15 @@ def _id(ctx, value):
     return _client(ctx).store.resolve_id(value)
 
 
-def load_specs(path: Path):
-    path = path.expanduser().resolve()
-    if path.suffix.lower() in {".yaml", ".yml"} and path.is_file():
-        data = yaml.safe_load(path.read_text())
-        rows = data["jobs"] if isinstance(data, dict) and "jobs" in data else [data]
-        if not isinstance(rows, list) or not rows:
-            raise ValueError("A workload YAML must contain a job mapping or a nonempty jobs list")
-        result = []
-        for row in rows:
-            spec = JobSpec.model_validate(row)
-            # Joining keeps absolute paths as they are.
-            spec.source = path.parent / spec.source.expanduser()
-            spec.inputs = {key: path.parent / value.expanduser() for key, value in spec.inputs.items()}
-            result.append(spec)
-        return result
-    return [JobSpec(source=path, name=path.stem)]
-
-
-def workload_specs(source: Path, *, timeout=None, arg=None, **overrides):
-    """Load a workload and apply the submit commands' overrides to every job."""
-    overrides |= dict(timeout_seconds=timeout, args=arg)
-    values = {key: value for key, value in overrides.items() if value is not None}
-    if overrides["gpu"] is False:
-        if overrides["accelerator"] is not None:
-            raise ValueError("--cpu cannot be combined with a GPU accelerator")
-        values["accelerator"] = None
-    return [JobSpec.model_validate(spec.model_dump() | values) for spec in load_specs(source)]
-
-
 def _save(ctx, **changes):
     """Validate and persist configuration; fields that are not changed keep their current values."""
     changes = {key: value for key, value in changes.items() if value is not None}
-    config = Config.model_validate(_client(ctx).config.model_dump() | changes)
+    # The saved file, not this invocation's configuration: a one-off --state-dir must not persist.
+    config = Config.model_validate(load_config().model_dump() | changes)
     atomic_json(config_path(), config.model_dump(mode="json"))
+    if _client(ctx).worker_health()["running"]:
+        # The worker reads configuration when it starts; stderr keeps --json output parseable.
+        typer.echo("Restart the worker to apply this change: compute-runner service restart", err=True)
     return config
 
 
@@ -129,6 +107,7 @@ def initialize(
         ),
     ] = None,
 ):
+    """Save worker-wide settings: failover policy, polling interval and strict mode."""
     config = _save(ctx, failover=failover, poll_seconds=poll_seconds, strict=strict)
     _emit(
         ctx,
@@ -164,7 +143,8 @@ def account_add(
     index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key), len(accounts))
     saved = accounts[index].model_dump() if index < len(accounts) else {}
     changes = dict(credentials=credentials, cpu_limit=cpu_limit, gpu_limit=gpu_limit)
-    values = saved | dict(provider=provider, user=user) | {k: v for k, v in changes.items() if v is not None}
+    # An existing account keeps its saved ID, whatever the casing typed now; its jobs refer to it.
+    values = dict(provider=provider, user=user) | saved | {k: v for k, v in changes.items() if v is not None}
     account = Account.model_validate(values)
     others = [a.model_dump() for a in accounts if a.id.casefold() != key]
     others.insert(0 if default else index, account.model_dump())
@@ -209,6 +189,7 @@ def submit(
     request_key: str | None = None,
     account: Annotated[str | None, typer.Option(help="Account ID such as kaggle:USER; default first")] = None,
 ):
+    """Queue a script, notebook, project YAML or jobs: YAML; --dry-run lists the files to upload."""
     specs = workload_specs(
         source,
         entrypoint=entrypoint,
@@ -220,7 +201,7 @@ def submit(
         arg=arg,
     )
     if dry_run:
-        _emit(ctx, [_client(ctx).preview(spec) for spec in specs])
+        _emit(ctx, [_client(ctx).preview(spec, account) for spec in specs])
     else:
         jobs = _client(ctx).submit_many(specs, request_key=request_key, account=account)
         if ctx.obj["json"]:
@@ -229,11 +210,15 @@ def submit(
             for job in jobs:
                 console.print(f"Queued {job.id} ({job.spec.name})")
         if not ctx.obj["json"] and not _client(ctx).worker_health()["running"]:
-            console.print("Queued locally. Start processing with: compute-runner service start (or compute-runner worker run)")
+            console.print(
+                "Queued locally. Start processing with: compute-runner service start "
+                "(or compute-runner worker run)"
+            )
 
 
 @app.command("list")
 def list_jobs(ctx: typer.Context, state: str | None = None):
+    """List every job, or those in one state."""
     jobs = _client(ctx).list(states={state} if state else None)
     if ctx.obj["json"]:
         _emit(ctx, [_job_dict(job) for job in jobs])
@@ -254,11 +239,13 @@ def list_jobs(ctx: typer.Context, state: str | None = None):
 
 @app.command()
 def status(ctx: typer.Context, job_id: str):
+    """Print a job's full record."""
     _emit(ctx, _client(ctx).get(_id(ctx, job_id)))
 
 
 @app.command()
 def watch(ctx: typer.Context, job_id: str):
+    """Print a job's progress every polling interval until it settles."""
     job_id = _id(ctx, job_id)
     while True:
         job = _client(ctx).get(job_id)
@@ -287,6 +274,7 @@ def wait(
     timeout: float | None = None,
     downloads: Annotated[bool, typer.Option("--downloads/--no-downloads")] = True,
 ):
+    """Wait for a job to settle; exits 1 unless it succeeded."""
     job = _client(ctx).wait(_id(ctx, job_id), timeout=timeout, downloads=downloads)
     _emit(ctx, job)
     if job.state != "succeeded":
@@ -295,6 +283,7 @@ def wait(
 
 @app.command()
 def logs(ctx: typer.Context, job_id: str, follow: bool = False):
+    """Print a run's log, a snapshot while it runs, or stream it with --follow."""
     for chunk in _client(ctx).logs(_id(ctx, job_id), follow=follow):
         if ctx.obj["json"]:
             typer.echo(json.dumps({"data": chunk}))
@@ -305,11 +294,13 @@ def logs(ctx: typer.Context, job_id: str, follow: bool = False):
 
 @app.command()
 def download(ctx: typer.Context, job_id: str):
+    """Download a finished run's outputs now; the worker also does this automatically."""
     _emit(ctx, _client(ctx).download(_id(ctx, job_id)))
 
 
 @app.command()
 def retry(ctx: typer.Context, job_id: str, account: str | None = None):
+    """Rerun a finished or blocked job's saved code as a new job."""
     _emit(ctx, _client(ctx).retry(_id(ctx, job_id), account=account))
 
 
@@ -321,6 +312,7 @@ def move(ctx: typer.Context, job_id: str, account: Annotated[str, typer.Option()
 
 @app.command()
 def cancel(ctx: typer.Context, job_id: str):
+    """Cancel a pending job locally, or ask its provider to stop a running one."""
     _emit(ctx, _client(ctx).cancel(_id(ctx, job_id)))
 
 
@@ -332,6 +324,7 @@ def resolve(
         bool, typer.Option(help="Assert you independently verified no remote run exists")
     ] = False,
 ):
+    """Operator assertion that an unresolved submission created no remote run; the user's call alone."""
     if not not_submitted:
         raise ValueError(
             "Inspect the run on its provider first; --not-submitted is an explicit operator assertion"
@@ -341,11 +334,13 @@ def resolve(
 
 @app.command()
 def quota(ctx: typer.Context, account: str | None = None):
+    """Query accelerator quota for one account, or every account."""
     _emit(ctx, _client(ctx).quota(account))
 
 
 @app.command()
 def doctor(ctx: typer.Context, offline: bool = False):
+    """Check configuration, disk and worker, and each account's quota and active runs unless --offline."""
     client = _client(ctx)
     info = dict(
         accounts=[account.id for account in client.config.accounts],
@@ -370,6 +365,7 @@ def doctor(ctx: typer.Context, offline: bool = False):
 
 @worker_app.command("run")
 def worker_run(ctx: typer.Context, once: bool = False):
+    """Run the scheduler in the foreground, or one cycle with --once."""
     _client(ctx).config.account()  # Fails with setup guidance when no account is configured.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     worker = _client(ctx).worker()
@@ -378,11 +374,13 @@ def worker_run(ctx: typer.Context, once: bool = False):
 
 @worker_app.command("status")
 def worker_status(ctx: typer.Context):
+    """Read worker lock and heartbeat."""
     _emit(ctx, _client(ctx).worker_health())
 
 
 @service_app.command("install")
 def service_install(ctx: typer.Context, start: Annotated[bool, typer.Option("--start/--no-start")] = True):
+    """Install and enable the worker as a systemd user service."""
     _client(ctx).config.account()  # Fails with setup guidance when no account is configured.
     # Persist a state-dir override so API clients and the service use the same queue.
     atomic_json(config_path(), _client(ctx).config.model_dump(mode="json"))
@@ -391,21 +389,25 @@ def service_install(ctx: typer.Context, start: Annotated[bool, typer.Option("--s
 
 @service_app.command("start")
 def service_start():
+    """Start the worker service."""
     service.control("start")
 
 
 @service_app.command("stop")
 def service_stop():
+    """Stop the worker service; queued jobs wait and remote runs continue."""
     service.control("stop")
 
 
 @service_app.command("restart")
 def service_restart():
+    """Restart the worker service, for example to apply configuration changes."""
     service.control("restart")
 
 
 @service_app.command("status")
 def service_status(ctx: typer.Context):
+    """Show systemd status and the worker heartbeat."""
     if not ctx.obj["json"]:
         service.control("status")
     _emit(ctx, _client(ctx).worker_health())
@@ -417,9 +419,3 @@ def main():
     except ERRORS as error:
         typer.echo("Error: " + safe_message(error), err=True)
         raise SystemExit(1) from None
-
-
-# Import after load_specs is defined; the agent CLI reuses workload-file parsing.
-from .agent_cli import ERRORS, agent_app  # noqa: E402
-
-app.add_typer(agent_app, name="agent")

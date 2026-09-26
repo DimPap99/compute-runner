@@ -33,7 +33,9 @@ class Client:
             self._providers.setdefault(account.id, connect(account, self.config))
         return self._providers[account.id]
 
-    def preview(self, spec: JobSpec):
+    def preview(self, spec: JobSpec, account: str | None = None):
+        """The files a submission would upload; checks the spec against the account without remote calls."""
+        self.provider(account).check(spec)
         return describe(spec)
 
     def submit(
@@ -143,6 +145,7 @@ class Client:
             state="cancelled",
             finished_at=time.time(),
             wait_reason="Cancelled locally",
+            suggested_account=None,
             download_state="disabled",
         )
         if updated is None:
@@ -180,6 +183,8 @@ class Client:
         """Place a job that has not been submitted on another configured account."""
         job = self.get(job_id)
         target = self.config.account(account).id
+        if target == job.account:
+            raise ValueError(f"The job is already on {target}")
         if job.state not in MOVABLE:
             raise ValueError(f"Only jobs that have not been submitted can move; this one is {job.state}")
         self.provider(target).check(job.spec)
@@ -231,7 +236,9 @@ class Client:
             if self.worker_health()["running"]:
                 stopped_since = None
             elif now - (stopped_since := stopped_since or now) >= 30:
-                raise RuntimeError("No worker is running. Start compute-runner service start or compute-runner worker run")
+                raise RuntimeError(
+                    "No worker is running. Start compute-runner service start or compute-runner worker run"
+                )
             time.sleep(min(2, self.config.poll_seconds, deadline - now if deadline else 2))
 
     def logs(self, job_id, *, follow=False):

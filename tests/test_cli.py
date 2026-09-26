@@ -3,7 +3,8 @@ import json
 from typer.testing import CliRunner
 
 from compute_runner import Client
-from compute_runner.cli import app, load_specs
+from compute_runner.cli import app
+from compute_runner.workloads import load_specs
 from compute_runner.service import unit_text
 
 
@@ -104,3 +105,29 @@ def test_service_escapes_paths_and_uses_venv(setup):
 def test_service_working_directory_is_not_quoted(setup):
     client, _, _ = setup
     assert f"WorkingDirectory={client.config.state_dir}\n" in unit_text(client.config)
+
+
+def test_configuration_changes_remind_a_running_worker_to_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
+    runner = CliRunner()
+    assert "restart" not in runner.invoke(app, ["--json", "account", "add", "kaggle", "tester"]).stderr
+    with Client().store.worker_lock():
+        result = runner.invoke(app, ["--json", "account", "add", "kaggle", "other"])
+    assert result.exit_code == 0 and "compute-runner service restart" in result.stderr
+    assert json.loads(result.stdout)["accounts"] == ["kaggle:tester", "kaggle:other"]
+
+
+def test_one_off_state_dir_is_not_saved_and_dry_run_checks_the_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
+    runner = CliRunner()
+    scratch = tmp_path / "scratch"
+    result = runner.invoke(app, ["--state-dir", str(scratch), "account", "add", "kaggle", "tester"])
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp_path / "config/config.json").read_text())
+    assert saved["state_dir"] == str((tmp_path / "state").resolve())
+    script = tmp_path / "hello.py"
+    script.write_text("print(42)")
+    result = runner.invoke(app, ["--json", "submit", str(script), "--dry-run", "--timeout", "90000"])
+    assert result.exit_code != 0 and "43200" in str(result.exception)

@@ -95,6 +95,10 @@ def waiting_for_capacity(account, pool):
     return f"Waiting for {pool.upper()} capacity on {account}"
 
 
+def queued_behind(account):
+    return f"Queued behind a job preparing on {account}"
+
+
 def place(store, job_id, account, reason):
     """Put a job that has no remote run on another account; None if it changed meanwhile.
 
@@ -254,7 +258,11 @@ class Worker:
             return
         try:
             self.store.heartbeat(state="running", stage=f"discovering runs on {account}")
-            found.runs = {ref.lower(): kind for ref, kind in self.provider(account).active_runs().items()}
+            provider = self.provider(account)
+            found.runs = {ref.lower(): kind for ref, kind in provider.active_runs().items()}
+            # Checked with the runs, not per launch: failover weighs every account each cycle.
+            gpu = provider.quota().get("gpu")
+            found.gpu_seconds = gpu["available_seconds"] if gpu else 0
             found.checked_at = now
             found.error = None
         except Exception as error:
@@ -272,34 +280,29 @@ class Worker:
         return count >= getattr(self.config.account(account), pool + "_limit")
 
     def _obstacle(self, account, pool, *, reserve=False):
-        """Why no new run can start on the account now, as (reason, hold changes); None if one can."""
+        """Why no new run can start on the account now; None if one can."""
         self._refresh_inventory(account)
         found = self.discovery[account]
         if found.checked_at is None or found.error:
-            return f"Run discovery on {account} unavailable; waiting before new launches", {}
+            return f"Run discovery on {account} unavailable; waiting before new launches"
         if self._full(account, pool, reserve=reserve):
-            return waiting_for_capacity(account, pool), {}
-        if pool == "gpu":
-            retry = time.time() + self.config.retry_seconds
-            try:
-                gpu = self.provider(account).quota().get("gpu")
-            except Exception as error:
-                changes = dict(error=safe_message(error), next_action_at=retry)
-                return f"GPU quota on {account} unavailable", changes
-            found.gpu_seconds = gpu["available_seconds"] if gpu else 0
-            if found.gpu_seconds <= 0:
-                return f"Waiting for available GPU quota on {account}", dict(error=None, next_action_at=retry)
+            return waiting_for_capacity(account, pool)
+        if pool == "gpu" and found.gpu_seconds <= 0:
+            return f"Waiting for available GPU quota on {account}"
         return None
 
     def _alternative(self, job, pool, targets):
         """The first other account, in preference order, that can start the job now.
 
         targets caches each account's availability for this cycle. Work already preparing
-        there counts, so a burst moves no more jobs than an account can start.
+        there counts, so a burst moves no more jobs than an account can start. An account
+        that rejected one of the job's launches is skipped, so a job cannot bounce between
+        two full accounts.
         """
+        rejected = {attempt.account for attempt in job.attempts if attempt.state == "rejected"}
         for account in self.config.accounts:
             key = (account.id, pool)
-            if account.id == job.account:
+            if account.id == job.account or account.id in rejected:
                 continue
             if key not in targets:
                 targets[key] = self._obstacle(account.id, pool, reserve=True) is None
@@ -312,16 +315,15 @@ class Worker:
             return account.id
         return None
 
-    def _hold(self, job, reason, suggested=None, **changes):
-        """Keep a pending job queued, with a visible reason and an account that could start it now."""
-        if changes or job.wait_reason != reason or job.suggested_account != suggested:
-            self.store.update(
-                job.id, expected=PENDING, wait_reason=reason, suggested_account=suggested, **changes
-            )
+    def _hold(self, job, reason, suggested=None):
+        """Keep a pending job waiting, with a visible reason and an account that could start it now."""
+        if job.wait_reason != reason or job.suggested_account != suggested:
+            self.store.update(job.id, expected=PENDING, wait_reason=reason, suggested_account=suggested)
 
     def _dispatch(self, pending):
-        # Jobs wait in order within each account's resource pool; blocked records why.
-        blocked, targets = {}, {}
+        # Jobs start in order within each account's resource pool. waiting[key] is why later jobs
+        # there wait, and whether the account itself cannot start work now, which allows failover.
+        waiting, targets = {}, {}
         configured = {account.id for account in self.config.accounts}
         for original in pending:
             if self.stop_event.is_set():
@@ -331,39 +333,44 @@ class Worker:
                 continue
             pool = "gpu" if job.spec.gpu else "cpu"
             if job.account not in configured:
-                self.store.update(
-                    job.id,
-                    expected=PENDING,
-                    state="blocked",
-                    error=f"Account {job.account} is not configured; add it or move the job",
+                # Usually an account added after this worker started; it runs once the worker restarts.
+                self._hold(
+                    job, f"Account {job.account} is unknown to the running worker; restart it or move the job"
                 )
                 continue
             key = (job.account, pool)
             if job.next_action_at > time.time():
-                blocked.setdefault(key, waiting_for_capacity(*key))
-                if job.state != "queued":
+                if job.state == "preparing":
+                    # Its uploads wait for a retry or for provider processing; later jobs keep their place.
+                    waiting.setdefault(key, (queued_behind(job.account), False))
                     continue
-                # Backing off, e.g. after the provider rejected a launch for capacity or quota.
-                problem = job.wait_reason or blocked[key], {}
-            elif key in blocked:
-                problem = blocked[key], {}
-            elif problem := self._obstacle(job.account, pool):
-                blocked[key] = problem[0]
+                # Queued jobs back off only after the provider rejected a launch for capacity or quota.
+                waiting.setdefault(key, (waiting_for_capacity(*key), True))
+                problem = job.wait_reason or waiting[key][0], True
+            elif key in waiting:
+                problem = waiting[key]
+            elif reason := self._obstacle(job.account, pool):
+                problem = waiting[key] = reason, True
+            else:
+                problem = None
             if problem:
-                reason, changes = problem
-                target = self._alternative(job, pool, targets) if self.config.failover != "off" else None
-                # A job that started uploading stays, so jobs do not bounce between accounts.
+                reason, account_unavailable = problem
+                target = None
+                if account_unavailable and self.config.failover != "off":
+                    target = self._alternative(job, pool, targets)
+                # Only queued jobs move by themselves; one that is preparing keeps its uploads.
                 if not (target and self.config.failover == "auto" and job.state == "queued"):
-                    self._hold(job, reason, target, **changes)
+                    self._hold(job, reason, target)
                     continue
                 job = place(self.store, job.id, target, f"Moved from {job.account}: {reason}")
-                targets.pop((target, pool))
                 if job is None:
                     continue
                 key = (job.account, pool)
+            # The job takes a slot on its account, so that account's cached availability is stale.
+            targets.pop(key, None)
             if not self._prepare(job):
-                if self.store.get(job.id).state in PENDING:
-                    blocked.setdefault(key, waiting_for_capacity(*key))
+                if self.store.get(job.id).state == "preparing":
+                    waiting.setdefault(key, (queued_behind(job.account), False))
                 continue
             job = self.store.get(job.id)
             if job.state != "preparing":
@@ -373,7 +380,7 @@ class Worker:
             if self.discovery[job.account].error or self._full(job.account, pool):
                 continue
             if not self._submit(job):
-                blocked.setdefault(key, waiting_for_capacity(*key))
+                waiting.setdefault(key, (waiting_for_capacity(*key), True))
 
     def _prepare(self, job):
         job = self.store.update(
@@ -422,7 +429,8 @@ class Worker:
             self.store.update(
                 job.id,
                 expected={"preparing"},
-                state="queued" if transient else "blocked",
+                # Still preparing: completed uploads stay, and the job keeps its account and place.
+                state="preparing" if transient else "blocked",
                 error=safe_message(error),
                 wait_reason="Upload retry pending"
                 if transient
@@ -506,10 +514,13 @@ class Worker:
 
     def _downloads(self):
         self.downloads = {job_id: future for job_id, future in self.downloads.items() if not future.done()}
+        # Downloads for a removed account wait until it is added again.
+        configured = {account.id for account in self.config.accounts}
         for job in self.store.list(TERMINAL):
             if (
                 job.remote_ref
                 and job.attempts[-1].state == "accepted"
+                and job.attempts[-1].account in configured
                 and job.spec.auto_download
                 and job.download_state != "complete"
                 and job.download_retry_at <= time.time()

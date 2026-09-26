@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from functools import wraps
 from pathlib import Path
 from typing import Annotated
 
 import typer
-import yaml
 
-from .agent import short
+from .agent import ERRORS, short
+from .workloads import workload_specs
 
 agent_app = typer.Typer(
-    no_args_is_help=True, help="Bounded JSON API for agents. Scheduling stays in the worker."
+    no_args_is_help=True,
+    help="Bounded JSON API for agents; each command prints one JSON object. Scheduling stays in the "
+    "worker. Workflow and permissions: skills/compute-runner/SKILL.md.",
 )
-# Operation failures reported as a message; anything else is a bug and keeps its traceback.
-ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
 
 
 def response(function):
@@ -54,9 +53,7 @@ def submit(
         str | None, typer.Option(help="Account ID from agent accounts; default: the first account")
     ] = None,
 ):
-    """Submit a script, notebook, project YAML, or jobs: YAML atomically."""
-    from .cli import workload_specs
-
+    """Submit a script, notebook, project YAML, or jobs: YAML atomically. Uses the account's compute."""
     specs = workload_specs(
         source,
         entrypoint=entrypoint,
@@ -68,7 +65,7 @@ def submit(
         arg=arg,
     )
     if dry_run:
-        return ctx.obj["client"].agent().preview(specs)
+        return ctx.obj["client"].agent().preview(specs, account=account)
     return ctx.obj["client"].agent().submit(specs, request_key=request_key, account=account)
 
 
@@ -130,7 +127,7 @@ def retry(
     request_key: Annotated[str, typer.Option()],
     account: Annotated[str | None, typer.Option(help="Account ID; default: the job's account")] = None,
 ):
-    """Explicitly rerun saved code with a new request key, safe to replay."""
+    """Rerun a job's saved code as a new job when the user wants a rerun. The key makes it safe to replay."""
     return ctx.obj["client"].agent().retry(job_id, request_key=request_key, account=account)
 
 
@@ -150,14 +147,17 @@ def move(
     batch: str | None = None,
     limit: int = 20,
 ):
-    """Move jobs that have not been submitted to another account; submitted ones stay."""
+    """Move jobs that have not been submitted to another account; submitted ones stay.
+
+    Unless the failover policy is auto, move only after the user approves the account.
+    """
     return ctx.obj["client"].agent().move(job_ids, batch_id=batch, account=account, limit=limit)
 
 
 @agent_app.command("cancel")
 @response
 def cancel(ctx: typer.Context, job_id: str):
-    """Cancel a pending job locally, or ask its provider to stop a running one."""
+    """Cancel a pending job locally, or ask its provider to stop a running one. Only on the user's request."""
     return ctx.obj["client"].agent().cancel(job_id)
 
 
