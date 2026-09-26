@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -30,20 +31,24 @@ def load_config() -> Config:
     return Config.model_validate_json(path.read_text()) if path.exists() else Config()
 
 
-def atomic_json(path: Path, value):
-    import uuid
-
+def atomic_write(path: Path, data):
+    """Privately replace path with bytes or byte chunks. A failure midway keeps the old file."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("x", encoding="utf-8") as stream:
+        with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
-            json.dump(value, stream, indent=2, ensure_ascii=False)
+            for chunk in [data] if isinstance(data, bytes) else data:
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_json(path: Path, value):
+    atomic_write(path, json.dumps(value, indent=2, ensure_ascii=False).encode())
 
 
 class Store:
@@ -251,10 +256,7 @@ class Store:
         return JobRecord.model_validate_json(row[0])
 
     def list(self, states=None) -> list[JobRecord]:
-        with self.connection() as db:
-            rows = db.execute("SELECT record FROM jobs ORDER BY created,id").fetchall()
-        jobs = [JobRecord.model_validate_json(r[0]) for r in rows]
-        return [j for j in jobs if states is None or j.state in states]
+        return self.page(states=states, limit=-1)[1]
 
     def update(self, job_id: str, *, expected=None, **changes) -> JobRecord | None:
         with self.connection() as db:

@@ -24,6 +24,8 @@ class FakeBackend:
         self.output_files = {"outputs/result.json": '{"ok": true}'}
         self.live_text = "epoch 1\n"
         self.live_calls = 0
+        self.cancelled = []
+        self.cancel_error = None
 
     def active_runs(self):
         if self.discovery_error:
@@ -76,6 +78,12 @@ class FakeBackend:
 
     def logs(self, ref, follow=False):
         yield "example log\n"
+
+    def cancel(self, ref, job_id):
+        if self.cancel_error:
+            raise self.cancel_error
+        self.cancelled.append(ref)
+        self.remote[ref] = dict(state="CANCEL_REQUESTED", error=None)
 
     def live_log(self, ref):
         self.live_calls += 1

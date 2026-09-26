@@ -173,7 +173,7 @@ def test_resource_metadata_explicit_and_runtime_forwarded(setup):
     assert metadata["machine_shape"] == "NvidiaTeslaT4" and metadata["timeout_seconds"] == 120
 
 
-def test_pending_cancel_and_active_cancel_refused(setup):
+def test_pending_cancel_is_local_and_active_cancel_stops_the_remote_run(setup):
     client, backend, spec = setup
     queued = client.submit(spec)
     client.cancel(queued.id)
@@ -181,9 +181,29 @@ def test_pending_cancel_and_active_cancel_refused(setup):
     assert not backend.pushes
     active = client.submit(spec)
     client.worker().tick()
-    with pytest.raises(ValueError, match="Kaggle"):
+    ref = client.get(active.id).remote_ref
+    assert client.cancel(active.id).wait_reason == "Cancellation requested on Kaggle"
+    assert backend.cancelled == [ref]
+    client.worker().tick()
+    assert client.get(active.id).wait_reason == "Cancellation requested on Kaggle"
+    backend.remote[ref]["state"] = "CANCEL_ACKNOWLEDGED"
+    due(client, active.id)
+    client.worker().tick()
+    cancelled = client.get(active.id)
+    assert cancelled.state == "cancelled" and cancelled.download_state == "complete"
+    with pytest.raises(ValueError, match="already finished"):
         client.cancel(active.id)
-    assert client.get(active.id).state == "remote_queued"
+
+
+def test_cancel_refuses_unconfirmed_submissions(setup):
+    client, backend, spec = setup
+    backend.push_error = RemoteError("timeout", "uncertain")
+    job = client.submit(spec)
+    client.worker().tick()
+    assert client.get(job.id).attempts[-1].state == "uncertain"
+    with pytest.raises(ValueError, match="unconfirmed"):
+        client.cancel(job.id)
+    assert backend.cancelled == []
 
 
 def test_only_one_worker_holds_lock(setup):

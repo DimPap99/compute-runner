@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
@@ -98,6 +99,10 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
 
 
 def bootstrap(config):
+    # The public API never returns a session ID; the runner reads this line to cancel the run.
+    session = re.search(r"-(\d+)-\w+$", os.environ.get("KAGGLE_CONTAINER_NAME", ""))
+    if session:
+        print(f"KGR workload {config['job_id']} session {session.group(1)}", flush=True)
     project = Path(config.get("working_root", "/kaggle/working")) / "project"
     project.mkdir(parents=True, exist_ok=False)
     if config.get("inline"):

@@ -16,6 +16,7 @@ from .models import ACTIVE, TERMINAL, Attempt, Config
 from .store import Store, atomic_json
 
 logger = logging.getLogger(__name__)
+PENDING = {"queued", "preparing"}
 
 
 def collect_outputs(store, backend, job_id):
@@ -124,7 +125,7 @@ class Worker:
         for job in self.store.list(ACTIVE):
             if outstanding(job) and job.next_action_at <= now:
                 self._poll(job)
-        pending = self.store.list({"queued", "preparing"})
+        pending = self.store.list(PENDING)
         if pending and not self.stop_event.is_set():
             self._refresh_inventory()
             self._dispatch(pending)
@@ -145,7 +146,7 @@ class Worker:
             self.store.update(
                 job.id,
                 state=new_state,
-                attempts=[a.model_dump() for a in job.attempts],
+                attempts=job.attempts,
                 error=safe_message(error),
                 wait_reason="Reconciling submission; no duplicate will launch"
                 if uncertain
@@ -181,9 +182,9 @@ class Worker:
             state=state,
             remote_state=remote,
             last_polled_at=now,
-            attempts=[a.model_dump() for a in job.attempts],
+            attempts=job.attempts,
             error=status.get("error"),
-            wait_reason=None,
+            wait_reason="Cancellation requested on Kaggle" if remote == "CANCEL_REQUESTED" else None,
             next_action_at=now + self.config.poll_seconds,
         )
         if state in TERMINAL:
@@ -217,60 +218,50 @@ class Worker:
                         counts[kind] += 1
         return counts
 
+    def _full(self, pool):
+        return self._counts()[pool] >= getattr(self.config, pool + "_limit")
+
+    def _hold(self, job, reason, **changes):
+        """Keep a pending job queued, with a visible reason."""
+        self.store.update(job.id, expected=PENDING, wait_reason=reason, **changes)
+
+    def _gpu_quota_problem(self):
+        try:
+            gpu = self.backend.quota().get("gpu")
+        except Exception as error:
+            return "GPU quota unavailable", safe_message(error)
+        if gpu is None or gpu["available_seconds"] <= 0:
+            return "Waiting for available GPU quota", None
+        return None
+
     def _dispatch(self, pending):
         blocked_pools = set()
         for original in pending:
             if self.stop_event.is_set():
                 break
             job = self.store.get(original.id)
-            if job.state not in {"queued", "preparing"}:
+            if job.state not in PENDING:
                 continue
             pool = "gpu" if job.spec.gpu else "cpu"
             if job.next_action_at > time.time():
                 blocked_pools.add(pool)
                 continue
             if self.inventory_at is None or self.inventory_error:
-                self.store.update(
-                    job.id,
-                    expected={"queued", "preparing"},
-                    wait_reason="Account discovery unavailable; waiting before new launches",
-                )
+                self._hold(job, "Account discovery unavailable; waiting before new launches")
                 continue
-            if pool in blocked_pools or self._counts()[pool] >= getattr(self.config, pool + "_limit"):
-                self.store.update(
-                    job.id,
-                    expected={"queued", "preparing"},
-                    wait_reason=f"Waiting for {pool.upper()} capacity",
-                )
+            if pool in blocked_pools or self._full(pool):
+                self._hold(job, f"Waiting for {pool.upper()} capacity")
                 continue
-            if job.spec.gpu:
-                try:
-                    quota = self.backend.quota()
-                    gpu = quota.get("gpu")
-                    if gpu is None or gpu["available_seconds"] <= 0:
-                        self.store.update(
-                            job.id,
-                            expected={"queued", "preparing"},
-                            wait_reason="Waiting for available GPU quota",
-                            next_action_at=time.time() + self.config.retry_seconds,
-                        )
-                        blocked_pools.add(pool)
-                        continue
-                except Exception as error:
-                    self.store.update(
-                        job.id,
-                        expected={"queued", "preparing"},
-                        wait_reason="GPU quota unavailable",
-                        error=safe_message(error),
-                        next_action_at=time.time() + self.config.retry_seconds,
-                    )
-                    blocked_pools.add(pool)
-                    continue
+            if job.spec.gpu and (problem := self._gpu_quota_problem()):
+                reason, error = problem
+                self._hold(job, reason, error=error, next_action_at=time.time() + self.config.retry_seconds)
+                blocked_pools.add(pool)
+                continue
             if job.owner != self.config.owner:
                 self.store.update(job.id, state="blocked", error="Job owner differs from worker account")
                 continue
             if not self._prepare(job):
-                if self.store.get(job.id).state in {"queued", "preparing"}:
+                if self.store.get(job.id).state in PENDING:
                     blocked_pools.add(pool)
                 continue
             job = self.store.get(job.id)
@@ -278,7 +269,7 @@ class Worker:
                 continue
             # Recheck occupancy after uploads; external changes can still race, and Kaggle is authoritative.
             self._refresh_inventory()
-            if self.inventory_error or self._counts()[pool] >= getattr(self.config, pool + "_limit"):
+            if self.inventory_error or self._full(pool):
                 continue
             if not self._push(job):
                 blocked_pools.add(pool)
@@ -286,7 +277,7 @@ class Worker:
     def _prepare(self, job):
         job = self.store.update(
             job.id,
-            expected={"queued", "preparing"},
+            expected=PENDING,
             state="preparing",
             error=None,
             wait_reason="Preparing private inputs",
@@ -356,7 +347,7 @@ class Worker:
             state="submitting",
             wait_reason=None,
             error=None,
-            attempts=[a.model_dump() for a in job.attempts],
+            attempts=job.attempts,
             next_action_at=0,
         )
         if job is None:
@@ -378,7 +369,7 @@ class Worker:
             self.store.update(
                 job.id,
                 state=state,
-                attempts=[a.model_dump() for a in job.attempts],
+                attempts=job.attempts,
                 error=safe_message(error),
                 wait_reason="Waiting to retry rejected submission"
                 if error.definitive
@@ -392,7 +383,7 @@ class Worker:
             job.attempts[-1] = attempt
             self.store.update(
                 job.id,
-                attempts=[a.model_dump() for a in job.attempts],
+                attempts=job.attempts,
                 error=safe_message(error),
                 wait_reason="Submission outcome uncertain; reconciling",
                 next_action_at=time.time() + self.config.poll_seconds,
@@ -404,7 +395,7 @@ class Worker:
         self.store.update(
             job.id,
             state="remote_queued",
-            attempts=[a.model_dump() for a in job.attempts],
+            attempts=job.attempts,
             wait_reason=None,
             error=None,
             next_action_at=time.time() + self.config.poll_seconds,

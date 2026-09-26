@@ -1,6 +1,7 @@
 """End-to-end scenarios for an LLM driving the queue through `kgr agent` and AgentClient."""
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -353,8 +354,27 @@ def test_structured_errors_for_common_llm_mistakes(setup, tmp_path, monkeypatch)
     assert client.list() == []
 
 
+def discovery_backend(tmp_path, kernels, running, gpus=()):
+    """Listing mirrors the live service: newest run first, every notebook reported as CPU."""
+    backend = backend_with(
+        Obj(kernels_list_with_response=lambda **_: Obj(kernels=kernels, next_page_token=None)), tmp_path
+    )
+    calls = {"status": [], "get_kernel": []}
+
+    def status(ref):
+        calls["status"].append(ref)
+        return {"state": "RUNNING" if ref in running else "COMPLETE", "error": ""}
+
+    def kernels_call(method, request, ref=None):
+        assert method == "get_kernel"
+        calls["get_kernel"].append(ref)
+        return Obj(metadata=Obj(enable_gpu=ref in gpus))
+
+    backend.status, backend._kernels = status, kernels_call
+    return backend, calls
+
+
 def test_account_discovery_stops_at_runs_too_old_to_be_active(tmp_path):
-    """Mirrors a live account: 70 notebooks, most finished long ago, listed newest run first."""
     from datetime import datetime, timedelta, timezone
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # the service returns naive UTC
@@ -366,15 +386,52 @@ def test_account_discovery_stops_at_runs_too_old_to_be_active(tmp_path):
         Obj(ref=f"tester/old-{i}", last_run_time=now - timedelta(days=2 + i), enable_gpu=False)
         for i in range(65)
     ]
-    backend = backend_with(
-        Obj(kernels_list_with_response=lambda **_: Obj(kernels=kernels, next_page_token=None)), tmp_path
-    )
-    checked = []
-
-    def status(ref):
-        checked.append(ref)
-        return {"state": "RUNNING" if ref.endswith(("-0", "-1")) else "COMPLETE", "error": ""}
-
-    backend.status = status
+    backend, calls = discovery_backend(tmp_path, kernels, running={"tester/recent-0", "tester/recent-1"})
     assert backend.active_runs() == {"tester/recent-0": "cpu", "tester/recent-1": "cpu"}
-    assert checked == [f"tester/recent-{i}" for i in range(5)]
+    assert calls["status"] == [f"tester/recent-{i}" for i in range(5)]
+
+
+def test_external_gpu_runs_are_detected_once_per_run(tmp_path):
+    from datetime import datetime
+
+    now = datetime.now()
+    kernels = [Obj(ref=f"tester/k{i}", last_run_time=now, enable_gpu=False) for i in range(3)]
+    running = {"tester/k0", "tester/k1"}
+    backend, calls = discovery_backend(tmp_path, kernels, running, gpus={"tester/k1"})
+    assert backend.active_runs() == {"tester/k0": "cpu", "tester/k1": "gpu"}
+    assert backend.active_runs() == {"tester/k0": "cpu", "tester/k1": "gpu"}
+    assert calls["get_kernel"] == ["tester/k0", "tester/k1"]  # cached across discovery cycles
+    running.discard("tester/k1")
+    assert backend.active_runs() == {"tester/k0": "cpu"} and set(backend._resources) == {("tester/k0", now)}
+
+
+def test_remote_cancel_uses_the_session_id_logged_by_this_job(tmp_path):
+    backend = KaggleBackend("tester", tmp_path)
+    sent = []
+    backend._kernels = lambda method, request, ref=None: (
+        sent.append((method, request.kernel_session_id)) or Obj(error_message="")
+    )
+    backend.live_log = lambda ref: (
+        "KGR workload other session 1\nKGR workload job1 session 352993764\ntick 3\n"
+    )
+    backend.cancel("tester/kgr-x", "job1")
+    assert sent == [("cancel_kernel_session", 352993764)]
+    backend.live_log = lambda ref: "KGR workload other session 1\n"
+    with pytest.raises(ValueError, match="No session ID"):
+        backend.cancel("tester/kgr-x", "job1")
+    backend.live_log = lambda ref: "KGR workload job1 session 5\n"
+    backend._kernels = lambda *args, **kwargs: Obj(error_message="Session already finished")
+    with pytest.raises(RemoteError, match="already finished"):
+        backend.cancel("tester/kgr-x", "job1")
+
+
+def test_runtime_logs_the_session_id_before_any_setup(setup, tmp_path, monkeypatch):
+    client, _, spec = setup
+    job = client.submit(spec)
+    job.attempts = [Attempt(number=1, ref="tester/kgr-session")]
+    script = prepare_kernel(job, client.config.state_dir) / "workload.py"
+    script.write_text(script.read_text().replace("/kaggle/working", str(tmp_path / "working")))
+    env = dict(os.environ, KAGGLE_CONTAINER_NAME="kaggle_QLKaLNVAIohcv9mw-352993764-webtier")
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == f"KGR workload {job.id} session 352993764"

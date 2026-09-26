@@ -83,13 +83,15 @@ def load_specs(path: Path):
     return [JobSpec(source=path, name=path.stem)]
 
 
-def override_specs(specs, overrides):
+def workload_specs(source: Path, *, timeout=None, arg=None, **overrides):
+    """Load a workload and apply the submit commands' overrides to every job."""
+    overrides |= dict(timeout_seconds=timeout, args=arg)
     values = {key: value for key, value in overrides.items() if value is not None}
-    if overrides.get("gpu") is False:
-        if overrides.get("accelerator") is not None:
+    if overrides["gpu"] is False:
+        if overrides["accelerator"] is not None:
             raise ValueError("--cpu cannot be combined with a GPU accelerator")
         values["accelerator"] = None
-    return [JobSpec.model_validate(spec.model_dump() | values) for spec in specs]
+    return [JobSpec.model_validate(spec.model_dump() | values) for spec in load_specs(source)]
 
 
 @app.command("init")
@@ -122,17 +124,16 @@ def submit(
     dry_run: bool = False,
     request_key: str | None = None,
 ):
-    specs = load_specs(source)
-    overrides = dict(
+    specs = workload_specs(
+        source,
         entrypoint=entrypoint,
         module=module,
         gpu=gpu,
         internet=internet,
         accelerator=accelerator,
-        timeout_seconds=timeout,
-        args=arg,
+        timeout=timeout,
+        arg=arg,
     )
-    specs = override_specs(specs, overrides)
     if dry_run:
         _emit(ctx, [_client(ctx).preview(spec) for spec in specs])
     else:

@@ -118,11 +118,18 @@ class Client:
         return self.store.list(states)
 
     def cancel(self, job_id):
+        """Cancel pending work locally, or ask Kaggle to stop an accepted run.
+
+        The worker records a remote cancellation when it next polls the run.
+        """
         job = self.get(job_id)
-        if outstanding(job) or job.terminal:
-            raise ValueError(
-                f"Cannot cancel this local job. Stop active execution on Kaggle: {job.url or job.id}"
-            )
+        if job.terminal:
+            raise ValueError(f"The job has already finished ({job.state})")
+        if outstanding(job):
+            if job.attempts[-1].state != "accepted":
+                raise ValueError(f"The submission is unconfirmed; inspect it on Kaggle first: {job.url}")
+            self.backend.cancel(job.remote_ref, job.id)
+            return self.store.update(job_id, wait_reason="Cancellation requested on Kaggle", next_action_at=0)
         updated = self.store.update(
             job_id,
             expected={"queued", "preparing", "blocked"},
@@ -168,30 +175,43 @@ class Client:
         job = self.get(job_id)
         if job.state != "needs_attention" or not job.attempts or job.attempts[-1].state == "accepted":
             raise ValueError("Only an unresolved, unaccepted attempt can be marked not submitted")
-        attempts = [attempt.model_dump() for attempt in job.attempts]
-        attempts[-1]["state"] = "rejected"
-        attempts[-1]["error"] = "Operator confirmed that no remote execution exists"
+        job.attempts[-1].state = "rejected"
+        job.attempts[-1].error = "Operator confirmed that no remote execution exists"
         return self.store.update(
             job_id,
             expected={"needs_attention"},
             state="blocked",
-            attempts=attempts,
+            attempts=job.attempts,
             error=None,
             wait_reason="Operator resolved missing submission; retry explicitly",
         )
 
     def wait(self, job_id, *, timeout=None, downloads=True):
         """Return once the job settles; a failed download is returned too (the worker retries it)."""
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        jobs, done = self.wait_many([job_id], timeout=timeout, downloads=downloads)
+        if not done:
+            raise TimeoutError(f"Waiting for {job_id} timed out; the job remains tracked")
+        return jobs[0]
+
+    def wait_many(self, job_ids=None, *, batch_id=None, timeout=None, downloads=True):
+        """Wait until every selected job settles or timeout passes; return (jobs, all_settled).
+
+        Tolerates a worker restart, but fails once no worker has run for 30 seconds.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        stopped_since = None
         while True:
-            job = self.get(job_id)
-            if settled(job, downloads=downloads):
-                return job
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"Waiting for {job_id} timed out; the job remains tracked")
-            if not self.worker_health()["running"]:
+            _, jobs = self.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
+            now = time.monotonic()
+            if all(settled(job, downloads=downloads) for job in jobs):
+                return jobs, True
+            if deadline is not None and now >= deadline:
+                return jobs, False
+            if self.worker_health()["running"]:
+                stopped_since = None
+            elif now - (stopped_since := stopped_since or now) >= 30:
                 raise RuntimeError("No worker is running. Start kgr service start or kgr worker run")
-            time.sleep(min(self.config.poll_seconds, 2))
+            time.sleep(min(2, self.config.poll_seconds, deadline - now if deadline else 2))
 
     def logs(self, job_id, *, follow=False):
         """Persisted logs of a finished run, a bounded snapshot of an unfinished one, or a stream."""

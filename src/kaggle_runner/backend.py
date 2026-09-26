@@ -8,16 +8,16 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 
-from .store import atomic_json
+from .store import atomic_json, atomic_write
 
 
 class RemoteError(RuntimeError):
@@ -72,22 +72,28 @@ def safe_message(error):
 def remote_error(error, *, mutation=False):
     if isinstance(error, RemoteError):
         return error
-    message = safe_message(error)
-    code = http_code(error)
+    message, code = safe_message(error), http_code(error)
+    if not code or not 400 <= code < 500 or code == 408:
+        return RemoteError(message, "uncertain" if mutation else "transient")
+    # Resource limits win over the status code: a 403 quota error is retryable, not an auth failure.
     kind = classify(message)
-    if code and 400 <= code < 500 and code != 408 and kind in {"capacity", "quota", "storage"}:
-        return RemoteError(message, kind, definitive=True)
-    if code in {401, 403}:
-        return RemoteError(message, "auth", definitive=True)
-    if code == 404:
-        return RemoteError(message, "missing", definitive=True)
-    if code == 429:
-        return RemoteError(
-            message, "capacity" if classify(message) == "capacity" else "rate_limit", definitive=True
-        )
-    if code and 400 <= code < 500 and code != 408:
-        return RemoteError(message, classify(message), definitive=True)
-    return RemoteError(message, "uncertain" if mutation else "transient")
+    if kind not in {"capacity", "quota", "storage"}:
+        kind = {401: "auth", 403: "auth", 404: "missing", 429: "rate_limit"}.get(code, kind)
+    return RemoteError(message, kind, definitive=True)
+
+
+def paginate(fetch):
+    """Yield fetch(token) pages until the service returns no next token."""
+    token, seen = None, set()
+    while True:
+        page = fetch(token)
+        yield page
+        token = page.next_page_token
+        if not token:
+            return
+        if token in seen:
+            raise RemoteError("Repeated pagination token")
+        seen.add(token)
 
 
 # Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
@@ -109,6 +115,7 @@ class KaggleBackend:
         self.owner = owner
         self.state_dir = state_dir
         self._api = None
+        self._resources = {}
 
     @property
     def api(self):
@@ -220,8 +227,6 @@ class KaggleBackend:
         )
         # The live service returns /code/owner/slug; also accept documented
         # owner/slug/version, bare slug and absolute Kaggle URL forms.
-        from urllib.parse import urlsplit
-
         parsed = urlsplit(response.ref)
         if parsed.netloc and parsed.hostname not in {"kaggle.com", "www.kaggle.com"}:
             raise RemoteError("Unexpected host in returned notebook reference", "uncertain")
@@ -233,17 +238,44 @@ class KaggleBackend:
             ref=f"{owner}/{slug}", version=response.version_number or (int(version) if version else None)
         )
 
+    def _kernels(self, method, request, ref=None):
+        if ref is not None:
+            request.user_name, request.kernel_slug = ref.split("/")[:2]
+        try:
+            with self.api.build_kaggle_client() as client:
+                return getattr(client.kernels.kernels_api_client, method)(request)
+        except Exception as error:
+            raise remote_error(error) from error
+
     def status(self, ref):
         from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionStatusRequest
 
-        request = ApiGetKernelSessionStatusRequest()
-        request.user_name, request.kernel_slug = ref.split("/")[:2]
-        try:
-            with self.api.build_kaggle_client() as client:
-                response = client.kernels.kernels_api_client.get_kernel_session_status(request)
-            return dict(state=response.status.name, error=response.failure_message)
-        except Exception as error:
-            raise remote_error(error) from error
+        response = self._kernels("get_kernel_session_status", ApiGetKernelSessionStatusRequest(), ref)
+        return dict(state=response.status.name, error=response.failure_message)
+
+    def _resource(self, ref):
+        """The account listing reports every notebook as CPU; the notebook itself is accurate."""
+        from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
+
+        metadata = self._kernels("get_kernel", ApiGetKernelRequest(), ref).metadata
+        if metadata is None or metadata.enable_gpu is None:
+            return "unknown"
+        return "gpu" if metadata.enable_gpu else "cpu"
+
+    def cancel(self, ref, job_id):
+        """Stop a running session. The runtime logs its session ID, which the public API never returns."""
+        from kagglesdk.kernels.types.kernels_api_service import ApiCancelKernelSessionRequest
+
+        found = re.search(rf"^KGR workload {job_id} session (\d+)$", self.live_log(ref), re.M)
+        if not found:
+            raise ValueError(
+                "No session ID in this run's log yet (it has not started, or predates remote cancellation)"
+            )
+        request = ApiCancelKernelSessionRequest()
+        request.kernel_session_id = int(found.group(1))
+        response = self._kernels("cancel_kernel_session", request)
+        if response.error_message:
+            raise RemoteError(response.error_message, "invalid", definitive=True)
 
     def active_runs(self):
         """Best-effort account inventory; no metadata or source is written locally.
@@ -253,24 +285,26 @@ class KaggleBackend:
         so scanning stops at the first kernel whose last run is older than ACTIVE_HORIZON.
         """
         result = {}
-        token = None
-        seen = set()
+        # Metadata is read once per run; entries for finished runs are dropped.
+        resources, self._resources = self._resources, {}
         cutoff = datetime.now(timezone.utc) - ACTIVE_HORIZON
+        pages = paginate(
+            lambda token: self.api.kernels_list_with_response(
+                mine=True, page_size=100, page_token=token, sort_by="dateRun"
+            )
+        )
         try:
-            while True:
-                response = self.api.kernels_list_with_response(
-                    mine=True, page_size=100, page_token=token, sort_by="dateRun"
-                )
+            for response in pages:
                 for kernel in response.kernels or []:
                     if kernel is None:
                         continue
                     last_run = kernel.last_run_time
-                    if last_run is not None:
-                        # The service returns naive UTC timestamps.
-                        if last_run.tzinfo is None:
-                            last_run = last_run.replace(tzinfo=timezone.utc)
-                        if last_run < cutoff:
-                            return result
+                    # The service returns naive UTC timestamps.
+                    if (
+                        last_run is not None
+                        and last_run.replace(tzinfo=last_run.tzinfo or timezone.utc) < cutoff
+                    ):
+                        return result
                     ref = kernel.ref
                     if not ref or ref.split("/")[0].lower() != self.owner.lower():
                         continue
@@ -281,17 +315,10 @@ class KaggleBackend:
                             continue
                         raise
                     if status["state"] in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
-                        result[ref] = (
-                            "unknown"
-                            if kernel.enable_gpu is None
-                            else ("gpu" if kernel.enable_gpu else "cpu")
-                        )
-                token = response.next_page_token
-                if not token:
-                    return result
-                if token in seen:
-                    raise RemoteError("Repeated account pagination token")
-                seen.add(token)
+                        key = (ref, last_run)
+                        self._resources[key] = resources.get(key) or self._resource(ref)
+                        result[ref] = self._resources[key]
+            return result
         except Exception as error:
             raise remote_error(error) from error
 
@@ -306,13 +333,10 @@ class KaggleBackend:
                 if quota is None:
                     result[name] = None
                     continue
-
-                def seconds(value):
-                    return value.total_seconds() if value is not None else 0
-
-                used = seconds(quota.time_used)
-                reserved = seconds(quota.time_reserved)
-                total = seconds(quota.total_time_allowed)
+                used, reserved, total = (
+                    value.total_seconds() if value is not None else 0
+                    for value in (quota.time_used, quota.time_reserved, quota.total_time_allowed)
+                )
                 result[name] = dict(
                     used_seconds=used,
                     reserved_seconds=reserved,
@@ -382,26 +406,14 @@ class KaggleBackend:
     def output_pages(self, ref):
         from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
 
-        token = None
-        seen = set()
-        while True:
+        def fetch(token):
             request = ApiListKernelSessionOutputRequest()
-            request.user_name, request.kernel_slug = ref.split("/")[:2]
             request.page_size = 100
             if token:
                 request.page_token = token
-            try:
-                with self.api.build_kaggle_client() as client:
-                    response = client.kernels.kernels_api_client.list_kernel_session_output(request)
-            except Exception as error:
-                raise remote_error(error) from error
-            yield response
-            token = response.next_page_token
-            if not token:
-                return
-            if token in seen:
-                raise RemoteError("Repeated output pagination token")
-            seen.add(token)
+            return self._kernels("list_kernel_session_output", request, ref)
+
+        return paginate(fetch)
 
     def download(self, ref, destination: Path, patterns=None, *, skip=None):
         return download_outputs(self.output_pages(ref), destination, patterns, skip=skip)
@@ -432,6 +444,18 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def _checked_chunks(response, digest):
+    """Yield the body into digest; fail before the file is replaced if it was cut short."""
+    size = 0
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        yield chunk
+    expected = response.headers.get("Content-Length")
+    if expected and not response.headers.get("Content-Encoding") and size != int(expected):
+        raise OSError("Incomplete output download")
+
+
 def download_outputs(pages, destination, patterns=None, *, skip=None, get=requests.get):
     """Download session outputs; names matching the skip predicate are not fetched."""
     from .bundle import safe_relative
@@ -444,10 +468,7 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=reques
     for page in pages:
         if page.log:
             # Always retrieve logs even when output filtering selects no files.
-            log = destination / "run.log"
-            temporary = log.with_suffix(".tmp")
-            temporary.write_text(render_log(page.log), encoding="utf-8")
-            os.replace(temporary, log)
+            atomic_write(destination / "run.log", render_log(page.log).encode())
         for item in page.files or []:
             name = safe_relative(item.file_name)
             target = root / name
@@ -459,32 +480,10 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=reques
                 continue
             if name in receipts and target.is_file() and sha256(target) == receipts[name]["sha256"]:
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = None
-            try:
-                with get(item.url, stream=True, timeout=(15, 90)) as response:
-                    response.raise_for_status()
-                    size = 0
-                    digest = hashlib.sha256()
-                    with tempfile.NamedTemporaryFile(
-                        dir=target.parent, prefix=".kgr-", delete=False
-                    ) as output:
-                        temporary = Path(output.name)
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if not chunk:
-                                continue
-                            output.write(chunk)
-                            digest.update(chunk)
-                            size += len(chunk)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    expected = response.headers.get("Content-Length")
-                    if expected and not response.headers.get("Content-Encoding") and size != int(expected):
-                        raise IOError("Incomplete output download")
-                os.replace(temporary, target)
-                receipts[name] = dict(bytes=size, sha256=digest.hexdigest())
-                atomic_json(receipt_path, receipts)
-            finally:
-                if temporary:
-                    temporary.unlink(missing_ok=True)
+            digest = hashlib.sha256()
+            with get(item.url, stream=True, timeout=(15, 90)) as response:
+                response.raise_for_status()
+                atomic_write(target, _checked_chunks(response, digest))
+            receipts[name] = dict(bytes=target.stat().st_size, sha256=digest.hexdigest())
+            atomic_json(receipt_path, receipts)
     return receipts

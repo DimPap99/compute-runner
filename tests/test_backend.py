@@ -207,3 +207,25 @@ def test_http_quota_error_remains_retryable_not_auth_failure():
     error = remote_error(requests.HTTPError("Forbidden", response=response), mutation=True)
     assert error.kind == "quota" and error.definitive
     assert "quota exhausted" in str(error)
+
+
+@pytest.mark.parametrize(
+    "code,message,kind,definitive",
+    [
+        (401, "Unauthenticated", "auth", True),
+        (403, "Permission denied", "auth", True),
+        (404, "Not found", "missing", True),
+        (429, "Too many requests", "rate_limit", True),
+        (429, "Maximum session limit reached", "capacity", True),
+        (400, "Invalid slug", "invalid", True),
+        (400, "Dataset storage limit exceeded", "storage", True),
+        (408, "Timeout", "transient", False),
+        (500, "Server error", "transient", False),
+    ],
+)
+def test_remote_error_mapping(code, message, kind, definitive):
+    response = requests.Response()
+    response.status_code = code
+    response._content = ('{"message": "%s"}' % message).encode()
+    error = remote_error(requests.HTTPError(message, response=response))
+    assert (error.kind, error.definitive) == (kind, definitive)

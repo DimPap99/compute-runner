@@ -300,7 +300,9 @@ def test_cli_agent_batch_workflow_and_structured_errors(setup, tmp_path, monkeyp
     assert len(backend.pushes) == 2
     running_log = command(["logs", job_id])
     assert running_log["text"] == "epoch 1\n" and running_log["live"]
-    assert "error" in command(["cancel", job_id], code=1)
+    assert command(["cancel", job_id])["jobs"][0]["reason"] == "Cancellation requested on Kaggle"
+    backend.cancel_error = ValueError("No session ID in this run's log yet")
+    assert "No session ID" in command(["cancel", first["jobs"][1]["id"]], code=1)["error"]
     assert "error" in command(["status", "--limit", "101"], code=1)
     assert "error" in command(["changes", "--batch", "unknown"], code=1)
     assert "error" in command(["submit", str(config), "--request-key", "bad key"], code=1)

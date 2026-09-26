@@ -181,7 +181,7 @@ print(finished.state, finished.download_state, finished.result_dir)
 | `download(job_id)` | Collect outputs from a submitted job whose execution has terminated |
 | `retry(job_id, request_key=None)` | Create a job from the original saved files and settings |
 | `retry_batch(job_id, request_key=None)` | Create a retry and return its single-job batch |
-| `cancel(job_id)` | Cancel locally pending work |
+| `cancel(job_id)` | Cancel pending work locally, or ask Kaggle to stop a running job |
 | `resolve_not_submitted(job_id)` | Record an operator's confirmation that an unresolved attempt created no remote execution |
 | `quota()` | Query accelerator quota information |
 | `worker_health()` | Read worker lock ownership and heartbeat data |
@@ -190,7 +190,7 @@ print(finished.state, finished.download_state, finished.result_dir)
 
 Use complete job IDs with `Client`. Optional parameters shown after the first argument are keyword arguments. Creating a client or reading local state does not authenticate to Kaggle. Submission is local, while logs, downloads, and quota queries access Kaggle when needed.
 
-`wait` raises `TimeoutError` when its local wait deadline expires. This does not cancel the job. With `downloads=False`, it returns after execution terminates. A blocked or uncertain job is returned for inspection, as is a finished job whose `download_state` is `error`; the worker keeps retrying that download. Waiting on unfinished work without a running worker raises an error.
+`wait` raises `TimeoutError` when its local wait deadline expires. This does not cancel the job. With `downloads=False`, it returns after execution terminates. A blocked or uncertain job is returned for inspection, as is a finished job whose `download_state` is `error`; the worker keeps retrying that download. Waiting raises an error once no worker has run for 30 seconds.
 
 ## Agent interface
 
@@ -370,7 +370,7 @@ kgr init --owner YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1 --poll-seconds
 kgr service restart
 ```
 
-A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing does not report whether an external run uses a GPU, so external runs count against the CPU limit. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
+A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
 Dataset preparation and uploads run in the dispatcher and can extend a polling cycle. Output downloads run separately.
 
@@ -398,7 +398,7 @@ kgr agent retry JOB_ID --request-key resolved-retry-v1
 
 `resolve` records an operator assertion and does not launch a job. It must not be used to bypass an active or uncertain execution.
 
-`kgr cancel JOB_ID` and `kgr agent cancel JOB_ID` cancel locally pending work. Active runs must be stopped through Kaggle's web interface. The worker continues monitoring them until termination is reported.
+`kgr cancel JOB_ID` and `kgr agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on Kaggle` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
 ## State and outputs
 
@@ -444,7 +444,7 @@ Back up the database before upgrading. To restore an older application version, 
 
 - Scheduling starts jobs when capacity becomes available. Start times, recurring schedules, and dependency graphs are not implemented.
 - Checkpoint continuation requires downloading a checkpoint and attaching it to a new job.
-- Active remote cancellation requires Kaggle's web interface.
+- Remote cancellation needs the run to have started and to have been submitted by this version of the runner.
 - HTTP and MCP servers are not included.
 - Job completion does not automatically resume an LLM conversation.
 - Custom containers and automatic offline dependency installation are not supported.

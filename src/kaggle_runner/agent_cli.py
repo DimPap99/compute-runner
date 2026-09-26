@@ -57,18 +57,18 @@ def submit(
     dry_run: bool = False,
 ):
     """Submit a script, notebook, project YAML, or jobs: YAML atomically."""
-    from .cli import load_specs, override_specs
+    from .cli import workload_specs
 
-    overrides = dict(
+    specs = workload_specs(
+        source,
         entrypoint=entrypoint,
         module=module,
         gpu=gpu,
         internet=internet,
         accelerator=accelerator,
-        timeout_seconds=timeout,
-        args=arg,
+        timeout=timeout,
+        arg=arg,
     )
-    specs = override_specs(load_specs(source), overrides)
     if dry_run:
         return ctx.obj["client"].agent().preview(specs)
     return ctx.obj["client"].agent().submit(specs, request_key=request_key)
@@ -134,7 +134,7 @@ def retry(ctx: typer.Context, job_id: str, request_key: Annotated[str, typer.Opt
 @agent_app.command("cancel")
 @response
 def cancel(ctx: typer.Context, job_id: str):
-    """Cancel a locally pending job. Active remote execution must be stopped on Kaggle."""
+    """Cancel a pending job locally, or ask Kaggle to stop a running one."""
     return ctx.obj["client"].agent().cancel(job_id)
 
 
