@@ -7,6 +7,7 @@ same flow over SSH when KGR_TEST_SSH names a machine.
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -24,6 +25,7 @@ from compute_runner.bundle import snapshot_bundle
 from compute_runner.cli import app
 from compute_runner.models import SshSettings, input_reference
 from compute_runner.providers import RemoteError
+from compute_runner.providers import ssh_remote
 from compute_runner.providers.ssh import HELPER, SshProvider
 from compute_runner.runtime import __file__ as RUNTIME
 from conftest import FakeProvider, due
@@ -209,18 +211,43 @@ def alive(pid):
         return False
 
 
+STUBBORN = (
+    "import os, subprocess, sys, time\nfrom pathlib import Path\n"
+    "code = 'import signal, time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\ntime.sleep(300)'\n"
+    # Its own session, as a notebook's kernel has: outside the workload's process group.
+    "child = subprocess.Popen([sys.executable, '-c', code], start_new_session=True)\n"
+    "time.sleep(1)  # Let it install its handler.\n"
+    "Path(os.environ['KGR_OUTPUT_DIR'], 'child.pid').write_text(str(child.pid))\n"
+)
+
+
+def child_of(lab, job_id):
+    run = lab.machine.home / ".compute-runner/runs" / lab.client.get(job_id).remote_ref
+    deadline = time.monotonic() + 30
+    while not (run / "working/outputs/child.pid").exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    return int((run / "working/outputs/child.pid").read_text())
+
+
 def test_a_workload_that_ignores_sigterm_is_killed_after_the_grace_period(lab):
     lab.machine.stop_grace_seconds = 1
-    (lab.project / "stubborn.py").write_text(
-        "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('ready', flush=True)\n"
-        "time.sleep(300)\n"
-    )
+    (lab.project / "stubborn.py").write_text(STUBBORN + "time.sleep(300)\n")
     job = lab.client.submit(JobSpec(source=lab.project, entrypoint="stubborn.py", internet=True))
     running(lab.client, job.id)
-    time.sleep(1)  # Let it install its handler.
+    child = child_of(lab, job.id)
     lab.client.cancel(job.id)
     [job] = settle(lab.client, job.id, seconds=30)
-    assert job.state == "cancelled"
+    # Recorded only once every process of the run is gone, even one in a session of its own.
+    assert job.state == "cancelled" and not alive(child)
+
+
+def test_processes_a_finished_workload_leaves_behind_are_stopped(lab):
+    lab.machine.stop_grace_seconds = 1
+    (lab.project / "leaves.py").write_text(STUBBORN + "print('done')\n")
+    job = lab.client.submit(JobSpec(source=lab.project, entrypoint="leaves.py", internet=True))
+    [job] = settle(lab.client, job.id, seconds=30)
+    child = int((job.result_dir / "outputs/child.pid").read_text())
+    assert job.state == "succeeded" and not alive(child)
 
 
 def test_following_a_log_returns_exactly_what_was_written(lab):
@@ -461,12 +488,16 @@ def test_account_add_saves_ssh_settings_and_checks_secret_files(tmp_path, monkey
     password.write_text("secret")
     key.write_text("key")
     password.chmod(0o644)
+    key.chmod(0o644)
     add = ["--json", "account", "add", "ssh", "lab", "--host", "10.0.0.5", "--login", "me"]
     result = runner.invoke(app, [*add, "--password-file", str(password)])
     assert result.exit_code != 0 and "chmod 600" in str(result.exception)
     password.chmod(0o600)
     assert runner.invoke(app, [*add, "--password-file", str(password), "--gpu-limit", "1"]).exit_code == 0
-    # Updating keeps other settings; a key replaces the saved password file.
+    # Updating keeps other settings; a key replaces the saved password file. Keys must be private too.
+    readable = runner.invoke(app, ["--json", "account", "add", "ssh", "lab", "--key", str(key)])
+    assert readable.exit_code != 0 and "chmod 600" in str(readable.exception)
+    key.chmod(0o600)
     assert runner.invoke(app, ["--json", "account", "add", "ssh", "lab", "--key", str(key)]).exit_code == 0
     [account] = Client().config.accounts
     assert account.ssh.host == "10.0.0.5" and account.ssh.key == key and account.ssh.password_file is None
@@ -475,6 +506,8 @@ def test_account_add_saves_ssh_settings_and_checks_secret_files(tmp_path, monkey
     assert both.exit_code != 0 and "not both" in str(both.exception)
     kaggle = runner.invoke(app, ["--json", "account", "add", "kaggle", "someone", "--host", "x"])
     assert kaggle.exit_code != 0 and "SSH accounts only" in str(kaggle.exception)
+    login = runner.invoke(app, ["--json", "account", "add", "kaggle", "someone", "--login", "x"])
+    assert "--login applies to SSH accounts only" in str(login.exception)
     # Refused before anything is saved.
     trusted = runner.invoke(app, ["--json", "account", "add", "kaggle", "someone", "--trust-new-host"])
     assert trusted.exit_code != 0 and [a.id for a in Client().config.accounts] == ["ssh:lab"]
@@ -495,12 +528,170 @@ def test_the_remote_helper_is_the_runtime_plus_commands(tmp_path):
         )
         return result.returncode, result.stdout, result.stderr
 
-    target = tmp_path / "remote/files"
-    target.parent.mkdir()
+    target = tmp_path / "remote/bundles" / bundle["digest"] / "files"
+    target.parent.mkdir(parents=True)
     code, out, _ = call("unpack", archive=str(archive), digest="0" * 64, target=str(target))
     assert code != 0 and not target.exists()
+    # Nothing outside a bundle's own folder is ever unpacked into, or removed.
+    home = tmp_path / "remote/data"
+    home.mkdir()
+    (home / "keep.txt").write_text("mine")
+    code, out, _ = call("unpack", archive=str(archive), digest=bundle["digest"], target=str(home))
+    assert code != 0 and "Not a bundle folder" in _ and (home / "keep.txt").read_text() == "mine"
     code, out, _ = call("unpack", archive=str(archive), digest=bundle["digest"], target=str(target))
     assert json.loads(out) == {"ready": True} and (target / "a.txt").read_text() == "a"
+
+
+def test_a_file_on_the_machine_arrives_as_a_folder_holding_it_as_copies_do(lab):
+    (lab.machine.home / "train.csv").write_text("a\n")
+    (lab.project / "use.py").write_text(
+        "import os\nfrom pathlib import Path\ndata = Path(os.environ['KGR_INPUT_DATA'])\n"
+        "Path(os.environ['KGR_OUTPUT_DIR'], 'seen.txt').write_text((data / 'train.csv').read_text())\n"
+    )
+    inputs = {"data": Path(f"ssh:{lab.machine.home}/train.csv")}
+    [job] = settle(
+        lab.client,
+        lab.client.submit(JobSpec(source=lab.project, entrypoint="use.py", internet=True, inputs=inputs)).id,
+    )
+    assert job.state == "succeeded" and (job.result_dir / "outputs/seen.txt").read_text() == "a\n", job.error
+
+
+def test_links_are_followed_alike_when_attaching_fingerprinting_and_copying(lab):
+    real = lab.machine.home / "real"
+    real.mkdir()
+    (real / "a.csv").write_text("1\n")
+    (real / "gone").symlink_to(lab.machine.home / "deleted")
+    (real / "b.csv").symlink_to(real / "a.csv")
+    (lab.machine.home / "data").symlink_to(real)
+    pinned = lab.machine.resolve_dataset(f"ssh:LAB:{lab.machine.home}/data".removeprefix("ssh:"))
+    assert pinned and pinned.startswith(f"lab:{lab.machine.home}/data#")
+    copy = lab.tmp / "copy"
+    copy.mkdir()
+    lab.machine.fetch_dataset(pinned, copy)
+    assert sorted(os.listdir(copy)) == ["a.csv", "b.csv"] and (copy / "b.csv").read_text() == "1\n"
+    (real / "loop").symlink_to(real)
+    (lab.tmp / "copy2").mkdir()
+    with pytest.raises(ValueError, match="Links to folders"):
+        lab.machine.fetch_dataset(pinned, lab.tmp / "copy2")
+
+
+def test_a_file_that_changes_while_downloaded_does_not_replace_the_saved_one(lab):
+    (lab.project / "w.py").write_text(
+        "import os\nfrom pathlib import Path\nPath(os.environ['KGR_OUTPUT_DIR'], 'm.pt').write_text('new')\n"
+    )
+    job = lab.client.submit(JobSpec(source=lab.project, entrypoint="w.py", internet=True))
+    call = lab.machine._call
+
+    def listed_before_a_change(command, **arguments):
+        found = call(command, **arguments)
+        if command == "files":
+            for item in found["files"]:
+                item["sha256"] = "0" * 64
+        return found
+
+    lab.machine._call = listed_before_a_change
+    lab.client.worker().tick()
+    for _ in range(100):
+        job = lab.client.get(job.id)
+        if job.download_error:
+            break
+        due(lab.client, job.id)
+        lab.client.worker().tick()
+        time.sleep(0.2)
+    assert "changed while it was downloaded" in job.download_error
+    assert not (job.result_dir / "outputs/m.pt").exists()
+    lab.machine._call = call
+    due(lab.client, job.id)
+    lab.client.worker().tick()
+    job = lab.client.get(job.id)
+    assert job.download_state == "complete" and (job.result_dir / "outputs/m.pt").read_text() == "new"
+
+
+class Channel:
+    def __init__(self, code):
+        self.code = code
+
+    def recv_exit_status(self):
+        return self.code
+
+
+class Stream:
+    def __init__(self, code, data=b""):
+        self.channel, self.data = Channel(code), data
+
+    def read(self):
+        return self.data
+
+
+def test_commands_without_an_exit_status_or_with_passing_failures_are_transient(lab, monkeypatch):
+    def exits(code):
+        client = SimpleNamespace(
+            exec_command=lambda command, timeout: (None, Stream(code), Stream(code, b"boom"))
+        )
+        monkeypatch.setattr(SshProvider, "_ssh", lambda self: client)
+        return SshProvider._exec(lab.machine, "true")
+
+    with pytest.raises(RemoteError) as dropped:
+        exits(-1)
+    assert not dropped.value.definitive
+    monkeypatch.undo()
+    for code, definitive in [(ssh_remote.TRANSIENT_EXIT, False), (1, True)]:
+        lab.machine._exec = lambda command, timeout=600, code=code: (code, "", "OSError: disk full")
+        with pytest.raises(RemoteError) as error:
+            lab.machine._call("info")
+        assert error.value.definitive is definitive
+
+
+def test_sftp_failures_of_the_helper_upload_are_remote_errors(lab, monkeypatch):
+    def full(self, path, mode="r"):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(LocalSftp, "open", full)
+    with pytest.raises(RemoteError, match="Uploading the helper"):
+        lab.machine.info()
+
+
+def test_a_supervisor_that_records_its_result_as_status_reads_is_not_a_failure(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    (run / "started").mkdir(parents=True)
+    (run / "state.json").write_text(json.dumps({"state": "running", "pid": 1}))
+
+    def finished_meanwhile(pid):
+        (run / "state.json").write_text(json.dumps({"state": "succeeded", "pid": 1}))
+        return False
+
+    monkeypatch.setattr(ssh_remote, "_alive", finished_meanwhile)
+    assert ssh_remote.status(str(run)) == {"state": "succeeded", "error": None}
+    monkeypatch.setattr(ssh_remote, "_alive", lambda pid: True)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    (run / "state.json").write_text(json.dumps({"state": "running", "pid": 1}))
+    assert ssh_remote.cancel(str(run)) == {"signalled": False}
+
+
+def test_the_password_file_is_checked_again_at_each_login(lab, tmp_path):
+    password = tmp_path / "password"
+    password.write_text("secret")
+    password.chmod(0o644)
+    settings = lab.machine.settings.model_copy(update={"password_file": password})
+    machine = SshProvider(lab.machine.account.model_copy(update={"ssh": settings}), lab.tmp)
+    with pytest.raises(RemoteError, match="chmod 600") as error:
+        machine._connect(None)
+    assert error.value.kind == "auth" and error.value.definitive
+
+
+def test_the_work_directory_is_a_folder_of_its_own_below_home():
+    for bad in ["", ".", "..", "/", "/home/me", "a/../..", "~"]:
+        if bad == "~":
+            continue
+        with pytest.raises(ValueError, match="below the home folder"):
+            SshSettings(host="h", username="u", workdir=bad)
+    assert SshSettings(host="h", username="u", workdir="./jobs/runner/").workdir == "jobs/runner"
+
+
+def test_agent_accounts_tell_an_unlimited_gpu_quota_from_an_unchecked_one(lab):
+    accounts = {a["id"]: a for a in lab.client.agent().accounts()["accounts"]}
+    assert accounts["ssh:lab"]["gpu_quota_limited"] is False
+    assert accounts["kaggle:tester"]["gpu_quota_limited"] is True
 
 
 @pytest.mark.skipif(
@@ -532,4 +723,7 @@ def test_real_ssh_server(tmp_path, monkeypatch):
         assert job.state == "succeeded" and (job.result_dir / "outputs/ok.txt").read_text() == "ok"
     finally:
         machine = client.provider("ssh:real")
-        machine._exec(f"chmod -R u+w {machine.workdir} && rm -rf {machine.workdir}")
+        # Removes only this test's own work directory.
+        assert settings.workdir.startswith(".compute-runner-test-")
+        folder = shlex.quote(machine.workdir)
+        machine._exec(f"chmod -R u+w {folder} && rm -rf {folder}")

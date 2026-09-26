@@ -24,16 +24,30 @@ import zipfile
 from pathlib import Path
 
 if "_unpack" not in globals():  # Imported on its own, as in tests; on the machine it follows runtime.py.
-    from compute_runner.runtime import MANIFEST, _unpack
+    from compute_runner.runtime import MANIFEST, _unpack, file_digest
 
 STOP_GRACE_SECONDS = 20
+# How long start may take between marking a run started and recording its supervisor.
 STARTING_SECONDS = 60
+# Every process a run starts inherits this variable, so the supervisor can find them all.
+MARKER = "KGR_RUN_MARKER"
+# Exit status of a command that failed for a passing reason (see __main__).
+TRANSIENT_EXIT = 3
 
 
-def _write_json(path, value):
+def _write_json(path, value, *, replace=True):
+    """Write path atomically; with replace=False, only if it does not exist yet."""
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value))
-    os.replace(temporary, path)
+    if replace:
+        os.replace(temporary, path)
+        return
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        pass
+    finally:
+        temporary.unlink()
 
 
 def _read_json(path):
@@ -51,6 +65,31 @@ def _alive(pid):
         return False
 
 
+def _members(marker, group):
+    """Live processes of one run: in its process group, or carrying the marker it inherits.
+
+    The marker also finds processes that start a session of their own, such as a notebook's
+    kernel. Zombies are left out, since they hold nothing and may never be reaped, and so are
+    other users' processes, which this user cannot stop.
+    """
+    needle = f"{MARKER}={marker}".encode()
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != os.getuid():
+                continue
+            state, _, pgrp = Path(f"/proc/{entry}/stat").read_text().rsplit(")", 1)[1].split()[:3]
+            if state != "Z" and (
+                int(pgrp) == group or needle in Path(f"/proc/{entry}/environ").read_bytes().split(b"\0")
+            ):
+                found.append(int(entry))
+        except (OSError, ValueError):  # Gone meanwhile.
+            pass
+    return found
+
+
 def _ready(target):
     return target.with_name("ready")
 
@@ -61,6 +100,9 @@ def unpack(archive, digest, target):
     A lock makes a second unpack, such as one retried after a timeout, wait for the first.
     """
     target = Path(target)
+    # Only a bundle's own folder is ever replaced, so a wrong target cannot remove other files.
+    if (target.name, target.parent.name, target.parent.parent.name) != ("files", digest, "bundles"):
+        raise ValueError(f"Not a bundle folder for {digest}: {target}")
     with open(target.with_name("unpack.lock"), "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if _ready(target).is_file():
@@ -104,8 +146,6 @@ def start(run, env):
         os.mkdir(run / "started")
     except FileExistsError:
         return {"started": False}
-    # Counted by runs() before the supervisor announces itself, so a GPU is never given out twice.
-    _write_json(run / "assigned.json", {"gpu": env.get("CUDA_VISIBLE_DEVICES")})
     with open(run / "run.log", "ab") as log:
         process = subprocess.Popen(
             [sys.executable, __file__, "supervise", json.dumps({"run": str(run), "env": env})],
@@ -116,42 +156,48 @@ def start(run, env):
             start_new_session=True,
             close_fds=True,
         )
+    # Recorded now, so status and runs() see the run at once. The supervisor writes the same
+    # record when it starts; this one never replaces what it wrote, even its final state.
+    _write_json(run / "state.json", _running(process.pid, env), replace=False)
     return {"started": True, "pid": process.pid}
+
+
+def _running(pid, env):
+    return {"state": "running", "pid": pid, "started_at": time.time(), "gpu": env.get("CUDA_VISIBLE_DEVICES")}
 
 
 def supervise(run, env):
     """Run the workload with its timeout and record how it ended in state.json.
 
-    A stop, from cancel or the timeout, sends SIGTERM to the workload's process group and
-    SIGKILL after STOP_GRACE_SECONDS. The cancel file is watched too, so a cancel that arrives
-    before the SIGTERM handler exists is not lost.
+    A stop, from cancel or the timeout, sends SIGTERM to every process of the run and SIGKILL
+    after STOP_GRACE_SECONDS; so does a workload that exits and leaves processes behind. The
+    result is recorded only once they are all gone, so a GPU stays counted until it is free.
+    The cancel file is watched too, so a cancel that arrives before the SIGTERM handler exists
+    is not lost.
     """
     run = Path(run)
     settings = json.loads((run / "run.json").read_text())
     state = run / "state.json"
     stop = {"at": None}
     child = None
+    marker = f"{run.name}-{os.getpid()}-{time.time_ns()}"
 
-    def signal_group(sig):
-        try:
-            os.killpg(child.pid, sig)
-        except ProcessLookupError:
-            pass
+    def signal_all(sig):
+        for pid in _members(marker, child.pid):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     def terminate(*_):
         if stop["at"] is None:
             stop["at"] = time.monotonic()
-            if child is not None and child.poll() is None:
-                signal_group(signal.SIGTERM)
+            if child is not None:
+                signal_all(signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    record = {
-        "state": "running",
-        "pid": os.getpid(),
-        "started_at": time.time(),
-        "gpu": env.get("CUDA_VISIBLE_DEVICES"),
-    }
+    record = _running(os.getpid(), env)
     _write_json(state, record)
 
     def cancelled():
@@ -175,19 +221,22 @@ def supervise(run, env):
         else:
             command = [python, "-u", settings["code_file"]]
         if not cancelled():
-            child = subprocess.Popen(command, cwd=run, env={**os.environ, **env}, start_new_session=True)
+            child = subprocess.Popen(
+                command, cwd=run, env={**os.environ, **env, MARKER: marker}, start_new_session=True
+            )
             deadline = time.monotonic() + settings["timeout_seconds"]
             grace = settings.get("stop_grace_seconds", STOP_GRACE_SECONDS)
-            timed_out_at = None
-            while child.poll() is None:
+            stopping = None  # When SIGTERM went to the run's processes.
+            while child.poll() is None or _members(marker, child.pid):
                 now = time.monotonic()
-                if now >= deadline and timed_out_at is None and not cancelled():
-                    outcome["error"] = f"Timed out after {settings['timeout_seconds']} seconds"
-                    timed_out_at = now
-                    signal_group(signal.SIGTERM)
-                stopping = stop["at"] if cancelled() else timed_out_at
-                if stopping is not None and now - stopping >= grace:
-                    signal_group(signal.SIGKILL)
+                if stopping is None:
+                    if child.returncode is None and now >= deadline and not cancelled():
+                        outcome["error"] = f"Timed out after {settings['timeout_seconds']} seconds"
+                    if cancelled() or outcome["error"] or child.returncode is not None:
+                        stopping = stop["at"] or now
+                        signal_all(signal.SIGTERM)
+                elif now - stopping >= grace:
+                    signal_all(signal.SIGKILL)
                 time.sleep(0.5)
             outcome["exit_code"] = child.returncode
         if cancelled():
@@ -213,14 +262,17 @@ def status(run):
         if time.time() - (run / "started").stat().st_mtime > STARTING_SECONDS:
             return {
                 "state": "failed",
-                "error": "The run's supervisor never started (was the machine restarted?)",
+                "error": "The run's supervisor never started (its start was interrupted)",
             }
         return {"state": "queued"}
     if record["state"] == "running" and not _alive(record["pid"]):
-        return {
-            "state": "failed",
-            "error": "The run stopped without recording a result (was the machine restarted?)",
-        }
+        # The supervisor may have recorded its result and exited since the first read.
+        record = _read_json(run / "state.json") or record
+        if record["state"] == "running":
+            return {
+                "state": "failed",
+                "error": "The run stopped without recording a result (was the machine restarted?)",
+            }
     return {"state": record["state"], "error": record.get("error")}
 
 
@@ -230,32 +282,26 @@ def cancel(run):
     (run / "cancel").touch()
     record = _read_json(run / "state.json")
     if record and record["state"] == "running" and _alive(record["pid"]):
-        os.kill(record["pid"], signal.SIGTERM)
-        return {"signalled": True}
+        try:
+            os.kill(record["pid"], signal.SIGTERM)
+            return {"signalled": True}
+        except ProcessLookupError:  # It finished in the meantime.
+            pass
     return {"signalled": False}
 
 
 def runs(root):
     """Attempts that hold resources: {ref: {"resource": cpu|gpu, "gpu": device or None}}.
 
-    A run counts while its supervisor is alive, and while it is starting: started, but its
-    supervisor has not written state.json yet (for at most STARTING_SECONDS).
+    A run counts while its supervisor is alive; start records it before returning.
     """
     found = {}
     for run in Path(root).iterdir() if Path(root).is_dir() else []:
-        if not (run / "started").is_dir():
-            continue
         record = _read_json(run / "state.json")
-        if record is None:
-            if time.time() - (run / "started").stat().st_mtime > STARTING_SECONDS:
-                continue
-            gpu = (_read_json(run / "assigned.json") or {}).get("gpu")
-        elif record["state"] == "running" and _alive(record["pid"]):
-            gpu = record.get("gpu")
-        else:
+        if record is None or record["state"] != "running" or not _alive(record["pid"]):
             continue
         settings = _read_json(run / "run.json") or {}
-        found[run.name] = {"resource": "gpu" if settings.get("gpu") else "cpu", "gpu": gpu}
+        found[run.name] = {"resource": "gpu" if settings.get("gpu") else "cpu", "gpu": record.get("gpu")}
     return found
 
 
@@ -269,15 +315,11 @@ def files(root):
             path = Path(current) / name
             if path.is_symlink() or not path.is_file():
                 continue
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
             found.append(
                 {
                     "name": path.relative_to(root).as_posix(),
                     "bytes": path.stat().st_size,
-                    "sha256": digest.hexdigest(),
+                    "sha256": file_digest(path),
                 }
             )
     return {"files": found}
@@ -286,7 +328,9 @@ def files(root):
 def version(path):
     """Whether path exists, and a fingerprint of its files' names, sizes and modification times.
 
-    Folders on a machine change in place; the fingerprint pins what a copy was made from.
+    Folders on a machine change in place; the fingerprint pins what a copy was made from. Links
+    count as what they point to, as a copy follows them; broken links are left out, as a copy
+    leaves them out.
     """
     if not os.path.exists(path):
         return {"exists": False}
@@ -294,9 +338,11 @@ def version(path):
     entries = [(path, os.stat(path))] if os.path.isfile(path) else []
     for current, dirs, names in os.walk(path):
         dirs.sort()
-        entries += [
-            (os.path.join(current, name), os.stat(os.path.join(current, name))) for name in sorted(names)
-        ]
+        for name in sorted(names):
+            try:
+                entries.append((os.path.join(current, name), os.stat(os.path.join(current, name))))
+            except FileNotFoundError:
+                pass
     for name, found in entries:
         digest.update(f"{os.path.relpath(name, path)}\0{found.st_size}\0{found.st_mtime_ns}\n".encode())
     return {"exists": True, "version": digest.hexdigest()[:16]}
@@ -332,6 +378,12 @@ COMMANDS = {
 }
 
 if __name__ == "__main__":
-    result = COMMANDS[sys.argv[1]](**json.loads(sys.argv[2] if len(sys.argv) > 2 else "{}"))
+    try:
+        result = COMMANDS[sys.argv[1]](**json.loads(sys.argv[2] if len(sys.argv) > 2 else "{}"))
+    except OSError as error:  # Such as a full disk: the command may succeed later. Others are verdicts.
+        if isinstance(error, (FileNotFoundError, PermissionError, NotADirectoryError, IsADirectoryError)):
+            raise
+        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        sys.exit(TRANSIENT_EXIT)
     if sys.argv[1] != "supervise":  # The supervisor's output is the run's log.
         print(json.dumps(result))

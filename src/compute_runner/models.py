@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .security import validate_nonsecret_env
 from .paths import application_dir
@@ -117,6 +117,15 @@ class SshSettings(Model):
     # Where runs, bundles and virtual environments live on the machine; relative to the home folder.
     workdir: str = ".compute-runner"
     python: str = "python3"
+
+    @field_validator("workdir")
+    @classmethod
+    def own_folder(cls, value):
+        # A folder of its own below home, so the runner's files never mix with the user's.
+        parts = PurePosixPath(value).parts
+        if not parts or PurePosixPath(value).is_absolute() or any(part in {".", ".."} for part in parts):
+            raise ValueError("workdir must be a folder below the home folder, such as .compute-runner")
+        return PurePosixPath(value).as_posix()
 
 
 class Account(Model):

@@ -163,7 +163,12 @@ def bootstrap(config):
             inputs[alias] = str(_find_dataset(bundle["dataset"]))
             continue
         if "path" in bundle:  # Data already on this machine, attached where it is.
-            inputs[alias] = os.path.abspath(bundle["path"])
+            location = os.path.abspath(bundle["path"])
+            if os.path.isfile(location):  # A copy of one file arrives as a folder holding it; so does this.
+                folder = Path(tempfile.mkdtemp(prefix="kgr-input-"))
+                (folder / os.path.basename(location)).symlink_to(location)
+                location = str(folder)
+            inputs[alias] = location
             continue
         if "local" in bundle:
             inputs[alias] = str(_local_bundle(bundle["local"], bundle["digest"])[1])

@@ -21,11 +21,14 @@ Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PAT
 | Rerun | `agent retry` | Only when the user wants a rerun |
 | Continue a stopped resumable run | `agent continue` | When the user wants it continued |
 | Stop work | `agent cancel` | Only work the user wants stopped |
-| User decisions | `account add`/`remove`, `init`, `service install`/`stop`/`restart`, `resolve --not-submitted` | Only when the user explicitly asks |
+| User decisions | `init`, `service install`/`stop`/`restart`, `account remove`, `resolve --not-submitted` | Only when the user explicitly asks |
+| Accounts and credentials | `account add`, `--trust-new-host`, key, password and Kaggle credential files | Never. The user sets these up; give them the command to run |
 
-Never read, print, or copy credential files, and never put credentials in workload `env`, `args`, `params`, or source files.
+Use the shell only to run `compute-runner` commands. Never run commands that write, move, copy, rename, or delete files or folders (`cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `ln`, `tee`, redirections such as `>`, `sed -i`, and the like), and never reach providers yourself (`ssh`, `scp`, `rsync`, `sftp`, `kaggle`). Read files with your file-reading tools. Create or edit workload code or YAML only when the user asks for it, with your file-editing tools.
 
-Results are written by the queue, never by you. Do not create, move, copy, rename, or delete anything in a results folder or the state directory, and do not build results paths yourself: every path you need is in a command's response.
+Never read, print, or copy credential files, and never put credentials in workload `env`, `args`, `params`, or source files. Account and credential setup is the user's: when an account is missing or its login fails (an `auth` error, an unknown host key), tell the user what to run, such as `compute-runner account add ssh NAME --host HOST --login USER --key ~/.ssh/KEY --trust-new-host`, and that key, password and credentials files must be `chmod 600`. Never trust a host key or change `known_hosts` for them.
+
+Results are written by the queue, never by you. Do not create, move, copy, rename, or delete anything in a results folder, the state directory, or an SSH machine's work directory, and do not build results paths yourself: every path you need is in a command's response. Never remove a workspace, run folder or dataset, locally or on a machine.
 
 ## Decide resumability
 
@@ -36,11 +39,11 @@ Resumability is an explicit user choice, not a default. For training, optimizati
 - If the user chooses resumable but did not give a checkpoint cadence, ask whether to checkpoint by elapsed minutes or completed epochs and ask for the positive interval. Do not invent a cadence.
 - If the user chooses non-resumable, do not add checkpoint code merely because the job is long.
 
-Do not ask this question for a stateless workload that has no meaningful progress to restore. When resumability is chosen, or when inspecting or migrating an already resumable job, read [references/resumability.md](references/resumability.md) before editing or submitting it. The reusable helper is [assets/checkpointing.py](assets/checkpointing.py); adapt or copy it into the workload source rather than assuming `compute_runner` is installed inside the remote session.
+Do not ask this question for a stateless workload that has no meaningful progress to restore. When resumability is chosen, or when inspecting or migrating an already resumable job, read [references/resumability.md](references/resumability.md) before editing or submitting it. The reusable helper is [assets/checkpointing.py](assets/checkpointing.py); when the user asks for resumable code, adapt its code into the workload source with your file-editing tools rather than assuming `compute_runner` is installed inside the remote session.
 
 ## Accounts
 
-`compute-runner agent accounts` lists the accounts in preference order (the first is the default), the `failover` policy, CPU/GPU slots in use per account, and the last known `gpu_quota_seconds`. It makes no remote calls. Check it before GPU work or when choosing where to run.
+`compute-runner agent accounts` lists the accounts in preference order (the first is the default), the `failover` policy, CPU/GPU slots in use per account, and the last known `gpu_quota_seconds` (`gpu_quota_limited: false` marks SSH machines, which have no GPU time limit; otherwise null means not checked yet). It makes no remote calls. Check it before GPU work or when choosing where to run.
 
 Omit `--account` to use the default. Pass another account to `agent submit` or `agent retry` when the user named or approved it; with `failover: auto` you may also pick one that `agent accounts` shows with free slots.
 
@@ -56,7 +59,7 @@ An account may be unable to read a job's dataset, such as another account's priv
 
 ## Submit
 
-For one file, use `compute-runner agent submit /path/train.py --request-key experiment-v1`, adding `--param NAME=VALUE` for the settings that distinguish this run. For folders or multiple jobs, write a workload YAML; read [references/workloads.md](references/workloads.md) when creating or changing workload definitions. GPU and internet are disabled by default and can be set per job in YAML.
+For one file, use `compute-runner agent submit /path/train.py --request-key experiment-v1`, adding `--param NAME=VALUE` for the settings that distinguish this run. For folders or multiple jobs, write a workload YAML with your file-editing tools; read [references/workloads.md](references/workloads.md) when creating or changing workload definitions. GPU and internet are disabled by default and can be set per job in YAML.
 
 Name each workload after what it does (`cifar10-resnet18`, not `test`), and put its settings in `params`: the name becomes the experiment folder, and the parameters are recorded with each run so the user can tell runs apart. Workloads read their inputs from `KGR_INPUT_<ALIAS>` and write results to `KGR_OUTPUT_DIR`; never hardcode provider paths.
 

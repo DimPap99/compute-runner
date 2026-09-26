@@ -160,6 +160,8 @@ class AgentClient:
                 provider=account.provider,
                 cpu=dict(used=used["cpu"], limit=account.cpu_limit),
                 gpu=dict(used=used["gpu"], limit=account.gpu_limit),
+                # SSH machines have no GPU time limit; null elsewhere means not checked yet.
+                gpu_quota_limited=account.provider != "ssh",
                 gpu_quota_seconds=None if quota is None else round(quota),
                 checked_age_seconds=round(time.time() - checked) if checked else None,
             )

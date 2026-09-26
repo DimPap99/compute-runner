@@ -204,6 +204,11 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
     missing = tmp_path / "missing.json"
     with pytest.raises(ValueError, match="Credentials file not found"):
         run("account", "add", "kaggle", "other", "--credentials", str(missing))
+    readable = tmp_path / "kaggle.json"
+    readable.write_text("{}")
+    readable.chmod(0o644)
+    with pytest.raises(ValueError, match="chmod 600"):
+        run("account", "add", "kaggle", "other", "--credentials", str(readable))
     run("account", "add", "kaggle", "tester")
     assert run("account", "add", "kaggle", "other", "--default")["accounts"] == ["kaggle:other", "kaggle:tester"]
     # Updating an account typed in other casing keeps the ID its jobs refer to.
@@ -368,3 +373,10 @@ def test_downloads_for_a_removed_account_wait_until_it_returns(two_accounts):
     client.config.accounts, other.download_error = accounts, None
     worker.tick()
     assert client.get(job.id).download_state == "complete"
+
+
+def test_cancel_never_touches_a_notebook_the_runner_did_not_launch(tmp_path):
+    provider = KaggleProvider(Account(user="tester"), tmp_path)
+    for ref in ["tester/my-analysis", "someone/kgr-x-a1"]:
+        with pytest.raises(ValueError, match="not a launch notebook"):
+            provider.cancel(ref, "job")

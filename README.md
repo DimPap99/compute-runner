@@ -84,7 +84,7 @@ compute-runner account list
 compute-runner account remove kaggle:bob
 ```
 
-Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone and can hold a `kaggle.json` username and key or a Kaggle access token. Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
+Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone, can hold a `kaggle.json` username and key or a Kaggle access token, and must be readable by you alone (`chmod 600`). Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
 
 SSH machines are accounts too; see [SSH machines](#ssh-machines).
 
@@ -138,9 +138,9 @@ compute-runner account add ssh lab --gpu-limit 2        # the machine has two GP
 compute-runner doctor                                   # Python version, GPUs and runs on each machine
 ```
 
-Without `--key` or `--password-file`, the login uses ssh-agent and the default keys in `~/.ssh`. A password file must be readable by you alone (`chmod 600`). Only the paths of key and password files are saved. The machine's host key must be known: `--trust-new-host` accepts a host that is not in `known_hosts` yet and prints its fingerprint, and a host key that changes later is refused until you remove the old one. `~/.ssh/config` is not read, so give the host, port and login on the account.
+Without `--key` or `--password-file`, the login uses ssh-agent and the default keys in `~/.ssh`. Key and password files must be readable by you alone (`chmod 600`); a password file is checked again at every login. Only the paths of key and password files are saved. The machine's host key must be known: `--trust-new-host` reads the key without logging in, accepts a host that is not in `known_hosts` yet and prints its fingerprint, and a host key that changes later is refused until you remove the old one. Compare the printed fingerprint with the one the machine's administrator gives you (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the machine). Setting up an account, its key and its host key is yours to do; the agent skill leaves it to you. `~/.ssh/config` is not read, so give the host, port and login on the account.
 
-Each job runs as your login, in its own folder under the work directory on the machine (`~/.compute-runner`, or `--workdir`), started by a supervisor that keeps running when the connection or the worker stops. The supervisor enforces `timeout_seconds` and records how the run ended; `cancel` stops the workload's whole process group. Source and input bundles are uploaded once, verified, and kept read-only for later runs. A `requirements` file installs into a virtual environment of that run, which can still use packages installed on the machine. Notebooks run with `nbconvert` from the machine's Python, and the executed notebook is downloaded with the outputs.
+Each job runs as your login, in its own folder under the work directory on the machine (`~/.compute-runner`, or `--workdir`: a folder below your home folder, without `..`), started by a supervisor that keeps running when the connection or the worker stops. The supervisor enforces `timeout_seconds` and records how the run ended. A timeout or `cancel` sends SIGTERM to every process the run started, including ones in a session of their own such as a notebook's kernel, and SIGKILL 20 seconds later; processes a finished workload leaves behind are stopped the same way. The run's end is recorded only once they are all gone, so its GPU is not given to another job while still in use. Source and input bundles are uploaded once, verified, and kept read-only for later runs. A `requirements` file installs into a virtual environment of that run, which can still use packages installed on the machine. Notebooks run with `nbconvert` from the machine's Python, and the executed notebook is downloaded with the outputs.
 
 What differs from Kaggle:
 
@@ -148,10 +148,10 @@ What differs from Kaggle:
 | --- | --- |
 | Network | Cannot be blocked, so SSH jobs must set `internet: true`; jobs without it are refused and never fail over to an SSH machine |
 | GPUs | `gpu: true` only, no accelerator IDs. GPU slots are the account's `--gpu-limit` (0 unless set), each GPU job gets its own device through `CUDA_VISIBLE_DEVICES`, and CPU jobs see no GPU. There is no GPU time quota |
-| Data on the machine | `inputs: {data: "ssh:/data/imagenet"}` attaches a folder already on the machine where it is, without uploading it. Submission records the machine, as `ssh:lab:/data/imagenet`, so the reference keeps meaning that machine: on another account, including another SSH machine with the same path, the folder is used only as a copy (see [Datasets across accounts](#datasets-across-accounts)), which is made again when its files change. A job on a Kaggle account names the machine itself: `ssh:lab:/data/imagenet` |
+| Data on the machine | `inputs: {data: "ssh:/data/imagenet"}` attaches a folder already on the machine where it is, without uploading it. A single file arrives as a folder holding it, as a copy does. Links to files count as the files, broken links are left out, and a folder holding links to folders cannot be copied. Submission records the machine, as `ssh:lab:/data/imagenet`, so the reference keeps meaning that machine: on another account, including another SSH machine with the same path, the folder is used only as a copy (see [Datasets across accounts](#datasets-across-accounts)), which is made again when its files change. A job on a Kaggle account names the machine itself: `ssh:lab:/data/imagenet` |
 | Kaggle datasets | Copied through a connected Kaggle account when copies are allowed |
 | Capacity | `--cpu-limit` and `--gpu-limit` count only this runner's jobs, not other work on the machine |
-| Cleanup | Run folders and bundles stay on the machine. Bundles are read-only; remove the work directory with `chmod -R u+w ~/.compute-runner && rm -rf ~/.compute-runner` |
+| Cleanup | The runner writes only inside its work directory and never deletes run folders, bundles or your data. To reclaim the space, remove the work directory yourself when no jobs use it: bundles are read-only, so `chmod -R u+w ~/.compute-runner && rm -rf ~/.compute-runner` |
 
 ## Workload configuration
 
@@ -370,7 +370,7 @@ compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 
 ### Accounts
 
-`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used` and `limit`), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check, and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
+`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used` and `limit`), `gpu_quota_limited` (false on SSH machines, which have no GPU time limit), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check (null when not checked yet), and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
 
 `agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it.
 
@@ -494,7 +494,7 @@ Agent methods return JSON-compatible dictionaries and raise Python exceptions on
 
 ### Agent skill
 
-The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, which actions need the user's approval, request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
+The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, which actions need the user's approval, the rule that the agent's shell use is limited to `compute-runner` commands (it reads files but never writes, moves, copies or deletes them through the shell, and leaves account and credential setup to you), request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
 
 ```bash
 ln -s ~/compute-runner/skills/compute-runner ~/.claude/skills/compute-runner  # Claude Code

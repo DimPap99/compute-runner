@@ -35,7 +35,7 @@ Prefer this interface unless the workload's framework has an established equival
 
 Use `KGR_OUTPUT_DIR/checkpoints` for new checkpoints. A named workload input called `resume` is exposed as `KGR_INPUT_RESUME`. Do not put checkpoints in the source directory or rely on a process-exit hook: cancellation can occur between hooks, so periodic checkpoints are the recovery mechanism.
 
-For raw training loops, copy and adapt [../assets/checkpointing.py](../assets/checkpointing.py). It provides cadence calculation, atomic numbered checkpoint files, a checksummed `latest.json`, compatibility checks, and `auto`/`required`/`never`/explicit-path discovery. It deliberately accepts serializer callbacks so the training code remains responsible for framework state.
+For raw training loops, adapt the code of [../assets/checkpointing.py](../assets/checkpointing.py) into the workload source with your file-editing tools (never `cp`). It provides cadence calculation, atomic numbered checkpoint files, a checksummed `latest.json`, compatibility checks, and `auto`/`required`/`never`/explicit-path discovery. It deliberately accepts serializer callbacks so the training code remains responsible for framework state.
 
 Use native checkpoint facilities instead when they preserve the required state correctly, such as Hugging Face Trainer or Lightning checkpoints. Keep the same command-line semantics and Kaggle input/output locations where practical.
 

@@ -330,6 +330,8 @@ class KaggleProvider:
             ApiDeleteKernelRequest,
         )
 
+        if not ref.casefold().startswith(f"{self.owner}/kgr-".casefold()):  # Only its own launch notebooks.
+            raise ValueError(f"Refusing to cancel {ref}: not a launch notebook of this runner")
         found = re.search(rf"^KGR workload {job_id} session (\d+)$", self.live_log(ref), re.M)
         if found:
             request = ApiCancelKernelSessionRequest()

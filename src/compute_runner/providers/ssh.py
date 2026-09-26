@@ -7,7 +7,6 @@ bundles, start runs detached from the connection, and report their state. Downlo
 
 from __future__ import annotations
 
-import base64
 import codecs
 import hashlib
 import json
@@ -26,6 +25,7 @@ from ..security import redact_secrets
 from ..store import atomic_json, atomic_write, config_path
 from . import RemoteError
 from .launch import launch_config, write_launcher
+from .ssh_remote import TRANSIENT_EXIT
 
 try:
     import paramiko
@@ -40,8 +40,7 @@ LOG_TAIL_BYTES = 256 * 1024
 COMMAND_SECONDS = 600
 LONG_COMMAND_SECONDS = 6 * 3600
 LONG = {"unpack", "files", "version"}
-STATES = {"queued": "queued", "running": "running", "succeeded": "succeeded", "failed": "failed"}
-STATES["cancelled"] = "cancelled"
+STATES = {"queued", "running", "succeeded", "failed", "cancelled"}
 
 
 def known_hosts_path() -> Path:
@@ -63,10 +62,6 @@ def _location(ref: str) -> tuple[str | None, str]:
 
 def _path(ref: str) -> str:
     return _location(ref)[1]
-
-
-def _fingerprint(key) -> str:
-    return "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
 
 
 class SshProvider:
@@ -92,6 +87,15 @@ class SshProvider:
         host, port = self.settings.host, self.settings.port
         return host if port == 22 else f"[{host}]:{port}"
 
+    def _changed_host_key(self):
+        return RemoteError(
+            f"The host key of {self._host_key_name} does not match the saved one. If the machine "
+            "was reinstalled, remove its old key from known_hosts and trust it again; otherwise "
+            "do not connect",
+            "auth",
+            definitive=True,
+        )
+
     def _connect(self, policy):
         client = paramiko.SSHClient()
         client.load_system_host_keys()
@@ -100,7 +104,19 @@ class SshProvider:
         client.set_missing_host_key_policy(policy)
         password = None
         if self.settings.password_file is not None:
-            password = self.settings.password_file.expanduser().read_text().rstrip("\n")
+            path = self.settings.password_file.expanduser()
+            try:
+                if path.stat().st_mode & 0o077:
+                    raise RemoteError(
+                        f"Password file {path} is readable by other users; run: chmod 600 {path}",
+                        "auth",
+                        definitive=True,
+                    )
+                password = path.read_text().rstrip("\n")
+            except OSError as error:
+                raise RemoteError(
+                    f"Cannot read password file {path}: {error}", "auth", definitive=True
+                ) from error
         key = str(self.settings.key.expanduser()) if self.settings.key else None
         try:
             client.connect(
@@ -116,13 +132,7 @@ class SshProvider:
                 auth_timeout=30,
             )
         except paramiko.BadHostKeyException as error:
-            raise RemoteError(
-                f"The host key of {self._host_key_name} does not match the saved one. If the machine "
-                "was reinstalled, remove its old key from known_hosts and trust it again; otherwise "
-                "do not connect",
-                "auth",
-                definitive=True,
-            ) from error
+            raise self._changed_host_key() from error
         except paramiko.AuthenticationException as error:
             raise RemoteError(
                 f"SSH login to {self.settings.username}@{self._host_key_name} was refused; check the key or "
@@ -180,13 +190,7 @@ class SshProvider:
         except TRANSPORT_ERRORS as error:
             raise RemoteError(f"Cannot read the host key of {self._host_key_name}: {error}") from error
         if saved and saved.get(key.get_name()) != key:
-            raise RemoteError(
-                f"The host key of {self._host_key_name} does not match the saved one. If the machine "
-                "was reinstalled, remove its old key from known_hosts and trust it again; otherwise "
-                "do not connect",
-                "auth",
-                definitive=True,
-            )
+            raise self._changed_host_key()
         if not saved:
             own = paramiko.HostKeys()
             path = known_hosts_path()
@@ -196,7 +200,7 @@ class SshProvider:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             own.save(str(path))
             path.chmod(0o600)
-        return _fingerprint(key)
+        return key.fingerprint
 
     def _exec(self, command, *, timeout=COMMAND_SECONDS):
         try:
@@ -206,6 +210,8 @@ class SshProvider:
             code = stdout.channel.recv_exit_status()
         except (paramiko.SSHException, OSError, EOFError, socket.timeout) as error:
             raise RemoteError(f"SSH command on {self._host_key_name} failed: {error}") from error
+        if code == -1:  # No exit status: the connection dropped, or a signal killed the command.
+            raise RemoteError(f"SSH command on {self._host_key_name} ended without an exit status")
         return code, output, error
 
     def _sftp(self):
@@ -223,6 +229,10 @@ class SshProvider:
             sftp = self._sftp()
             try:
                 home = sftp.normalize(".")
+            except TRANSPORT_ERRORS as error:
+                raise RemoteError(
+                    f"Finding the home folder on {self._host_key_name} failed: {error}"
+                ) from error
             finally:
                 sftp.close()
             self._workdir = posixpath.join(home, self.settings.workdir)
@@ -247,6 +257,8 @@ class SshProvider:
                     sftp.stat(path)
                 except FileNotFoundError:
                     self._put_bytes(sftp, code.encode(), path)
+            except TRANSPORT_ERRORS as error:
+                raise RemoteError(f"Uploading the helper to {self._host_key_name} failed: {error}") from error
             finally:
                 sftp.close()
             self._helper = path
@@ -262,10 +274,13 @@ class SshProvider:
             line, timeout=LONG_COMMAND_SECONDS if command in LONG else COMMAND_SECONDS
         )
         if code != 0:
-            detail = (error.strip().splitlines() or ["no output"])[-1]
-            raise RemoteError(
-                f"{command} on {self._host_key_name} failed: {detail}", "invalid", definitive=True
+            detail = (
+                f"{command} on {self._host_key_name} failed: "
+                + (error.strip().splitlines() or ["no output"])[-1]
             )
+            if code == TRANSIENT_EXIT:
+                raise RemoteError(detail)
+            raise RemoteError(detail, "invalid", definitive=True)
         return json.loads(output.strip().splitlines()[-1])
 
     @staticmethod
@@ -330,7 +345,7 @@ class SshProvider:
         A path on another machine is not readable here, even if the same path exists.
         """
         machine, path = _location(ref)
-        if machine not in (None, self.account.user):
+        if machine is not None and machine.casefold() != self.account.user.casefold():
             return None
         found = self._call("version", path=path)
         return f"{self.account.user}:{path}#{found['version']}" if found["exists"] else None
@@ -346,18 +361,28 @@ class SshProvider:
             sftp.close()
 
     def _get_tree(self, sftp, path, destination):
-        mode = sftp.lstat(path).st_mode
-        if stat.S_ISLNK(mode):
-            raise ValueError(f"Symlinks are not supported: {path}")
-        if stat.S_ISREG(mode):
+        """Copy path as the job on this machine sees it: links to files count as the files.
+
+        Broken links are left out, as the fingerprint leaves them out. Links to folders could
+        loop, so they are refused.
+        """
+        if stat.S_ISREG(sftp.stat(path).st_mode):
             sftp.get(path, str(destination / posixpath.basename(path)))
             return
         for entry in sftp.listdir_attr(path):
             child = posixpath.join(path, entry.filename)
-            if stat.S_ISDIR(entry.st_mode):
+            mode = entry.st_mode
+            if stat.S_ISLNK(mode):
+                try:
+                    mode = sftp.stat(child).st_mode
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(mode):
+                    raise ValueError(f"Links to folders cannot be copied: {child}")
+            if stat.S_ISDIR(mode):
                 (destination / entry.filename).mkdir()
                 self._get_tree(sftp, child, destination / entry.filename)
-            elif stat.S_ISREG(entry.st_mode):
+            elif stat.S_ISREG(mode):
                 sftp.get(child, str(destination / entry.filename))
             else:
                 raise ValueError(f"Only files and folders can be copied: {child}")
@@ -430,10 +455,11 @@ class SshProvider:
         # A package uploaded but never started is no run either.
         if found.get("missing") or found["state"] == "staged":
             raise RemoteError(f"No run {ref} on {self._host_key_name}", "missing", definitive=True)
-        return dict(state=STATES.get(found["state"]), detail=found["state"], error=found.get("error"))
+        state = found["state"] if found["state"] in STATES else None
+        return dict(state=state, detail=found["state"], error=found.get("error"))
 
     def cancel(self, ref, job_id):
-        """Signal the supervisor, which stops the workload's whole process group; polling sees the end."""
+        """Signal the supervisor, which stops every process of the run; polling sees the end."""
         self._call("cancel", run=self._run_dir(ref))
         return False
 
@@ -505,20 +531,24 @@ class SshProvider:
                 target = sink.target(item["name"])
                 if target is None:
                     continue
-                digest = hashlib.sha256()
-
-                def chunks(stream):
-                    while chunk := stream.read(1024 * 1024):
-                        digest.update(chunk)
-                        yield chunk
-
                 with sftp.open(posixpath.join(run, "working", item["name"]), "rb") as stream:
                     stream.prefetch()
-                    atomic_write(target, chunks(stream), check_space=True, expected_bytes=item["bytes"])
-                if digest.hexdigest() != item["sha256"]:
-                    raise RemoteError(f"{item['name']} changed while it was downloaded; retrying later")
+                    atomic_write(
+                        target, _checked(stream, item), check_space=True, expected_bytes=item["bytes"]
+                    )
                 sink.saved(item["name"], target, item["sha256"])
         except TRANSPORT_ERRORS as error:
             raise RemoteError(f"Downloading outputs of {ref} failed: {error}") from error
         finally:
             sftp.close()
+
+
+def _checked(stream, item):
+    """Yield a download; fail before the file is replaced if it differs from what was listed."""
+    digest, size = hashlib.sha256(), 0
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        yield chunk
+    if size != item["bytes"] or digest.hexdigest() != item["sha256"]:
+        raise RemoteError(f"{item['name']} changed while it was downloaded; retrying later")

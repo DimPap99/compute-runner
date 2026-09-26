@@ -199,7 +199,7 @@ def account_add(
     """Add or update an account. Only the paths of credential, key and password files are saved."""
     if trust_new_host and provider != "ssh":
         raise ValueError("--trust-new-host applies to SSH accounts only")
-    credentials = _secret_file(credentials, "Credentials file")
+    credentials = _secret_file(credentials, "Credentials file", private=True)
     accounts = _client(ctx).config.accounts
     key_id = f"{provider}:{user}".casefold()
     index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key_id), len(accounts))
@@ -209,14 +209,15 @@ def account_add(
         host=host,
         port=port,
         username=login,
-        key=_secret_file(key, "Key file"),
+        key=_secret_file(key, "Key file", private=True),
         password_file=_secret_file(password_file, "Password file", private=True),
         workdir=workdir,
         python=python,
     )
     ssh = {name: value for name, value in ssh.items() if value is not None}
     if ssh and provider != "ssh":
-        raise ValueError(f"--{next(iter(ssh)).replace('_', '-')} applies to SSH accounts only")
+        flag = {"username": "login"}.get(name := next(iter(ssh)), name).replace("_", "-")
+        raise ValueError(f"--{flag} applies to SSH accounts only")
     if provider == "ssh":
         if key is not None and password_file is not None:
             raise ValueError("Choose --key or --password-file, not both")
