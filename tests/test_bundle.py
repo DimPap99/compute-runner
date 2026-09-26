@@ -8,9 +8,8 @@ import pytest
 
 from compute_runner import JobSpec
 from compute_runner.bundle import describe, inventory, snapshot, snapshot_bundle
-from compute_runner.launcher import prepare_kernel
-from compute_runner.models import Attempt
 from compute_runner.runtime import _find_bundle, _unpack
+from conftest import staged_launcher
 
 
 def test_snapshot_is_immutable_and_reused(setup):
@@ -120,14 +119,12 @@ def test_notebook_outputs_cleared_without_editing_original(tmp_path):
 
 
 def test_script_launcher_executes_locally(setup, tmp_path):
-    client, _, spec = setup
+    client, backend, spec = setup
     spec.source.write_text(
         'import os\nfrom pathlib import Path\nPath(os.environ["KGR_OUTPUT_DIR"], "result.txt").write_text("ok")\n'
     )
     job = client.submit(spec)
-    job.attempts = [Attempt(number=1, ref="tester/kgr-test")]
-    folder = prepare_kernel(job, client.config.state_dir)
-    script = folder / "workload.py"
+    script = staged_launcher(backend, job)
     script.write_text(script.read_text().replace("/kaggle/working", str(tmp_path / "working")))
     result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -153,14 +150,12 @@ Path(os.environ['KGR_OUTPUT_DIR'], 'result.txt').write_text(str(VALUE))
     data.mkdir()
     (data / "data.txt").write_text("input")
     job = client.submit(JobSpec(source=project, module="pkg.main", inputs={"data": data}))
-    job.attempts = [Attempt(number=1, ref="tester/kgr-project")]
     job.upload_refs["source"] = backend.ensure_bundle(job.snapshot["source"])
     job.upload_refs["input:data"] = backend.ensure_bundle(job.snapshot["inputs"]["data"])
     for key, bundle in [("source", job.snapshot["source"]), ("input:data", job.snapshot["inputs"]["data"])]:
         mount = tmp_path / "input" / job.upload_refs[key].split("/")[1]
         shutil.copytree(client.config.state_dir / "bundles" / bundle["digest"] / "files", mount)
-    folder = prepare_kernel(job, client.config.state_dir)
-    script = folder / "workload.py"
+    script = staged_launcher(backend, job)
     script.write_text(
         script.read_text()
         .replace("/kaggle/working", str(tmp_path / "working"))

@@ -50,6 +50,9 @@ def submit(
     timeout: int | None = None,
     arg: Annotated[list[str] | None, typer.Option("--arg")] = None,
     dry_run: bool = False,
+    account: Annotated[
+        str | None, typer.Option(help="Account ID from agent accounts; default: the first account")
+    ] = None,
 ):
     """Submit a script, notebook, project YAML, or jobs: YAML atomically."""
     from .cli import workload_specs
@@ -66,7 +69,7 @@ def submit(
     )
     if dry_run:
         return ctx.obj["client"].agent().preview(specs)
-    return ctx.obj["client"].agent().submit(specs, request_key=request_key)
+    return ctx.obj["client"].agent().submit(specs, request_key=request_key, account=account)
 
 
 @agent_app.command("status")
@@ -121,20 +124,45 @@ def outputs(ctx: typer.Context, job_id: str, limit: int = 100, offset: int = 0):
 
 @agent_app.command("retry")
 @response
-def retry(ctx: typer.Context, job_id: str, request_key: Annotated[str, typer.Option()]):
+def retry(
+    ctx: typer.Context,
+    job_id: str,
+    request_key: Annotated[str, typer.Option()],
+    account: Annotated[str | None, typer.Option(help="Account ID; default: the job's account")] = None,
+):
     """Explicitly rerun saved code with a new request key, safe to replay."""
-    return ctx.obj["client"].agent().retry(job_id, request_key=request_key)
+    return ctx.obj["client"].agent().retry(job_id, request_key=request_key, account=account)
+
+
+@agent_app.command("accounts")
+@response
+def accounts(ctx: typer.Context):
+    """Accounts in preference order, failover policy, slots in use and last known GPU quota; local only."""
+    return ctx.obj["client"].agent().accounts()
+
+
+@agent_app.command("move")
+@response
+def move(
+    ctx: typer.Context,
+    account: Annotated[str, typer.Option(help="Target account ID from agent accounts")],
+    job_ids: Annotated[list[str] | None, typer.Argument()] = None,
+    batch: str | None = None,
+    limit: int = 20,
+):
+    """Move jobs that have not been submitted to another account; submitted ones stay."""
+    return ctx.obj["client"].agent().move(job_ids, batch_id=batch, account=account, limit=limit)
 
 
 @agent_app.command("cancel")
 @response
 def cancel(ctx: typer.Context, job_id: str):
-    """Cancel a pending job locally, or ask Kaggle to stop a running one."""
+    """Cancel a pending job locally, or ask its provider to stop a running one."""
     return ctx.obj["client"].agent().cancel(job_id)
 
 
 @agent_app.command("health")
 @response
 def health(ctx: typer.Context):
-    """Read worker lock and heartbeat without contacting Kaggle."""
+    """Read worker lock and heartbeat without remote calls."""
     return {"schema_version": 1, "worker": ctx.obj["client"].agent().health()}

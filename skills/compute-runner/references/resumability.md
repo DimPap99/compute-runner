@@ -179,7 +179,7 @@ Before submitting the continuation:
 2. Wait until partial output downloads settle and `outputs_ready` is true.
 3. Locate `latest.json`, verify its SHA-256 target, and load the checkpoint without starting training.
 4. Confirm that saved progress and compatibility metadata match the intended workload.
-5. Submit the continuation with `--resume required`, the downloaded checkpoint directory as input alias `resume`, and a new request key.
+5. Submit the continuation with `--resume required`, the downloaded checkpoint directory as input alias `resume`, and a new request key. To continue on another account, for example when the first account's GPU quota is exhausted, add `--account ID` after the user chooses it (see `compute-runner agent accounts`).
 6. Inspect the initial log for `RESUMED_FROM` at the expected epoch or step.
 
 If there is no valid checkpoint, tell the user what progress is recoverable. Do not label a restart from initial weights as a resume.

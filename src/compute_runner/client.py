@@ -8,40 +8,38 @@ import time
 import uuid
 from pathlib import Path
 
-from .backend import KaggleBackend
 from .bundle import describe, snapshot
 from .models import BatchRecord, Config, JobRecord, JobSpec
+from .providers import Provider, connect
 from .runtime import json_digest
 from .store import Store, load_config, try_lock
-from .worker import Worker, collect_outputs, outstanding, settled
+from .worker import MOVABLE, Worker, collect_outputs, outstanding, place, settled
 
 
 class Client:
-    def __init__(self, *, config: Config | None = None, state_dir=None, backend=None):
+    def __init__(self, *, config: Config | None = None, state_dir=None, providers=None):
+        """providers optionally supplies ready Provider instances by account ID."""
         self.config = (config or load_config()).model_copy(deep=True)
         if state_dir is not None:
             self.config.state_dir = Path(state_dir).expanduser().resolve()
         self.store = Store(self.config.state_dir)
-        self._backend = backend
-        if self.config.owner:
-            with self.store.connection() as db:
-                db.execute("BEGIN IMMEDIATE")
-                owner = db.execute("SELECT value FROM meta WHERE key='owner'").fetchone()
-                if owner and owner[0] != self.config.owner:
-                    raise ValueError("This state directory belongs to another Kaggle account")
-                db.execute("INSERT OR IGNORE INTO meta VALUES ('owner', ?)", (self.config.owner,))
+        self._providers: dict[str, Provider] = dict(providers or {})
 
-    @property
-    def backend(self):
-        if self._backend is None:
-            self._backend = KaggleBackend(self.config.owner, self.config.state_dir, strict=self.config.strict)
-        return self._backend
+    def provider(self, account: str | None = None) -> Provider:
+        """The adapter for a configured account, or the default one; connecting does not authenticate."""
+        account = self.config.account(account)
+        if account.id not in self._providers:
+            # Concurrent first uses (worker and download threads) share one instance.
+            self._providers.setdefault(account.id, connect(account, self.config))
+        return self._providers[account.id]
 
     def preview(self, spec: JobSpec):
         return describe(spec)
 
-    def submit(self, spec: JobSpec, *, request_key: str | None = None) -> JobRecord:
-        return self.submit_batch([spec], request_key=request_key).jobs[0]
+    def submit(
+        self, spec: JobSpec, *, request_key: str | None = None, account: str | None = None
+    ) -> JobRecord:
+        return self.submit_batch([spec], request_key=request_key, account=account).jobs[0]
 
     @staticmethod
     def check_batch_size(specs):
@@ -49,7 +47,7 @@ class Client:
             raise ValueError("A batch must contain between 1 and 1000 jobs")
 
     @staticmethod
-    def _fingerprint(value, request_key):
+    def _fingerprint(value, request_key, account=None):
         if request_key is not None and (
             not isinstance(request_key, str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", request_key)
@@ -57,16 +55,19 @@ class Client:
             raise ValueError(
                 "Request key must be 1–128 letters, digits, dots, underscores, colons, slashes or hyphens"
             )
-        return json_digest(value)
+        # An explicit account is part of the intent; requests without one keep their original fingerprint.
+        return json_digest(value if account is None else value | {"account": account})
 
-    def submit_batch(self, specs: list[JobSpec], *, request_key: str | None = None) -> BatchRecord:
+    def submit_batch(
+        self, specs: list[JobSpec], *, request_key: str | None = None, account: str | None = None
+    ) -> BatchRecord:
         """Atomically queue a batch; a repeated key returns its original immutable snapshots.
 
         Keys identify intent, not current file contents. New code needs a new key.
         A conflicting specification is rejected, even after the original batch finishes.
+        Jobs are placed on account, or on the first configured account.
         """
-        if not self.config.owner:
-            raise ValueError("Configure your account first: compute-runner init --owner YOUR_USERNAME")
+        target = self.config.account(account).id
         self.check_batch_size(specs)
         normalized = []
         for spec in specs:
@@ -75,31 +76,35 @@ class Client:
             spec.inputs = {alias: path.expanduser().absolute() for alias, path in spec.inputs.items()}
             normalized.append(spec)
         fingerprint = self._fingerprint(
-            {"submit": [spec.model_dump(mode="json") for spec in normalized]}, request_key
+            {"submit": [spec.model_dump(mode="json") for spec in normalized]}, request_key, account and target
         )
         previous = self.store.request(request_key, fingerprint)
         if previous is not None:
             return previous
+        for spec in normalized:
+            self.provider(target).check(spec)
         # Snapshot everything before exposing any job to the worker.
-        jobs = [self._new_job(spec, snapshot(spec, self.config.state_dir)) for spec in normalized]
+        jobs = [self._new_job(spec, snapshot(spec, self.config.state_dir), target) for spec in normalized]
         batch = BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=jobs)
         return self.store.add_batch(batch, request_key=request_key, fingerprint=fingerprint)
 
-    def _new_job(self, spec, saved, parent_id=None):
+    def _new_job(self, spec, saved, account, parent_id=None):
         job_id = uuid.uuid4().hex
         return JobRecord(
             id=job_id,
             spec=spec,
             snapshot=saved,
-            owner=self.config.owner,
+            account=account,
             result_dir=self.config.state_dir / "results" / job_id,
             download_state="pending" if spec.auto_download else "disabled",
             parent_id=parent_id,
         )
 
-    def submit_many(self, specs: list[JobSpec], *, request_key: str | None = None) -> list[JobRecord]:
+    def submit_many(
+        self, specs: list[JobSpec], *, request_key: str | None = None, account: str | None = None
+    ) -> list[JobRecord]:
         """Queue atomically and return jobs in input order."""
-        return self.submit_batch(specs, request_key=request_key).jobs
+        return self.submit_batch(specs, request_key=request_key, account=account).jobs
 
     def batch(self, batch_id: str) -> BatchRecord:
         return self.store.batch(batch_id)
@@ -117,7 +122,7 @@ class Client:
         return self.store.list(states)
 
     def cancel(self, job_id):
-        """Cancel pending work locally, or ask Kaggle to stop an accepted run.
+        """Cancel pending work locally, or ask the provider to stop an accepted run.
 
         The worker records a remote cancellation when it next polls the run.
         """
@@ -125,10 +130,13 @@ class Client:
         if job.terminal:
             raise ValueError(f"The job has already finished ({job.state})")
         if outstanding(job):
-            if job.attempts[-1].state != "accepted":
-                raise ValueError(f"The submission is unconfirmed; inspect it on Kaggle first: {job.url}")
-            self.backend.cancel(job.remote_ref, job.id)
-            return self.store.update(job_id, wait_reason="Cancellation requested on Kaggle", next_action_at=0)
+            attempt = job.attempts[-1]
+            if attempt.state != "accepted":
+                raise ValueError(f"The submission is unconfirmed; inspect it first: {job.url}")
+            self.provider(attempt.account).cancel(attempt.ref, job.id)
+            return self.store.update(
+                job_id, wait_reason=f"Cancellation requested on {attempt.account}", next_action_at=0
+            )
         updated = self.store.update(
             job_id,
             expected={"queued", "preparing", "blocked"},
@@ -141,30 +149,44 @@ class Client:
             raise ValueError("Job changed state during cancellation; inspect its current status")
         return updated
 
-    def retry(self, job_id, *, request_key: str | None = None):
-        return self.retry_batch(job_id, request_key=request_key).jobs[0]
+    def retry(self, job_id, *, request_key: str | None = None, account: str | None = None):
+        return self.retry_batch(job_id, request_key=request_key, account=account).jobs[0]
 
-    def retry_batch(self, job_id, *, request_key: str | None = None):
-        fingerprint = self._fingerprint({"retry": job_id}, request_key)
+    def retry_batch(self, job_id, *, request_key: str | None = None, account: str | None = None):
+        """Rerun a job's saved snapshot, on its account unless another is given."""
+        explicit = account and self.config.account(account).id
+        fingerprint = self._fingerprint({"retry": job_id}, request_key, explicit)
         previous = self.store.request(request_key, fingerprint)
         if previous is not None:
             return previous
         job = self.get(job_id)
         if outstanding(job):
-            raise ValueError(
-                f"An execution may still exist; resolve it on Kaggle before rerunning: {job.url}"
-            )
+            raise ValueError(f"An execution may still exist; resolve it before rerunning: {job.url}")
         if not job.terminal and job.state != "blocked":
             raise ValueError("Retry accepts a terminal or blocked job only")
         for bundle in [job.snapshot["source"], *job.snapshot["inputs"].values()]:
             if not (self.config.state_dir / "bundles" / bundle["digest"] / "payload.zip").is_file():
                 raise ValueError("Saved bundle is missing; submit a new workload")
-        new = self._new_job(job.spec.model_copy(deep=True), job.snapshot, parent_id=job.id)
+        target = explicit or self.config.account(job.account).id
+        self.provider(target).check(job.spec)
+        new = self._new_job(job.spec.model_copy(deep=True), job.snapshot, target, parent_id=job.id)
         return self.store.add_batch(
             BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=[new]),
             request_key=request_key,
             fingerprint=fingerprint,
         )
+
+    def move(self, job_id, account: str) -> JobRecord:
+        """Place a job that has not been submitted on another configured account."""
+        job = self.get(job_id)
+        target = self.config.account(account).id
+        if job.state not in MOVABLE:
+            raise ValueError(f"Only jobs that have not been submitted can move; this one is {job.state}")
+        self.provider(target).check(job.spec)
+        moved = place(self.store, job_id, target, f"Moved from {job.account} on request")
+        if moved is None:
+            raise ValueError("Job changed state while moving; inspect its current status")
+        return moved
 
     def resolve_not_submitted(self, job_id):
         """Operator assertion after independently confirming no remote execution exists.
@@ -216,21 +238,25 @@ class Client:
         """Persisted logs of a finished run, a bounded snapshot of an unfinished one, or a stream."""
         job = self.get(job_id)
         if not job.remote_ref:
-            raise ValueError("This job has not been submitted to Kaggle yet")
+            raise ValueError("This job has not been submitted yet")
+        provider = self.provider(job.attempts[-1].account)
         if not follow and not job.terminal:
-            # Kaggle persists logs only after a session ends.
-            yield self.backend.live_log(job.remote_ref)
+            # Providers may persist logs only after a run ends.
+            yield provider.live_log(job.remote_ref)
             return
-        yield from self.backend.logs(job.remote_ref, follow=follow)
+        yield from provider.logs(job.remote_ref, follow=follow)
 
     def download(self, job_id):
-        return collect_outputs(self.store, self.backend, job_id)
+        return collect_outputs(self.store, self.provider, job_id)
 
-    def quota(self):
-        return self.backend.quota()
+    def quota(self, account: str | None = None):
+        """One account's quota, or every account's by ID."""
+        if account is not None:
+            return self.provider(account).quota()
+        return {item.id: self.provider(item.id).quota() for item in self.config.accounts}
 
     def worker(self):
-        return Worker(self.config, self.backend, self.store)
+        return Worker(self.config, self.provider, self.store)
 
     def worker_health(self):
         path = self.config.state_dir / "worker.json"

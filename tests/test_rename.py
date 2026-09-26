@@ -72,7 +72,7 @@ def test_cli_config_directory_overrides_environment(isolated_paths, monkeypatch)
     root = isolated_paths
     monkeypatch.setenv("COMPUTE_RUNNER_CONFIG_DIR", str(root / "from-environment"))
     result = CliRunner().invoke(
-        app, ["--config-dir", str(root / "from-cli"), "init", "--owner", "tester"]
+        app, ["--config-dir", str(root / "from-cli"), "account", "add", "kaggle", "tester"]
     )
     assert result.exit_code == 0, result.output
     assert (root / "from-cli/config.json").is_file()

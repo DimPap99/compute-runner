@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
 from typing import get_args
 
-from .backend import safe_message
-from .models import JobState
+from .models import ACTIVE, JobState
+from .providers import safe_message
 from .store import atomic_write
+from .worker import MOVABLE, occupancy
 
 
 def short(value, limit=400):
@@ -24,6 +26,7 @@ def summary(job):
         id=job.id,
         name=short(job.spec.name, 100),
         state=job.state,
+        account=job.account,
         resource=short(job.spec.accelerator, 100) or ("gpu" if job.spec.gpu else "cpu"),
         internet=job.spec.internet,
         downloads=job.download_state,
@@ -31,6 +34,7 @@ def summary(job):
     )
     for key, item in {
         "reason": short(job.wait_reason),
+        "suggested_account": job.suggested_account,
         "error": short(job.error),
         "download_error": short(job.download_error),
         "url": job.url,
@@ -119,11 +123,46 @@ class AgentClient:
             worker=self.health(),
         )
 
-    def submit(self, specs, *, request_key):
+    def accounts(self):
+        """Configured accounts in preference order, with slots in use and the worker's last remote check.
+
+        Local only: counts combine this queue's runs with other runs the worker last discovered.
+        """
+        config = self.client.config
+        try:
+            seen = json.loads((config.state_dir / "accounts.json").read_text())
+        except (OSError, ValueError):
+            seen = {}
+        jobs = self.client.store.list(ACTIVE)
+        accounts = []
+        for account in config.accounts:
+            found = seen.get(account.id, {})
+            used = occupancy(jobs, account.id, found.get("runs", {}))
+            checked, quota = found.get("checked_at"), found.get("gpu_seconds")
+            value = dict(
+                id=account.id,
+                provider=account.provider,
+                cpu=dict(used=used["cpu"], limit=account.cpu_limit),
+                gpu=dict(used=used["gpu"], limit=account.gpu_limit),
+                gpu_quota_seconds=None if quota is None else round(quota),
+                checked_age_seconds=round(time.time() - checked) if checked else None,
+            )
+            if found.get("error"):
+                value["error"] = short(found["error"])
+            accounts.append(value)
+        return dict(
+            schema_version=1,
+            failover=config.failover,
+            default=accounts[0]["id"] if accounts else None,
+            accounts=accounts,
+            worker=self.health(),
+        )
+
+    def submit(self, specs, *, request_key, account=None):
         """One key per logical request. Reuse it only to replay that exact submission."""
         if request_key is None:
             raise ValueError("request_key is required for agent submissions")
-        return self._batch_status(self.client.submit_batch(specs, request_key=request_key))
+        return self._batch_status(self.client.submit_batch(specs, request_key=request_key, account=account))
 
     def preview(self, specs):
         """Small upload inventory; no snapshots, queue writes, or remote calls."""
@@ -140,11 +179,34 @@ class AgentClient:
             private=True,
         )
 
-    def retry(self, job_id, *, request_key):
+    def retry(self, job_id, *, request_key, account=None):
         if request_key is None:
             raise ValueError("request_key is required for agent retries")
         job_id = self.client.store.resolve_id(job_id)
-        return self._batch_status(self.client.retry_batch(job_id, request_key=request_key))
+        return self._batch_status(self.client.retry_batch(job_id, request_key=request_key, account=account))
+
+    def move(self, job_ids=None, *, batch_id=None, account, limit=20):
+        """Move the selected jobs that have not been submitted to another account.
+
+        Submitted and finished jobs stay where they are; not_moved lists jobs the account rejected.
+        """
+        _page_bounds(limit)
+        if (job_ids is None) == (batch_id is None):
+            raise ValueError("Select either job IDs or a batch")
+        job_ids = self._job_ids(job_ids)
+        target = self.client.config.account(account).id
+        _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
+        moved, rejected = 0, []
+        for job in jobs:
+            if job.state not in MOVABLE:
+                continue
+            try:
+                self.client.move(job.id, target)
+                moved += 1
+            except ValueError as error:
+                rejected.append({"id": job.id, "error": short(error)})
+        value = self.status(job_ids, batch_id=batch_id, limit=limit) | {"moved": moved}
+        return value | {"not_moved": rejected} if rejected else value
 
     def cancel(self, job_id):
         job_id = self.client.store.resolve_id(job_id)
@@ -243,7 +305,8 @@ class AgentClient:
     def outputs(self, job_id, *, limit=100, offset=0):
         """List downloaded output files, relative to root, without reading them.
 
-        Remote names are relative to /kaggle/working, so KGR_OUTPUT_DIR files appear as outputs/NAME.
+        Remote names are relative to the run's working directory, so KGR_OUTPUT_DIR files appear as
+        outputs/NAME.
         """
         _page_bounds(limit, offset)
         job = self.client.get(self.client.store.resolve_id(job_id))

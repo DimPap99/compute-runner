@@ -1,112 +1,42 @@
-"""Version-isolated Kaggle adapter with explicit, operation-aware failures."""
+"""Kaggle adapter: private notebooks and datasets, one instance per account."""
 
 from __future__ import annotations
 
+import base64
 import contextvars
-import fnmatch
-import hashlib
-import ipaddress
 import json
 import os
 import re
-import socket
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
+import nbformat
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 
-from .runtime import file_digest, safe_relative
-from .security import redact_secrets
-from .store import atomic_json, atomic_write
-
-
-class RemoteError(RuntimeError):
-    def __init__(self, message, kind="transient", *, definitive=False):
-        super().__init__(message)
-        self.kind = kind
-        self.definitive = definitive
-
-
-def classify(message):
-    lower = message.lower()
-    if "session" in lower and any(word in lower for word in ("maximum", "limit", "cap reached")):
-        return "capacity"
-    if any(word in lower for word in ("quota", "accelerator time", "gpu hours")):
-        return "quota"
-    if any(word in lower for word in ("storage", "disk space", "dataset limit")):
-        return "storage"
-    return "invalid"
-
-
-def http_code(error):
-    response = getattr(error, "response", None)
-    if response is None:
-        return None
-    code = response.status_code
-    try:
-        body_code = response.json().get("code", 0)
-        if isinstance(body_code, int) and body_code >= 400:
-            code = body_code
-    except (ValueError, AttributeError):
-        pass
-    return code
-
-
-def safe_message(error):
-    # Signed download URLs and bearer credentials must not enter state or logs.
-    text = str(error)
-    try:
-        detail = error.errors(include_input=False, include_url=False)[0]
-        text = f"Invalid {'.'.join(map(str, detail['loc']))}: {detail['msg']}"
-    except (AttributeError, IndexError, KeyError, TypeError):
-        pass
-    response = getattr(error, "response", None)
-    if response is not None:
-        try:
-            body = response.json()
-            detail = body.get("message") or body.get("error")
-            if isinstance(detail, str):
-                text = f"HTTP {http_code(error)}: {detail}"
-        except (ValueError, AttributeError):
-            pass
-    return redact_secrets(text, strict=True)[:2000]
-
-
-def remote_error(error, *, mutation=False):
-    if isinstance(error, RemoteError):
-        return error
-    message, code = safe_message(error), http_code(error)
-    if not code or not 400 <= code < 500 or code == 408:
-        return RemoteError(message, "uncertain" if mutation else "transient")
-    # Resource limits win over the status code: a 403 quota error is retryable, not an auth failure.
-    kind = classify(message)
-    if kind not in {"capacity", "quota", "storage"}:
-        kind = {401: "auth", 403: "auth", 404: "missing", 429: "rate_limit"}.get(code, kind)
-    return RemoteError(message, kind, definitive=True)
-
-
-def paginate(fetch):
-    """Yield fetch(token) pages until the service returns no next token."""
-    token, seen = None, set()
-    while True:
-        page = fetch(token)
-        yield page
-        token = page.next_page_token
-        if not token:
-            return
-        if token in seen:
-            raise RemoteError("Repeated pagination token")
-        seen.add(token)
-
+from .. import runtime
+from ..models import Account, JobRecord, JobSpec
+from ..security import redact_secrets, redacted_env_record
+from ..store import atomic_json
+from . import RemoteError, classify, http_code, paginate, remote_error
+from .downloads import download_outputs
 
 # Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
 ACTIVE_HORIZON = timedelta(hours=24)
-# Remote session states that still occupy an execution slot.
-RUNNING_STATES = {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
+MAX_SECONDS = 43200
+STATES = {
+    "QUEUED": "queued",
+    "RUNNING": "running",
+    "CANCEL_REQUESTED": "cancelling",
+    "COMPLETE": "succeeded",
+    "ERROR": "failed",
+    "CANCEL_ACKNOWLEDGED": "cancelled",
+}
+# Remote states that still occupy an execution slot.
+RUNNING = {"queued", "running", "cancelling"}
 
 
 def _utc(value):
@@ -124,9 +54,63 @@ class TimeoutAdapter(HTTPAdapter):
         return super().send(request, **kwargs)
 
 
-class KaggleBackend:
-    def __init__(self, owner: str, state_dir: Path, *, strict=False):
-        self.owner = owner
+def _api_class(credentials: Path | None):
+    # Kaggle's package authenticates eagerly on import. Keep it out of public model/API imports.
+    from kaggle.api.kaggle_api_extended import AuthMethod, KaggleApi
+
+    class BoundedApi(KaggleApi):
+        def build_kaggle_client(self):
+            client = super().build_kaggle_client()
+            session = client._http_client
+            session._init_session()
+            session._session.mount("https://", TimeoutAdapter(max_retries=0))
+            # The SDK transport prefers any ambient access token to the credentials it was given.
+            # Pin it to those authenticate() resolved, which the provider checks against its account.
+            values = self.config_values
+            if values.get(self.CONFIG_NAME_TOKEN):
+                session._session.auth = session.BearerAuth(values[self.CONFIG_NAME_TOKEN])
+            elif values.get(self.CONFIG_NAME_USER) and values.get(self.CONFIG_NAME_KEY):
+                session._session.auth = (values[self.CONFIG_NAME_USER], values[self.CONFIG_NAME_KEY])
+            return client
+
+        def _load_config(self):
+            if credentials is None:
+                return super()._load_config()
+            # An explicit file is authoritative: KAGGLE_* variables and ~/.kaggle belong to another account.
+            text = credentials.read_text().strip()
+            try:
+                values = json.loads(text)
+            except ValueError:
+                values = None
+            if isinstance(values, dict):
+                self.config_values = {key: str(values[key]) for key in ("username", "key") if key in values}
+                self._file_token = None
+            else:
+                self.config_values, self._file_token = {}, text
+
+        def _authenticate_with_access_token(self):
+            if credentials is None:
+                return super()._authenticate_with_access_token()
+            username = self._file_token and self._introspect_token(self._file_token)
+            if not username:
+                return False
+            self.config_values = self.config_values | {
+                self.CONFIG_NAME_TOKEN: self._file_token,
+                self.CONFIG_NAME_USER: username,
+                self.CONFIG_NAME_AUTH_METHOD: str(AuthMethod.ACCESS_TOKEN),
+            }
+            return True
+
+        def _authenticate_with_oauth_creds(self):
+            return credentials is None and super()._authenticate_with_oauth_creds()
+
+    return BoundedApi
+
+
+class KaggleProvider:
+    def __init__(self, account: Account, state_dir: Path, *, strict=False):
+        self.account = account
+        self.owner = account.user
         self.state_dir = state_dir
         self.strict = strict
         self._api = None
@@ -135,26 +119,55 @@ class KaggleBackend:
     @property
     def api(self):
         if self._api is None:
-            # Kaggle's package has eager authentication. Keep the import out of public model/API imports.
             try:
-                from kaggle.api.kaggle_api_extended import KaggleApi
-
-                class BoundedApi(KaggleApi):
-                    def build_kaggle_client(self):
-                        client = super().build_kaggle_client()
-                        session = client._http_client
-                        session._init_session()
-                        session._session.mount("https://", TimeoutAdapter(max_retries=0))
-                        return client
-
-                self._api = BoundedApi()
-                self._api.authenticate()
+                api = _api_class(self.account.credentials)()
+                api.authenticate()
             except (SystemExit, Exception) as error:
-                self._api = None
                 raise RemoteError(
-                    "Kaggle authentication unavailable; configure standard Kaggle credentials", "auth"
+                    f"Kaggle authentication unavailable for {self.account.id}; configure its credentials",
+                    "auth",
                 ) from error
+            user = api.config_values.get(api.CONFIG_NAME_USER) or ""
+            if user.casefold() != self.owner.casefold():
+                raise RemoteError(
+                    f"Kaggle credentials for {self.account.id} authenticate as {user or 'nobody'}", "auth"
+                )
+            self._api = api
         return self._api
+
+    def check(self, spec: JobSpec):
+        if spec.accelerator and not spec.accelerator.startswith("Nvidia"):
+            raise ValueError("Kaggle accepts NVIDIA GPU accelerator IDs only")
+        if spec.timeout_seconds > MAX_SECONDS:
+            raise ValueError(f"Kaggle runs are limited to {MAX_SECONDS} seconds")
+        for ref in spec.datasets:
+            if not re.fullmatch(r"[\w-]+/[\w-]+(?:/[1-9]\d*)?", ref):
+                raise ValueError(f"Invalid Kaggle dataset reference: {ref}")
+
+    def url(self, ref):
+        return f"https://www.kaggle.com/code/{ref}"
+
+    def stage(self, job: JobRecord, number: int) -> str:
+        name = re.sub(r"[^a-z0-9]+", "-", job.spec.name.lower())[:16].strip("-") or "workload"
+        ref = f"{self.owner}/kgr-{name}-{job.id[:12]}-a{number}"
+        prepare_kernel(job, ref, self._folder(job, number), self.state_dir)
+        return ref
+
+    def _folder(self, job, number):
+        return self.state_dir / "jobs" / job.id / f"attempt-{number}"
+
+    def submit(self, job: JobRecord) -> dict:
+        attempt = job.attempts[-1]
+        result = self.push(
+            self._folder(job, attempt.number),
+            timeout_seconds=job.spec.timeout_seconds,
+            accelerator=job.spec.accelerator,
+        )
+        if result["ref"].lower() != attempt.ref.lower():
+            raise RemoteError(
+                "Kaggle returned an unexpected notebook identity; reconcile manually", "uncertain"
+            )
+        return result
 
     def resolve_dataset(self, ref):
         if len(ref.split("/")) == 3:
@@ -267,7 +280,8 @@ class KaggleBackend:
         from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionStatusRequest
 
         response = self._kernels("get_kernel_session_status", ApiGetKernelSessionStatusRequest(), ref)
-        return dict(state=response.status.name, error=response.failure_message)
+        raw = response.status.name
+        return dict(state=STATES.get(raw), detail=raw, error=response.failure_message)
 
     def _resource(self, ref):
         """The account listing reports every notebook as CPU; the notebook itself is accurate."""
@@ -312,13 +326,14 @@ class KaggleBackend:
         try:
             for response in pages:
                 for kernel in response.kernels or []:
-                    if kernel is None:
+                    # The listing can lead with empty placeholder entries dated 2010; they are not runs.
+                    if kernel is None or not kernel.ref:
                         continue
                     last_run = kernel.last_run_time
                     if last_run is not None and _utc(last_run) < cutoff:
                         return result
                     ref = kernel.ref
-                    if not ref or ref.split("/")[0].lower() != self.owner.lower():
+                    if ref.split("/")[0].lower() != self.owner.lower():
                         continue
                     try:
                         status = self.status(ref)
@@ -326,7 +341,7 @@ class KaggleBackend:
                         if error.kind == "missing":
                             continue
                         raise
-                    if status["state"] in RUNNING_STATES:
+                    if status["state"] in RUNNING:
                         key = (ref, last_run)
                         self._resources[key] = resources.get(key) or self._resource(ref)
                         result[ref] = self._resources[key]
@@ -377,7 +392,7 @@ class KaggleBackend:
                     return
                 except requests.RequestException as error:
                     # A session that prints nothing for a while is quiet, not disconnected.
-                    if _read_timeout(error) and self.status(ref)["state"] in RUNNING_STATES:
+                    if _read_timeout(error) and self.status(ref)["state"] in RUNNING:
                         continue
                     failures = failures + 1 if seen == before else 0
                     if failures < 5:
@@ -430,7 +445,9 @@ class KaggleBackend:
         return paginate(fetch)
 
     def download(self, ref, destination: Path, patterns=None, *, skip=None):
-        return download_outputs(self.output_pages(ref), destination, patterns, skip=skip, strict=self.strict)
+        return download_outputs(
+            self.output_pages(ref), destination, patterns, skip=skip, strict=self.strict, render=render_log
+        )
 
 
 def _read_timeout(error):
@@ -450,134 +467,66 @@ def render_log(raw):
     return raw
 
 
-def _content_length(response):
-    raw = response.headers.get("Content-Length")
-    if raw is None or response.headers.get("Content-Encoding"):
-        return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as error:
-        raise OSError("Invalid output download size") from error
-    if value < 0:
-        raise OSError("Invalid output download size")
-    return value
-
-
-def _checked_chunks(response, digest, expected):
-    """Yield the body into digest; fail before the file is replaced if it was cut short."""
-    size = 0
-    for chunk in response.iter_content(chunk_size=1024 * 1024):
-        digest.update(chunk)
-        size += len(chunk)
-        yield chunk
-    if expected is not None and size != expected:
-        raise OSError("Incomplete output download")
-
-
-_REDIRECTS = {301, 302, 303, 307, 308}
-
-
-def _validated_download_url(url, *, resolve=False):
-    """Accept public HTTPS URLs only; signed output URLs need no local credentials."""
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except (TypeError, ValueError) as error:
-        raise ValueError("Invalid output download URL") from error
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise ValueError("Output downloads require HTTPS")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("Output download URLs must not contain credentials")
-    if port not in (None, 443):
-        raise ValueError("Output downloads require the standard HTTPS port")
-    hostname = parsed.hostname.rstrip(".").casefold()
-    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal", ".home.arpa")):
-        raise ValueError("Output download URL points to a local host")
-    try:
-        addresses = [ipaddress.ip_address(hostname)]
-    except ValueError:
-        addresses = []
-    if resolve:
-        try:
-            addresses.extend(
-                ipaddress.ip_address(item[4][0])
-                for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+def prepare_kernel(job: JobRecord, ref: str, folder: Path, state_dir: Path) -> Path:
+    """Construct a private kernel from immutable local snapshots."""
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    snapshot = job.snapshot
+    source = snapshot["source"]
+    payload = state_dir / "bundles" / source["digest"] / "files"
+    config = dict(
+        job_id=job.id,
+        source_digest=source["digest"],
+        source_ref=job.upload_refs.get("source"),
+        inline=None,
+        inputs={
+            alias: dict(ref=job.upload_refs["input:" + alias], digest=bundle["digest"])
+            for alias, bundle in snapshot["inputs"].items()
+        },
+        module=snapshot["module"],
+        entrypoint=snapshot["entrypoint"],
+        args=job.spec.args,
+        env=job.spec.env,
+        requirements=job.spec.requirements,
+    )
+    if snapshot["single_file"]:
+        # Directory bundles carry their own manifest; only embedded files need their checksums here.
+        config["source_files"] = source["files"]
+        config["inline"] = {
+            name: base64.b64encode((payload / name).read_bytes()).decode() for name in source["files"]
+        }
+    bootstrap = Path(runtime.__file__).read_text() + "\n_KGR_CONFIG = " + repr(config) + "\n"
+    if snapshot["kind"] == "notebook":
+        notebook = nbformat.read(payload / snapshot["entrypoint"], as_version=4)
+        notebook.cells.insert(0, nbformat.v4.new_code_cell(bootstrap + "bootstrap(_KGR_CONFIG)\n"))
+        code_file = "workload.ipynb"
+        nbformat.write(notebook, folder / code_file)
+    else:
+        code_file = "workload.py"
+        (folder / code_file).write_text(bootstrap + "run_script(_KGR_CONFIG)\n")
+    metadata = dict(
+        id=ref,
+        title=ref.split("/")[1].replace("-", " "),
+        code_file=code_file,
+        language="python",
+        kernel_type=snapshot["kind"],
+        is_private=True,
+        enable_gpu=job.spec.gpu,
+        enable_tpu=False,
+        enable_internet=job.spec.internet,
+        dataset_sources=list(
+            dict.fromkeys(
+                [
+                    *[job.upload_refs.get("dataset:" + ref, ref) for ref in job.spec.datasets],
+                    *[value for key, value in job.upload_refs.items() if not key.startswith("dataset:")],
+                ]
             )
-        except socket.gaierror as error:
-            raise ValueError("Output download host could not be resolved") from error
-    if any(not address.is_global for address in addresses):
-        raise ValueError("Output download URL points to a non-public address")
-    return url
-
-
-def _open_download(url, get, *, strict=False, resolve=False, max_redirects=5):
-    if not strict:
-        return get(url, stream=True, timeout=(15, 90))
-    for _ in range(max_redirects + 1):
-        _validated_download_url(url, resolve=resolve)
-        response = get(url, stream=True, timeout=(15, 90), allow_redirects=False)
-        if getattr(response, "status_code", 200) not in _REDIRECTS:
-            return response
-        location = response.headers.get("Location")
-        response.close()
-        if not location:
-            raise ValueError("Output download redirect has no destination")
-        url = urljoin(url, location)
-    raise ValueError("Too many output download redirects")
-
-
-def download_outputs(pages, destination, patterns=None, *, skip=None, get=None, strict=False):
-    """Download session outputs; names matching the skip predicate are not fetched.
-
-    strict ignores proxy, CA and .netrc settings from the environment, and fetches only
-    public HTTPS addresses, checking every redirect.
-    """
-    session = None
-    resolve = strict and get is None
-    if get is None:
-        session = requests.Session()
-        session.trust_env = not strict
-        get = session.get
-    try:
-        destination = Path(destination)
-        root = destination / "outputs"
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        receipt_path = destination / "downloads.json"
-        receipts = json.loads(receipt_path.read_text()) if receipt_path.exists() else {}
-        for page in pages:
-            if page.log:
-                # Always retrieve logs even when output filtering selects no files.
-                log_data = redact_secrets(render_log(page.log), strict=strict).encode()
-                atomic_write(
-                    destination / "run.log",
-                    log_data,
-                    check_space=True,
-                    expected_bytes=len(log_data),
-                )
-            for item in page.files or []:
-                name = safe_relative(item.file_name)
-                target = root / name
-                if not target.resolve().is_relative_to(root.resolve()):
-                    raise ValueError("Output resolves outside the destination")
-                if skip is not None and skip(name):
-                    continue
-                if patterns is not None and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
-                    continue
-                if name in receipts and target.is_file() and file_digest(target) == receipts[name]["sha256"]:
-                    continue
-                digest = hashlib.sha256()
-                with _open_download(item.url, get, strict=strict, resolve=resolve) as response:
-                    response.raise_for_status()
-                    expected = _content_length(response)
-                    atomic_write(
-                        target,
-                        _checked_chunks(response, digest, expected),
-                        check_space=True,
-                        expected_bytes=expected,
-                    )
-                receipts[name] = dict(bytes=target.stat().st_size, sha256=digest.hexdigest())
-                atomic_json(receipt_path, receipts)
-        return receipts
-    finally:
-        if session is not None:
-            session.close()
+        ),
+        competition_sources=[],
+        kernel_sources=[],
+        model_sources=[],
+    )
+    if job.spec.accelerator:
+        metadata["machine_shape"] = job.spec.accelerator
+    atomic_json(folder / "kernel-metadata.json", metadata)
+    atomic_json(folder / "provenance.json", redacted_env_record(job.model_dump(mode="json")))
+    return folder

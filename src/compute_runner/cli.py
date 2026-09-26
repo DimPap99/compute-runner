@@ -16,21 +16,24 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from .backend import safe_message
 from .client import Client
-from .models import Config, JobSpec
+from .models import Account, Config, JobSpec
+from .providers import safe_message
 from .security import redacted_env_record
 from .store import atomic_json, config_path
 from . import service
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Queue, run and monitor compute workloads. Currently support only Kaggle.",
+    help="Queue, run and monitor compute workloads on your provider accounts. Kaggle is the only provider "
+    "adapter today.",
 )
 worker_app = typer.Typer(no_args_is_help=True)
 service_app = typer.Typer(no_args_is_help=True)
+account_app = typer.Typer(no_args_is_help=True, help="Connect provider accounts; the first is the default.")
 app.add_typer(worker_app, name="worker")
 app.add_typer(service_app, name="service")
+app.add_typer(account_app, name="account")
 console = Console()
 
 
@@ -99,12 +102,24 @@ def workload_specs(source: Path, *, timeout=None, arg=None, **overrides):
     return [JobSpec.model_validate(spec.model_dump() | values) for spec in load_specs(source)]
 
 
+def _save(ctx, **changes):
+    """Validate and persist configuration; fields that are not changed keep their current values."""
+    changes = {key: value for key, value in changes.items() if value is not None}
+    config = Config.model_validate(_client(ctx).config.model_dump() | changes)
+    atomic_json(config_path(), config.model_dump(mode="json"))
+    return config
+
+
 @app.command("init")
 def initialize(
     ctx: typer.Context,
-    owner: Annotated[str, typer.Option()],
-    cpu_limit: Annotated[int | None, typer.Option(help="Default 5; unchanged when omitted")] = None,
-    gpu_limit: Annotated[int | None, typer.Option(help="Default 1; unchanged when omitted")] = None,
+    failover: Annotated[
+        str | None,
+        typer.Option(
+            help="When a job cannot start on its account: off, ask (suggest another account) or auto "
+            "(move it). Default ask; unchanged when omitted"
+        ),
+    ] = None,
     poll_seconds: Annotated[float | None, typer.Option(help="Default 30; unchanged when omitted")] = None,
     strict: Annotated[
         bool | None,
@@ -114,14 +129,69 @@ def initialize(
         ),
     ] = None,
 ):
-    changes = dict(
-        owner=owner, cpu_limit=cpu_limit, gpu_limit=gpu_limit, poll_seconds=poll_seconds, strict=strict
+    config = _save(ctx, failover=failover, poll_seconds=poll_seconds, strict=strict)
+    _emit(
+        ctx,
+        dict(
+            config=str(config_path()),
+            state_dir=str(config.state_dir),
+            failover=config.failover,
+            strict=config.strict,
+        ),
     )
-    values = _client(ctx).config.model_dump() | {k: v for k, v in changes.items() if v is not None}
-    config = Config.model_validate(values)
-    Client(config=config)  # Validate the account binding before saving configuration.
-    atomic_json(config_path(), config.model_dump(mode="json"))
-    _emit(ctx, dict(config=str(config_path()), owner=owner, state_dir=str(config.state_dir), strict=strict))
+
+
+@account_app.command("add")
+def account_add(
+    ctx: typer.Context,
+    provider: str,
+    user: str,
+    credentials: Annotated[
+        Path | None,
+        typer.Option(help="Credentials file for this account only; default: the provider's usual location"),
+    ] = None,
+    cpu_limit: Annotated[int | None, typer.Option(help="Default 5; unchanged when omitted")] = None,
+    gpu_limit: Annotated[int | None, typer.Option(help="Default 1; unchanged when omitted")] = None,
+    default: Annotated[bool, typer.Option("--default", help="Prefer this account to the others")] = False,
+):
+    """Add or update an account. Only the credentials file's path is saved."""
+    if credentials is not None:
+        credentials = credentials.expanduser().resolve()
+        if not credentials.is_file():
+            raise ValueError(f"Credentials file not found: {credentials}")
+    accounts = _client(ctx).config.accounts
+    key = Account(provider=provider, user=user).id.casefold()
+    index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key), len(accounts))
+    saved = accounts[index].model_dump() if index < len(accounts) else {}
+    changes = dict(credentials=credentials, cpu_limit=cpu_limit, gpu_limit=gpu_limit)
+    values = saved | dict(provider=provider, user=user) | {k: v for k, v in changes.items() if v is not None}
+    account = Account.model_validate(values)
+    others = [a.model_dump() for a in accounts if a.id.casefold() != key]
+    others.insert(0 if default else index, account.model_dump())
+    config = _save(ctx, accounts=others)
+    _emit(ctx, dict(account=account.id, accounts=[a.id for a in config.accounts]))
+
+
+@account_app.command("remove")
+def account_remove(ctx: typer.Context, account_id: str):
+    """Forget an account. Its unfinished jobs must be moved, cancelled or finished first."""
+    client = _client(ctx)
+    account = client.config.account(account_id)
+    # Downloads of finished runs still need the account.
+    busy = sum(
+        job.account == account.id and (not job.terminal or job.download_state in {"pending", "downloading"})
+        for job in client.list()
+    )
+    if busy:
+        raise ValueError(f"{busy} unfinished jobs use {account.id}; move, cancel or finish them first")
+    config = _save(ctx, accounts=[a.model_dump() for a in client.config.accounts if a.id != account.id])
+    _emit(ctx, dict(removed=account.id, accounts=[a.id for a in config.accounts]))
+
+
+@account_app.command("list")
+def account_list(ctx: typer.Context):
+    """Accounts in preference order with slots in use; no remote calls."""
+    _emit(ctx, _client(ctx).agent().accounts())
 
 
 @app.command()
@@ -137,6 +207,7 @@ def submit(
     arg: Annotated[list[str] | None, typer.Option("--arg")] = None,
     dry_run: bool = False,
     request_key: str | None = None,
+    account: Annotated[str | None, typer.Option(help="Account ID such as kaggle:USER; default first")] = None,
 ):
     specs = workload_specs(
         source,
@@ -151,7 +222,7 @@ def submit(
     if dry_run:
         _emit(ctx, [_client(ctx).preview(spec) for spec in specs])
     else:
-        jobs = _client(ctx).submit_many(specs, request_key=request_key)
+        jobs = _client(ctx).submit_many(specs, request_key=request_key, account=account)
         if ctx.obj["json"]:
             _emit(ctx, [_job_dict(job) for job in jobs])
         else:
@@ -167,12 +238,13 @@ def list_jobs(ctx: typer.Context, state: str | None = None):
     if ctx.obj["json"]:
         _emit(ctx, [_job_dict(job) for job in jobs])
         return
-    table = Table("Job", "Name", "State", "Resource", "Outputs", "Waiting / error")
+    table = Table("Job", "Name", "State", "Account", "Resource", "Outputs", "Waiting / error")
     for job in jobs:
         table.add_row(
             job.id[:12],
             job.spec.name,
             job.state,
+            job.account,
             job.spec.accelerator or ("GPU" if job.spec.gpu else "CPU"),
             job.download_state,
             job.error or job.wait_reason or "",
@@ -237,8 +309,14 @@ def download(ctx: typer.Context, job_id: str):
 
 
 @app.command()
-def retry(ctx: typer.Context, job_id: str):
-    _emit(ctx, _client(ctx).retry(_id(ctx, job_id)))
+def retry(ctx: typer.Context, job_id: str, account: str | None = None):
+    _emit(ctx, _client(ctx).retry(_id(ctx, job_id), account=account))
+
+
+@app.command()
+def move(ctx: typer.Context, job_id: str, account: Annotated[str, typer.Option()]):
+    """Place a job that has not been submitted on another account."""
+    _emit(ctx, _client(ctx).move(_id(ctx, job_id), account))
 
 
 @app.command()
@@ -256,21 +334,22 @@ def resolve(
 ):
     if not not_submitted:
         raise ValueError(
-            "Inspect the notebook on Kaggle first; --not-submitted is an explicit operator assertion"
+            "Inspect the run on its provider first; --not-submitted is an explicit operator assertion"
         )
     _emit(ctx, _client(ctx).resolve_not_submitted(_id(ctx, job_id)))
 
 
 @app.command()
-def quota(ctx: typer.Context):
-    _emit(ctx, _client(ctx).quota())
+def quota(ctx: typer.Context, account: str | None = None):
+    _emit(ctx, _client(ctx).quota(account))
 
 
 @app.command()
 def doctor(ctx: typer.Context, offline: bool = False):
     client = _client(ctx)
     info = dict(
-        owner=client.config.owner,
+        accounts=[account.id for account in client.config.accounts],
+        failover=client.config.failover,
         state_dir=str(client.config.state_dir),
         strict=client.config.strict,
         free_disk_bytes=shutil.disk_usage(client.config.state_dir).free,
@@ -278,15 +357,20 @@ def doctor(ctx: typer.Context, offline: bool = False):
         python=sys.version.split()[0],
     )
     if not offline:
-        info["quota"] = client.quota()
-        info["active_runs"] = client.backend.active_runs()
+        # Checked separately, so one broken account does not hide the others.
+        info["remote"] = {}
+        for account in client.config.accounts:
+            provider = client.provider(account.id)
+            try:
+                info["remote"][account.id] = dict(quota=provider.quota(), active_runs=provider.active_runs())
+            except ERRORS as error:
+                info["remote"][account.id] = dict(error=safe_message(error))
     _emit(ctx, info)
 
 
 @worker_app.command("run")
 def worker_run(ctx: typer.Context, once: bool = False):
-    if not _client(ctx).config.owner:
-        raise ValueError("Run compute-runner init --owner YOUR_USERNAME first")
+    _client(ctx).config.account()  # Fails with setup guidance when no account is configured.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     worker = _client(ctx).worker()
     worker.tick() if once else worker.run()
@@ -299,8 +383,7 @@ def worker_status(ctx: typer.Context):
 
 @service_app.command("install")
 def service_install(ctx: typer.Context, start: Annotated[bool, typer.Option("--start/--no-start")] = True):
-    if not _client(ctx).config.owner:
-        raise ValueError("Run compute-runner init --owner YOUR_USERNAME first")
+    _client(ctx).config.account()  # Fails with setup guidance when no account is configured.
     # Persist a state-dir override so API clients and the service use the same queue.
     atomic_json(config_path(), _client(ctx).config.model_dump(mode="json"))
     _emit(ctx, {"unit": str(service.install(_client(ctx).config, start=start))})

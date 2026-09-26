@@ -2,8 +2,8 @@ import time
 
 import pytest
 
-from compute_runner import JobSpec
-from compute_runner.backend import RemoteError
+from compute_runner import Account, JobSpec
+from compute_runner.providers import RemoteError
 from conftest import due
 
 
@@ -218,10 +218,10 @@ def test_pending_cancel_is_local_and_active_cancel_stops_the_remote_run(setup):
     active = client.submit(spec)
     client.worker().tick()
     ref = client.get(active.id).remote_ref
-    assert client.cancel(active.id).wait_reason == "Cancellation requested on Kaggle"
+    assert client.cancel(active.id).wait_reason == "Cancellation requested on kaggle:tester"
     assert backend.cancelled == [ref]
     client.worker().tick()
-    assert client.get(active.id).wait_reason == "Cancellation requested on Kaggle"
+    assert client.get(active.id).wait_reason == "Cancellation requested on kaggle:tester"
     backend.remote[ref]["state"] = "CANCEL_ACKNOWLEDGED"
     due(client, active.id)
     client.worker().tick()
@@ -249,13 +249,14 @@ def test_only_one_worker_holds_lock(setup):
             client.worker().tick()
 
 
-def test_owner_binding_prevents_cross_account_use(setup):
-    from compute_runner import Client
-
-    client, _, _ = setup
-    config = client.config.model_copy(update={"owner": "someoneelse"})
-    with pytest.raises(ValueError, match="another Kaggle account"):
-        Client(config=config)
+def test_job_on_an_unconfigured_account_is_blocked(setup):
+    client, backend, spec = setup
+    job = client.submit(spec)
+    client.config.accounts = [Account(user="someoneelse")]
+    client.worker().tick()
+    blocked = client.get(job.id)
+    assert blocked.state == "blocked" and "kaggle:tester is not configured" in blocked.error
+    assert not backend.pushes
 
 
 def test_fifo_waits_for_inputs_but_other_resource_pool_progresses(setup, tmp_path):
@@ -282,7 +283,7 @@ def test_concurrent_clients_keep_every_submission(setup):
     client, backend, spec = setup
 
     def submit(_):
-        return Client(config=client.config, backend=backend).submit(spec).id
+        return Client(config=client.config, providers={"kaggle:tester": backend}).submit(spec).id
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         ids = list(pool.map(submit, range(12)))

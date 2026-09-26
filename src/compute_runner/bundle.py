@@ -1,4 +1,4 @@
-"""Deterministic, credential-excluding snapshots; no Kaggle calls."""
+"""Deterministic, credential-excluding snapshots; no remote calls."""
 
 from __future__ import annotations
 

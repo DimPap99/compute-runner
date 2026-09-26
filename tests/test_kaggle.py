@@ -4,7 +4,10 @@ import pytest
 import requests
 
 from compute_runner import store as store_module
-from compute_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error, safe_message
+from compute_runner import Account
+from compute_runner.providers import RemoteError, remote_error, safe_message
+from compute_runner.providers.downloads import download_outputs
+from compute_runner.providers.kaggle import KaggleProvider, render_log
 from compute_runner.security import redact_secrets
 from compute_runner.store import atomic_write
 
@@ -200,7 +203,7 @@ def test_unknown_download_size_is_checked_while_streaming(tmp_path, monkeypatch)
 
 
 def test_push_error_body_is_not_success(tmp_path):
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         kernels_push=lambda *a, **k: Obj(error="Maximum batch CPU session count of 5 reached", kernel_id=0)
     )
@@ -220,7 +223,7 @@ def test_server_failure_is_uncertain_for_mutations():
 def test_quota_accounts_for_reservations(tmp_path):
     from datetime import datetime, timedelta, timezone
 
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         quota_view=lambda: Obj(
             quota_refresh_time=datetime(2026, 1, 1),  # The SDK returns naive UTC.
@@ -238,7 +241,7 @@ def test_quota_accounts_for_reservations(tmp_path):
 
 
 def test_push_normalizes_versioned_reference(tmp_path):
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         kernels_push=lambda *a, **k: Obj(
             error=None,
@@ -265,7 +268,7 @@ def test_dataset_missing_403_reconciles_owned_inventory(tmp_path):
         raise requests.HTTPError("Permission denied", response=response)
 
     creates = []
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         dataset_status=missing,
         dataset_list=lambda **kwargs: [],
@@ -284,7 +287,7 @@ def test_existing_dataset_403_does_not_trigger_creation(tmp_path):
     def forbidden(*args, **kwargs):
         raise requests.HTTPError("Permission denied", response=response)
 
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         dataset_status=forbidden, dataset_list=lambda **k: [Obj(ref=f"tester/kgr-b-{digest[:40]}")]
     )
@@ -304,7 +307,7 @@ def test_dataset_inventory_failure_after_403_stays_retryable(tmp_path):
     def offline(**kwargs):
         raise requests.ConnectionError("network down")
 
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(dataset_status=forbidden, dataset_list=offline)
     with pytest.raises(RemoteError) as error:
         backend.ensure_bundle({"digest": "c" * 64})
@@ -314,7 +317,7 @@ def test_dataset_inventory_failure_after_403_stays_retryable(tmp_path):
 def test_push_accepts_bare_slug_and_saves_receipt(tmp_path):
     import json
 
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         kernels_push=lambda *a, **k: Obj(
             error=None, kernel_id=9, ref="job", version_number=1, url="https://www.kaggle.com/code/tester/job"
@@ -326,8 +329,6 @@ def test_push_accepts_bare_slug_and_saves_receipt(tmp_path):
 
 
 def test_persisted_log_events_are_readable():
-    from compute_runner.backend import render_log
-
     assert render_log('[{"stream_name":"stdout","data":"hello\\n"}]') == "hello\n"
     assert render_log("plain text") == "plain text"
 
@@ -336,7 +337,7 @@ def test_persisted_log_events_are_readable():
     "ref", ["/code/tester/job", "https://www.kaggle.com/code/tester/job", "tester/job", "job"]
 )
 def test_live_save_response_reference_forms(tmp_path, ref):
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = Obj(
         kernels_push=lambda *a, **k: Obj(
             error=None, kernel_id=135, ref=ref, version_number=1, url="https://www.kaggle.com/code/tester/job"
@@ -375,3 +376,18 @@ def test_remote_error_mapping(code, message, kind, definitive):
     response._content = ('{"message": "%s"}' % message).encode()
     error = remote_error(requests.HTTPError(message, response=response))
     assert (error.kind, error.definitive) == (kind, definitive)
+
+
+@pytest.mark.parametrize(
+    "update, message",
+    [
+        ({"accelerator": "TpuV38"}, "NVIDIA"),
+        ({"timeout_seconds": 43201}, "43200 seconds"),
+        ({"datasets": ["not a reference"]}, "Invalid Kaggle dataset reference"),
+    ],
+)
+def test_kaggle_rejects_specs_it_cannot_run_before_queueing(setup, update, message):
+    client, _, spec = setup
+    with pytest.raises(ValueError, match=message):
+        client.submit(spec.model_copy(update=update))
+    assert client.list() == []

@@ -8,6 +8,14 @@ Verified on 2026-09-26 using the installed Python 3.12 environment.
 - `compute-runner` is installed at `~/.local/bin/compute-runner` and points to this project's isolated environment.
 - The original `/home/dimpap/LocEstim` repository remains clean.
 
+## Provider accounts and failover
+
+- The queue now talks to providers only through the `Provider` protocol; Kaggle is its one adapter. 170 automated tests passed, including 20 new cases for accounts, failover under the `off`/`ask`/`auto` policies, moves, per-account credentials, discovery, and single-account upgrades. Ruff, compilation, and `git diff --check` passed.
+- Backed up the live queue to `~/.local/share/compute-runner/queue.pre-accounts.sqlite3` before the service restart. The saved single-owner configuration is read as the account `kaggle:dimpap99`, and all seven existing job records report that account with unchanged notebook URLs. `compute-runner doctor` authenticated and passed the new username check. The service restarted on the new code and is running.
+- A throwaway queue with a second account holding a fake key showed that `kagglesdk` sends any ambient access token (`~/.kaggle/access_token`) instead of an explicitly configured key. One smoke submission for that account reached Kaggle under the main account's token and was rejected for capacity; nothing was launched. The adapter now pins the transport's authentication to the credentials it verified. A rerun returned `401 Unauthorized` for the fake account, and failover `ask` suggested `kaggle:dimpap99`.
+- Kaggle's notebook listing can start with empty placeholder entries dated 2010-04-01. Discovery stopped at them and reported no active runs while Kaggle enforced its 5-session CPU limit. Discovery now skips them and reported all five running research notebooks. A launch that the provider rejects for capacity or quota now also makes a waiting job eligible for failover.
+- The live end-to-end job (`examples/hello.py`) did not run: the account was at Kaggle's 5-session CPU limit because of the user's own research notebooks. It was cancelled locally before launch, so it will not take a slot.
+
 ## Compute Runner rename
 
 - Renamed the Python distribution, source package, CLI, documentation, notebook example, installed skill, project directory, and systemd user service. The README and command help state: "Currently support only Kaggle."

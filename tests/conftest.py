@@ -4,12 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from compute_runner import Client, Config, JobSpec
-from compute_runner.backend import RemoteError
+from compute_runner import Account, Client, Config, JobSpec
+from compute_runner.providers import RemoteError
+from compute_runner.providers.kaggle import STATES, KaggleProvider
 
 
-class FakeBackend:
-    def __init__(self):
+class FakeProvider(KaggleProvider):
+    """A Kaggle account whose network calls are simulated; validation and staging are real."""
+
+    def __init__(self, state_dir, user="tester"):
+        super().__init__(Account(user=user), state_dir)
         self.remote = {}
         self.pushes = []
         self.external = {}
@@ -37,7 +41,7 @@ class FakeBackend:
 
     def ensure_bundle(self, bundle):
         self.uploads.append(bundle["digest"])
-        return f"tester/kgr-b-{bundle['digest'][:40]}/1" if self.upload_ready else None
+        return f"{self.owner}/kgr-b-{bundle['digest'][:40]}/1" if self.upload_ready else None
 
     def resolve_dataset(self, ref):
         return ref if len(ref.split("/")) == 3 else ref + "/7"
@@ -53,9 +57,11 @@ class FakeBackend:
         return dict(ref=metadata["id"], version=1)
 
     def status(self, ref):
+        """Tests set Kaggle's raw states in remote."""
         if ref not in self.remote:
             raise RemoteError("not found", "missing", definitive=True)
-        return self.remote[ref]
+        raw = self.remote[ref]
+        return dict(state=STATES.get(raw["state"]), detail=raw["state"], error=raw["error"])
 
     def download(self, ref, destination, patterns, skip=None):
         self.download_calls += 1
@@ -90,19 +96,44 @@ class FakeBackend:
         return self.live_text
 
 
+def make_config(tmp_path, *users, **options):
+    return Config(
+        accounts=[Account(user=user) for user in users],
+        state_dir=tmp_path / "state",
+        poll_seconds=1,
+        retry_seconds=1,
+        reconcile_seconds=1,
+        **options,
+    )
+
+
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
-    backend = FakeBackend()
-    client = Client(
-        config=Config(
-            owner="tester", state_dir=tmp_path / "state", poll_seconds=1, retry_seconds=1, reconcile_seconds=1
-        ),
-        backend=backend,
-    )
+    config = make_config(tmp_path, "tester")
+    backend = FakeProvider(config.state_dir)
+    client = Client(config=config, providers={"kaggle:tester": backend})
     script = tmp_path / "hello.py"
     script.write_text("print('hello')\n")
     return client, backend, JobSpec(source=script)
+
+
+@pytest.fixture
+def two_accounts(tmp_path, monkeypatch):
+    """Accounts kaggle:tester (default) and kaggle:other; set config.failover per test."""
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    config = make_config(tmp_path, "tester", "other")
+    home, other = FakeProvider(config.state_dir), FakeProvider(config.state_dir, "other")
+    client = Client(config=config, providers={"kaggle:tester": home, "kaggle:other": other})
+    script = tmp_path / "hello.py"
+    script.write_text("print('hello')\n")
+    return client, home, other, JobSpec(source=script)
+
+
+def staged_launcher(backend, job):
+    """Stage attempt 1 as the worker would; return the generated script launcher."""
+    backend.stage(job, 1)
+    return backend.state_dir / "jobs" / job.id / "attempt-1" / "workload.py"
 
 
 def due(client, job_id):

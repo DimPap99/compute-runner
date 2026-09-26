@@ -15,13 +15,13 @@ import requests
 import urllib3
 from typer.testing import CliRunner
 
-from compute_runner import JobSpec
-from compute_runner.backend import READ_TIMEOUT, KaggleBackend, RemoteError, download_outputs
+from compute_runner import Account, JobSpec
+from compute_runner.providers import RemoteError
+from compute_runner.providers.downloads import download_outputs
+from compute_runner.providers.kaggle import READ_TIMEOUT, KaggleProvider
 from compute_runner.cli import app
-from compute_runner.launcher import prepare_kernel
-from compute_runner.models import Attempt
 from compute_runner.worker import source_copies
-from conftest import due
+from conftest import due, staged_launcher
 
 
 def agent_cli(code=0):
@@ -151,7 +151,7 @@ def test_gpu_waits_for_quota_while_cpu_proceeds(setup):
     client.worker().tick()
     status = agent.status(batch_id=batch["batch_id"])
     gpu, cpu = status["jobs"]
-    assert gpu["state"] == "queued" and gpu["reason"] == "Waiting for available GPU quota"
+    assert gpu["state"] == "queued" and gpu["reason"] == "Waiting for available GPU quota on kaggle:tester"
     assert cpu["state"] == "remote_queued" and len(backend.pushes) == 1
 
 
@@ -221,11 +221,10 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
         "Path('checkpoint.bin').write_text('weights')\n"
     )
     job = client.submit(JobSpec(source=project, module="pkg.main"))
-    job.attempts = [Attempt(number=1, ref="tester/kgr-scenario")]
     job.upload_refs["source"] = backend.ensure_bundle(job.snapshot["source"])
     mount = tmp_path / "input" / job.upload_refs["source"].split("/")[1]
     shutil.copytree(client.config.state_dir / "bundles" / job.snapshot["source"]["digest"] / "files", mount)
-    script = prepare_kernel(job, client.config.state_dir) / "workload.py"
+    script = staged_launcher(backend, job)
     working = tmp_path / "working"
     script.write_text(
         script.read_text()
@@ -289,7 +288,7 @@ def read_timeout():
 
 
 def backend_with(api, tmp_path):
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     backend._api = api
     return backend
 
@@ -312,7 +311,7 @@ def test_follow_keeps_waiting_through_quiet_periods(tmp_path):
             yield {"data": "done\n"}
 
     backend = backend_with(QuietApi(), tmp_path)
-    backend.status = lambda ref: {"state": "RUNNING"}
+    backend.status = lambda ref: {"state": "running"}
     assert "".join(backend.logs("tester/k", follow=True)) == "start\ndone\n"
 
 
@@ -385,7 +384,7 @@ def discovery_backend(tmp_path, kernels, running, gpus=()):
 
     def status(ref):
         calls["status"].append(ref)
-        return {"state": "RUNNING" if ref in running else "COMPLETE", "error": ""}
+        return {"state": "running" if ref in running else "succeeded", "error": ""}
 
     def kernels_call(method, request, ref=None):
         assert method == "get_kernel"
@@ -413,6 +412,17 @@ def test_account_discovery_stops_at_runs_too_old_to_be_active(tmp_path):
     assert calls["status"] == [f"tester/recent-{i}" for i in range(5)]
 
 
+def test_account_discovery_skips_placeholder_entries_before_recent_runs(tmp_path):
+    from datetime import datetime, timezone
+
+    # The live listing can start with empty entries dated 2010-04-01 ahead of running notebooks.
+    placeholders = [Obj(ref="", last_run_time=datetime(2010, 4, 1), enable_gpu=False)] * 5
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    running = [Obj(ref=f"tester/run-{i}", last_run_time=now, enable_gpu=False) for i in range(4)]
+    backend, _ = discovery_backend(tmp_path, placeholders + running, running={k.ref for k in running})
+    assert backend.active_runs() == {k.ref: "cpu" for k in running}
+
+
 def test_external_gpu_runs_are_detected_once_per_run(tmp_path):
     from datetime import datetime
 
@@ -428,7 +438,7 @@ def test_external_gpu_runs_are_detected_once_per_run(tmp_path):
 
 
 def test_remote_cancel_uses_the_session_id_logged_by_this_job(tmp_path):
-    backend = KaggleBackend("tester", tmp_path)
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
     sent = []
     backend._kernels = lambda method, request, ref=None: (
         sent.append((method, request.kernel_session_id)) or Obj(error_message="")
@@ -448,10 +458,9 @@ def test_remote_cancel_uses_the_session_id_logged_by_this_job(tmp_path):
 
 
 def test_runtime_logs_the_session_id_before_any_setup(setup, tmp_path, monkeypatch):
-    client, _, spec = setup
+    client, backend, spec = setup
     job = client.submit(spec)
-    job.attempts = [Attempt(number=1, ref="tester/kgr-session")]
-    script = prepare_kernel(job, client.config.state_dir) / "workload.py"
+    script = staged_launcher(backend, job)
     script.write_text(script.read_text().replace("/kaggle/working", str(tmp_path / "working")))
     env = dict(os.environ, KAGGLE_CONTAINER_NAME="kaggle_QLKaLNVAIohcv9mw-352993764-webtier")
     result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)

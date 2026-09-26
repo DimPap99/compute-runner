@@ -1,25 +1,35 @@
-"""Single dispatcher, persistent attempts, independent artifact downloads."""
+"""Single dispatcher, persistent attempts, per-account capacity, independent artifact downloads."""
 
 from __future__ import annotations
 
 import logging
-import re
 import signal
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 
-from .backend import RemoteError, safe_message
-from .launcher import prepare_kernel
 from .models import ACTIVE, TERMINAL, Attempt, Config
+from .providers import RemoteError, safe_message
 from .security import redacted_env_record
 from .store import Store, atomic_json, try_lock
 
 logger = logging.getLogger(__name__)
 PENDING = {"queued", "preparing"}
+# Jobs without a possible remote run; they can change account.
+MOVABLE = {"queued", "preparing", "blocked"}
+REMOTE_STATES = {
+    "queued": "remote_queued",
+    "running": "running",
+    "cancelling": "running",
+    "succeeded": "succeeded",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
 
 
-def collect_outputs(store, backend, job_id):
+def collect_outputs(store, provider, job_id):
     job = store.get(job_id)
     if not job.remote_ref or not job.terminal:
         raise ValueError("Outputs may be collected after a submitted run terminates")
@@ -29,7 +39,7 @@ def collect_outputs(store, backend, job_id):
             return store.get(job_id)
         try:
             store.update(job_id, download_state="downloading", download_error=None)
-            backend.download(
+            provider(job.attempts[-1].account).download(
                 job.remote_ref, job.result_dir, job.spec.output_patterns, skip=source_copies(job)
             )
             updated = store.update(job_id, download_state="complete", download_error=None)
@@ -44,7 +54,7 @@ def collect_outputs(store, backend, job_id):
                 download_state="error",
                 download_error=safe_message(error),
                 download_failures=job.download_failures + 1,
-                # 1, 2, 4 ... minutes, then hourly; a permanent failure should not hammer Kaggle.
+                # 1, 2, 4 ... minutes, then hourly; a permanent failure should not hammer the provider.
                 download_retry_at=time.time() + min(60 * 2**job.download_failures, 3600),
             )
             raise
@@ -68,6 +78,42 @@ def outstanding(job):
     )
 
 
+def occupancy(jobs, account, runs):
+    """Runs holding an account's CPU and GPU slots: our outstanding attempts plus other known runs."""
+    ours = [job for job in jobs if outstanding(job) and job.attempts[-1].account == account]
+    refs = {job.remote_ref.lower() for job in ours}
+    counts = {"cpu": sum(not job.spec.gpu for job in ours), "gpu": sum(job.spec.gpu for job in ours)}
+    for ref, resource in runs.items():
+        if ref.lower() not in refs:
+            for kind in ("cpu", "gpu"):
+                if resource in {kind, "unknown"}:
+                    counts[kind] += 1
+    return counts
+
+
+def waiting_for_capacity(account, pool):
+    return f"Waiting for {pool.upper()} capacity on {account}"
+
+
+def place(store, job_id, account, reason):
+    """Put a job that has no remote run on another account; None if it changed meanwhile.
+
+    Requeueing also stops a preparation in progress, whose updates expect "preparing".
+    """
+    return store.update(
+        job_id,
+        expected=MOVABLE,
+        account=account,
+        state="queued",
+        # Uploaded inputs belong to the previous account.
+        upload_refs={},
+        suggested_account=None,
+        error=None,
+        wait_reason=reason,
+        next_action_at=0,
+    )
+
+
 def settled(job, *, downloads=True):
     """Nothing further happens without operator action, apart from download retries."""
     if job.state in {"blocked", "needs_attention"}:
@@ -75,16 +121,25 @@ def settled(job, *, downloads=True):
     return job.terminal and (not downloads or job.download_state in {"complete", "disabled", "error"})
 
 
+@dataclass
+class Discovery:
+    """What the worker last learned about one account's remote capacity."""
+
+    runs: dict = field(default_factory=dict)
+    checked_at: float | None = None
+    error: str | None = None
+    retry_at: float = 0
+    gpu_seconds: float | None = None
+
+
 class Worker:
-    def __init__(self, config: Config, backend, store=None):
+    def __init__(self, config: Config, provider, store=None):
+        """provider maps an account ID to its Provider."""
         self.config = config
         self.store = store or Store(config.state_dir)
-        self.backend = backend
+        self.provider = provider
         self.stop_event = threading.Event()
-        self.inventory = {}
-        self.inventory_at = None
-        self.inventory_error = None
-        self.discovery_retry_at = 0
+        self.discovery = defaultdict(Discovery)
         self.pool = None
         self.downloads = {}
 
@@ -128,20 +183,24 @@ class Worker:
                 self._poll(job)
         pending = self.store.list(PENDING)
         if pending and not self.stop_event.is_set():
-            self._refresh_inventory()
             self._dispatch(pending)
         self._downloads()
-        self.store.heartbeat(state="running", stage="idle", discovery_error=self.inventory_error)
+        atomic_json(
+            self.config.state_dir / "accounts.json",
+            {account: asdict(found) for account, found in self.discovery.items()},
+        )
+        self.store.heartbeat(state="running", stage="idle")
 
     def _poll(self, job):
         attempt = job.attempts[-1]
         now = time.time()
         try:
-            status = self.backend.status(attempt.ref)
-        except RemoteError as error:
+            status = self.provider(attempt.account).status(attempt.ref)
+        except (RemoteError, ValueError) as error:  # ValueError: the account is no longer configured
             uncertain = attempt.state in {"submitting", "uncertain"}
             expired = now - attempt.started_at >= self.config.reconcile_seconds
-            new_state = "needs_attention" if expired and (uncertain or error.kind == "missing") else job.state
+            missing = getattr(error, "kind", None) == "missing"
+            new_state = "needs_attention" if expired and (uncertain or missing) else job.state
             if uncertain:
                 attempt.state = "uncertain"
             self.store.update(
@@ -156,19 +215,11 @@ class Worker:
                 next_action_at=now + self.config.poll_seconds,
             )
             return
-        remote = status["state"]
-        mapping = {
-            "QUEUED": "remote_queued",
-            "RUNNING": "running",
-            "COMPLETE": "succeeded",
-            "ERROR": "failed",
-            "CANCEL_ACKNOWLEDGED": "cancelled",
-            "CANCEL_REQUESTED": "running",
-        }
-        if remote not in mapping:
+        state = REMOTE_STATES.get(status["state"])
+        if state is None:
             self.store.update(
                 job.id,
-                remote_state=remote,
+                remote_state=status.get("detail"),
                 last_polled_at=now,
                 state="needs_attention"
                 if now - attempt.started_at >= self.config.reconcile_seconds
@@ -178,66 +229,100 @@ class Worker:
             )
             return
         attempt.state = "accepted"
-        state = mapping[remote]
         changes = dict(
             state=state,
-            remote_state=remote,
+            remote_state=status.get("detail"),
             last_polled_at=now,
             attempts=job.attempts,
             error=safe_message(status["error"]) if status.get("error") else None,
-            wait_reason="Cancellation requested on Kaggle" if remote == "CANCEL_REQUESTED" else None,
+            wait_reason=f"Cancellation requested on {attempt.account}"
+            if status["state"] == "cancelling"
+            else None,
             next_action_at=now + self.config.poll_seconds,
         )
         if state in TERMINAL:
             changes["finished_at"] = now
-            self.inventory.pop(attempt.ref.lower(), None)
+            self.discovery[attempt.account].runs.pop(attempt.ref.lower(), None)
         self.store.update(job.id, **changes)
 
-    def _refresh_inventory(self):
+    def _refresh_inventory(self, account):
+        found = self.discovery[account]
         now = time.time()
-        if now < self.discovery_retry_at:
+        if now < found.retry_at:
             return
-        if self.inventory_at is not None and now - self.inventory_at < self.config.discovery_seconds:
+        if found.checked_at is not None and now - found.checked_at < self.config.discovery_seconds:
             return
         try:
-            self.store.heartbeat(state="running", stage="discovering account runs")
-            self.inventory = {ref.lower(): kind for ref, kind in self.backend.active_runs().items()}
-            self.inventory_at = now
-            self.inventory_error = None
+            self.store.heartbeat(state="running", stage=f"discovering runs on {account}")
+            found.runs = {ref.lower(): kind for ref, kind in self.provider(account).active_runs().items()}
+            found.checked_at = now
+            found.error = None
         except Exception as error:
-            self.inventory_error = safe_message(error)
-            self.discovery_retry_at = now + self.config.retry_seconds
+            found.error = safe_message(error)
+            found.retry_at = now + self.config.retry_seconds
 
-    def _counts(self):
-        jobs = [j for j in self.store.list(ACTIVE) if outstanding(j)]
-        refs = {j.remote_ref.lower() for j in jobs}
-        counts = {"cpu": sum(not j.spec.gpu for j in jobs), "gpu": sum(j.spec.gpu for j in jobs)}
-        for ref, resource in self.inventory.items():
-            if ref not in refs:
-                for kind in ("cpu", "gpu"):
-                    if resource in {kind, "unknown"}:
-                        counts[kind] += 1
-        return counts
+    def _full(self, account, pool, *, reserve=False):
+        count = occupancy(self.store.list(ACTIVE), account, self.discovery[account].runs)[pool]
+        if reserve:
+            # Jobs already preparing there take the next slots.
+            count += sum(
+                job.account == account and job.spec.gpu == (pool == "gpu")
+                for job in self.store.list({"preparing"})
+            )
+        return count >= getattr(self.config.account(account), pool + "_limit")
 
-    def _full(self, pool):
-        return self._counts()[pool] >= getattr(self.config, pool + "_limit")
-
-    def _hold(self, job, reason, **changes):
-        """Keep a pending job queued, with a visible reason."""
-        if changes or job.wait_reason != reason:
-            self.store.update(job.id, expected=PENDING, wait_reason=reason, **changes)
-
-    def _gpu_quota_problem(self):
-        try:
-            gpu = self.backend.quota().get("gpu")
-        except Exception as error:
-            return "GPU quota unavailable", safe_message(error)
-        if gpu is None or gpu["available_seconds"] <= 0:
-            return "Waiting for available GPU quota", None
+    def _obstacle(self, account, pool, *, reserve=False):
+        """Why no new run can start on the account now, as (reason, hold changes); None if one can."""
+        self._refresh_inventory(account)
+        found = self.discovery[account]
+        if found.checked_at is None or found.error:
+            return f"Run discovery on {account} unavailable; waiting before new launches", {}
+        if self._full(account, pool, reserve=reserve):
+            return waiting_for_capacity(account, pool), {}
+        if pool == "gpu":
+            retry = time.time() + self.config.retry_seconds
+            try:
+                gpu = self.provider(account).quota().get("gpu")
+            except Exception as error:
+                changes = dict(error=safe_message(error), next_action_at=retry)
+                return f"GPU quota on {account} unavailable", changes
+            found.gpu_seconds = gpu["available_seconds"] if gpu else 0
+            if found.gpu_seconds <= 0:
+                return f"Waiting for available GPU quota on {account}", dict(error=None, next_action_at=retry)
         return None
 
+    def _alternative(self, job, pool, targets):
+        """The first other account, in preference order, that can start the job now.
+
+        targets caches each account's availability for this cycle. Work already preparing
+        there counts, so a burst moves no more jobs than an account can start.
+        """
+        for account in self.config.accounts:
+            key = (account.id, pool)
+            if account.id == job.account:
+                continue
+            if key not in targets:
+                targets[key] = self._obstacle(account.id, pool, reserve=True) is None
+            if not targets[key]:
+                continue
+            try:
+                self.provider(account.id).check(job.spec)
+            except ValueError:
+                continue
+            return account.id
+        return None
+
+    def _hold(self, job, reason, suggested=None, **changes):
+        """Keep a pending job queued, with a visible reason and an account that could start it now."""
+        if changes or job.wait_reason != reason or job.suggested_account != suggested:
+            self.store.update(
+                job.id, expected=PENDING, wait_reason=reason, suggested_account=suggested, **changes
+            )
+
     def _dispatch(self, pending):
-        blocked_pools = set()
+        # Jobs wait in order within each account's resource pool; blocked records why.
+        blocked, targets = {}, {}
+        configured = {account.id for account in self.config.accounts}
         for original in pending:
             if self.stop_event.is_set():
                 break
@@ -245,37 +330,50 @@ class Worker:
             if job.state not in PENDING:
                 continue
             pool = "gpu" if job.spec.gpu else "cpu"
+            if job.account not in configured:
+                self.store.update(
+                    job.id,
+                    expected=PENDING,
+                    state="blocked",
+                    error=f"Account {job.account} is not configured; add it or move the job",
+                )
+                continue
+            key = (job.account, pool)
             if job.next_action_at > time.time():
-                blocked_pools.add(pool)
-                continue
-            if self.inventory_at is None or self.inventory_error:
-                self._hold(job, "Account discovery unavailable; waiting before new launches")
-                continue
-            if pool in blocked_pools or self._full(pool):
-                blocked_pools.add(pool)
-                self._hold(job, f"Waiting for {pool.upper()} capacity")
-                continue
-            if job.spec.gpu and (problem := self._gpu_quota_problem()):
-                reason, error = problem
-                self._hold(job, reason, error=error, next_action_at=time.time() + self.config.retry_seconds)
-                blocked_pools.add(pool)
-                continue
-            if job.owner != self.config.owner:
-                self.store.update(job.id, state="blocked", error="Job owner differs from worker account")
-                continue
+                blocked.setdefault(key, waiting_for_capacity(*key))
+                if job.state != "queued":
+                    continue
+                # Backing off, e.g. after the provider rejected a launch for capacity or quota.
+                problem = job.wait_reason or blocked[key], {}
+            elif key in blocked:
+                problem = blocked[key], {}
+            elif problem := self._obstacle(job.account, pool):
+                blocked[key] = problem[0]
+            if problem:
+                reason, changes = problem
+                target = self._alternative(job, pool, targets) if self.config.failover != "off" else None
+                # A job that started uploading stays, so jobs do not bounce between accounts.
+                if not (target and self.config.failover == "auto" and job.state == "queued"):
+                    self._hold(job, reason, target, **changes)
+                    continue
+                job = place(self.store, job.id, target, f"Moved from {job.account}: {reason}")
+                targets.pop((target, pool))
+                if job is None:
+                    continue
+                key = (job.account, pool)
             if not self._prepare(job):
                 if self.store.get(job.id).state in PENDING:
-                    blocked_pools.add(pool)
+                    blocked.setdefault(key, waiting_for_capacity(*key))
                 continue
             job = self.store.get(job.id)
             if job.state != "preparing":
                 continue
-            # Recheck occupancy after uploads; external changes can still race, and Kaggle is authoritative.
-            self._refresh_inventory()
-            if self.inventory_error or self._full(pool):
+            # Recheck occupancy after uploads; external changes can still race; the provider is authoritative.
+            self._refresh_inventory(job.account)
+            if self.discovery[job.account].error or self._full(job.account, pool):
                 continue
-            if not self._push(job):
-                blocked_pools.add(pool)
+            if not self._submit(job):
+                blocked.setdefault(key, waiting_for_capacity(*key))
 
     def _prepare(self, job):
         job = self.store.update(
@@ -284,9 +382,11 @@ class Worker:
             state="preparing",
             error=None,
             wait_reason="Preparing private inputs",
+            suggested_account=None,
         )
         if job is None:
             return False
+        provider = self.provider(job.account)
         refs = dict(job.upload_refs)
         try:
             bundles = {"input:" + alias: bundle for alias, bundle in job.snapshot["inputs"].items()}
@@ -298,7 +398,7 @@ class Worker:
                 if self.store.get(job.id).state != "preparing":
                     return False
                 self.store.heartbeat(state="running", stage="uploading", job_id=job.id)
-                ref = self.backend.ensure_bundle(bundle)
+                ref = provider.ensure_bundle(bundle)
                 if ref is None:
                     self.store.update(
                         job.id,
@@ -313,7 +413,7 @@ class Worker:
             for ref in job.spec.datasets:
                 key = "dataset:" + ref
                 if key not in refs:
-                    refs[key] = self.backend.resolve_dataset(ref)
+                    refs[key] = provider.resolve_dataset(ref)
                     self.store.update(job.id, expected={"preparing"}, upload_refs=refs)
             return self.store.get(job.id).state == "preparing"
         except Exception as error:
@@ -332,18 +432,17 @@ class Worker:
             )
             return False
 
-    def _push(self, job):
+    def _submit(self, job):
+        provider = self.provider(job.account)
         number = len(job.attempts) + 1
-        name = re.sub(r"[^a-z0-9]+", "-", job.spec.name.lower())[:16].strip("-") or "workload"
-        ref = f"{job.owner}/kgr-{name}-{job.id[:12]}-a{number}"
-        attempt = Attempt(number=number, ref=ref)
-        job.attempts.append(attempt)
-        # The stage is local. A crash before the atomic state update cannot have submitted anything.
+        # Staging is local. A crash before the atomic state update cannot have submitted anything.
         try:
-            folder = prepare_kernel(job, self.config.state_dir)
+            ref = provider.stage(job, number)
         except Exception as error:
             self.store.update(job.id, expected={"preparing"}, state="blocked", error=safe_message(error))
             return True
+        attempt = Attempt(number=number, account=job.account, ref=ref, url=provider.url(ref))
+        job.attempts.append(attempt)
         job = self.store.update(
             job.id,
             expected={"preparing"},
@@ -356,13 +455,7 @@ class Worker:
         if job is None:
             return True
         try:
-            result = self.backend.push(
-                folder, timeout_seconds=job.spec.timeout_seconds, accelerator=job.spec.accelerator
-            )
-            if result["ref"].lower() != ref.lower():
-                raise RemoteError(
-                    "Kaggle returned an unexpected notebook identity; reconcile manually", "uncertain"
-                )
+            result = provider.submit(job)
         except RemoteError as error:
             attempt.error = safe_message(error)
             attempt.state = "rejected" if error.definitive else "uncertain"
@@ -407,7 +500,7 @@ class Worker:
 
     def _collect(self, job_id):
         try:
-            collect_outputs(self.store, self.backend, job_id)
+            collect_outputs(self.store, self.provider, job_id)
         except Exception as error:
             logger.warning("Output collection for %s: %s", job_id, safe_message(error))
 

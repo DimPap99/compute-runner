@@ -11,7 +11,7 @@ def test_cli_init_dry_run_and_submit(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
-    result = runner.invoke(app, ["--json", "init", "--owner", "tester"])
+    result = runner.invoke(app, ["--json", "account", "add", "kaggle", "tester"])
     assert result.exit_code == 0, result.output
     script = tmp_path / "hello.py"
     script.write_text("print(42)")
@@ -31,7 +31,7 @@ def test_cli_status_redacts_nonsecret_environment_values(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
-    assert runner.invoke(app, ["--json", "init", "--owner", "tester"]).exit_code == 0
+    assert runner.invoke(app, ["--json", "account", "add", "kaggle", "tester"]).exit_code == 0
     script = tmp_path / "hello.py"
     script.write_text("print(42)")
     yaml = tmp_path / "job.yaml"
@@ -49,7 +49,7 @@ def test_cli_rejected_secret_env_does_not_echo_value(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
-    assert runner.invoke(app, ["--json", "init", "--owner", "tester"]).exit_code == 0
+    assert runner.invoke(app, ["--json", "account", "add", "kaggle", "tester"]).exit_code == 0
     script = tmp_path / "hello.py"
     script.write_text("print(42)")
     yaml = tmp_path / "job.yaml"
@@ -75,17 +75,22 @@ def test_yaml_expands_home_directory(tmp_path, monkeypatch):
     assert load_specs(config)[0].source == tmp_path / "home/project"
 
 
-def test_init_keeps_configured_limits(tmp_path, monkeypatch):
+def test_settings_and_account_limits_persist(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
-    assert runner.invoke(app, ["init", "--owner", "tester"]).exit_code == 0
-    assert Client().backend.strict is False  # Permissive unless requested.
-    assert runner.invoke(app, ["init", "--owner", "tester", "--cpu-limit", "2", "--strict"]).exit_code == 0
-    assert runner.invoke(app, ["init", "--owner", "tester"]).exit_code == 0
+    assert runner.invoke(app, ["account", "add", "kaggle", "tester"]).exit_code == 0
+    assert Client().provider().strict is False  # Permissive unless requested.
+    assert runner.invoke(app, ["account", "add", "kaggle", "tester", "--cpu-limit", "2"]).exit_code == 0
+    assert runner.invoke(app, ["init", "--strict", "--failover", "auto"]).exit_code == 0
+    assert runner.invoke(app, ["account", "add", "kaggle", "tester"]).exit_code == 0
+    assert runner.invoke(app, ["init"]).exit_code == 0
     saved = json.loads((tmp_path / "config/config.json").read_text())
-    assert saved["cpu_limit"] == 2 and saved["strict"] is True
-    assert Client().backend.strict is True
+    assert [(a["user"], a["cpu_limit"]) for a in saved["accounts"]] == [("tester", 2)]
+    assert saved["strict"] is True and saved["failover"] == "auto"
+    assert Client().provider().strict is True
+    result = runner.invoke(app, ["init", "--failover", "sometimes"])
+    assert isinstance(result.exception, ValueError) and "failover" in str(result.exception)
 
 
 def test_service_escapes_paths_and_uses_venv(setup):

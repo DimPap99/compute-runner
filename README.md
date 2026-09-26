@@ -2,7 +2,7 @@
 
 Submit, monitor, and resume Python workloads through a local Python API or CLI.
 
-Currently support only Kaggle.
+Jobs run on provider accounts you connect. Kaggle is the only provider adapter today; you can connect several Kaggle accounts, and a job that cannot start on one can move to another.
 
 A background worker manages uploads, execution status, resource admission, and output downloads. Jobs and submission attempts are stored in SQLite. Source files are snapshotted when a job is submitted. Resuming training requires checkpoint support in the workload.
 
@@ -12,8 +12,8 @@ The agent interface provides compact JSON responses, persistent batches, idempot
 
 - Python 3.12 or later
 - Linux with `systemd --user` for the background service
-- Kaggle credentials available to the user running the worker
-- A Kaggle account with access to the requested compute resources and datasets
+- Credentials for each connected account, readable by the user running the worker
+- Accounts with access to the requested compute resources and datasets
 
 The worker can also run in a terminal without systemd. Local process locking uses `fcntl`.
 
@@ -27,12 +27,12 @@ python3 -m venv .venv
 .venv/bin/pip install -e . --no-deps
 source .venv/bin/activate
 
-compute-runner init --owner YOUR_KAGGLE_USERNAME
+compute-runner account add kaggle YOUR_KAGGLE_USERNAME
 compute-runner doctor
 compute-runner service install
 ```
 
-`compute-runner init` saves the account name, local scheduling limits, and [strict mode](#strict-mode). Rerunning it changes only the options you pass. It does not configure Kaggle credentials. `compute-runner doctor` checks the local configuration, remote quota information, and active runs. Use `compute-runner doctor --offline` for local checks only.
+`compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](#accounts-and-failover). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
 
 `compute-runner` is the primary command; `kgr` remains an alias for existing scripts. Python callers import `compute_runner`.
 
@@ -68,6 +68,42 @@ compute-runner --json status JOB_ID
 ```
 
 These commands return full records. Use `compute-runner agent` for bounded responses intended for automation.
+
+## Accounts and failover
+
+An account is one set of credentials on one provider. Its ID is `PROVIDER:USER`, such as `kaggle:alice`. Accounts are kept in order of preference, and the first is the default for new jobs:
+
+```bash
+compute-runner account add kaggle alice                   # standard Kaggle credentials
+compute-runner account add kaggle bob --credentials ~/.config/kaggle-bob/kaggle.json --gpu-limit 1
+compute-runner account add kaggle bob --default          # prefer bob from now on
+compute-runner account list
+compute-runner account remove kaggle:bob
+```
+
+Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone and can hold a `kaggle.json` username and key or a Kaggle access token. Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it.
+
+Each job records its account, and each attempt records the account, remote reference, and URL it ran on. Choose an account with `--account` on `submit` and `retry`, or move a job that has not been submitted yet:
+
+```bash
+compute-runner submit train.py --gpu --account kaggle:bob
+compute-runner move JOB_ID --account kaggle:alice
+```
+
+When a waiting job cannot start on its account, because its slots are busy, its GPU quota is exhausted, or the account cannot be checked, the failover policy decides what happens:
+
+| Policy | Behavior |
+| --- | --- |
+| `off` | The job waits on its account |
+| `ask` (default) | The job waits and shows `suggested_account`: the first other account, in preference order, that can start it now. An agent asks the user before moving it |
+| `auto` | The worker moves the job to that account and records `Moved from ACCOUNT: reason` |
+
+```bash
+compute-runner init --failover auto
+compute-runner service restart
+```
+
+Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account. Moving a job uploads its inputs again, because private datasets belong to one account. Runs that have started never move; continue a stopped resumable run with a new submission on another account, as described in [Optional resumable training](#optional-resumable-training).
 
 ## Workload configuration
 
@@ -106,17 +142,17 @@ Source and input paths are relative to the YAML file. Entrypoint and requirement
 | `args` | `[]` | Arguments passed to the workload |
 | `env` | `{}` | Persisted, nonsecret environment values |
 | `gpu` | `false` | Request a GPU |
-| `accelerator` | Unset | NVIDIA accelerator ID. Setting this also enables GPU use |
+| `accelerator` | Unset | Provider accelerator ID; Kaggle accepts NVIDIA IDs. Setting this also enables GPU use |
 | `internet` | `false` | Enable network access in the workload |
-| `timeout_seconds` | `43200` | Requested session timeout, from 1 to 43200 seconds |
-| `datasets` | `[]` | Existing datasets as `owner/slug` or `owner/slug/version` |
+| `timeout_seconds` | `43200` | Requested session timeout; Kaggle accepts 1 to 43200 seconds |
+| `datasets` | `[]` | Existing provider datasets; on Kaggle `owner/slug` or `owner/slug/version` |
 | `inputs` | `{}` | Named local files or directories to upload as private datasets |
 | `requirements` | Unset | Included requirements file to install with pip. Requires internet access |
 | `exclude` | `[]` | Additional source exclusion patterns |
 | `auto_download` | `true` | Download outputs after execution terminates |
 | `output_patterns` | Unset | Glob filters for remote output paths. Unset selects all files |
 
-Unknown fields are rejected. Input names must be unique ignoring case. Environment names beginning with `KGR_` are reserved.
+Unknown fields are rejected. Input names must be unique ignoring case. Environment names beginning with `KGR_` are reserved. Provider-specific values are checked against the job's account when it is submitted or moved.
 
 For a batch, put workload mappings under `jobs`:
 
@@ -134,7 +170,7 @@ jobs:
 
 A batch accepts 1 to 1000 jobs. Every source and local input is snapshotted before the jobs are committed in one database transaction. A snapshot or database failure leaves none of that batch's jobs queued. Unused local bundles may remain. Jobs execute independently after the commit.
 
-Both submit commands accept `--entrypoint`, `--module`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, and repeated `--arg` options. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
+Both submit commands accept `--entrypoint`, `--module`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, `--account`, and repeated `--arg` options. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
 
 ### Packaging and runtime
 
@@ -156,7 +192,7 @@ The workload uses Kaggle's Python environment. A configured requirements file is
 
 Resumability is a workload-code decision, not a runner default. When an agent is preparing a stateful workload and the user's choice is unclear, the bundled skill tells it to ask whether the job should be resumable. If the answer is yes and no cadence was given, it then asks whether to checkpoint by elapsed minutes or completed epochs and for the interval. An explicit non-resumable choice is respected.
 
-Resumable scripts should expose `--resume auto|required|never|PATH`, `--checkpoint-mode minutes|epochs`, and `--checkpoint-every NUMBER`. Write checkpoints below `KGR_OUTPUT_DIR/checkpoints`; attach a downloaded checkpoint directory to a replacement job as the named input `resume`, which becomes `KGR_INPUT_RESUME`. Use `required` for an intended continuation so a missing or invalid checkpoint cannot silently restart training.
+Resumable scripts should expose `--resume auto|required|never|PATH`, `--checkpoint-mode minutes|epochs`, and `--checkpoint-every NUMBER`. Write checkpoints below `KGR_OUTPUT_DIR/checkpoints`; attach a downloaded checkpoint directory to a replacement job as the named input `resume`, which becomes `KGR_INPUT_RESUME`. Use `required` for an intended continuation so a missing or invalid checkpoint cannot silently restart training. The replacement can run on another account, for example when the first account's GPU quota is exhausted: submit it with `--account`.
 
 The skill includes a framework-neutral helper at `skills/compute-runner/assets/checkpointing.py`. It provides cadence checks, atomic numbered files, a checksummed `latest.json`, compatibility validation, and resume discovery. Training code must still serialize and restore its framework-specific model, optimizer, scheduler, scaler, progress, RNG, and data-loader state. See `skills/compute-runner/references/resumability.md` for the complete agent and migration contract.
 
@@ -189,24 +225,26 @@ print(finished.state, finished.download_state, finished.result_dir)
 | Method | Behavior |
 | --- | --- |
 | `preview(spec)` | Return the selected files, sizes, inputs, and resource settings without uploading |
-| `submit(spec, request_key=None)` | Queue one job and return its record |
-| `submit_many(specs, request_key=None)` | Queue a batch and return its jobs in input order |
-| `submit_batch(specs, request_key=None)` | Queue a batch and return a `BatchRecord` |
+| `submit(spec, request_key=None, account=None)` | Queue one job and return its record |
+| `submit_many(specs, request_key=None, account=None)` | Queue a batch and return its jobs in input order |
+| `submit_batch(specs, request_key=None, account=None)` | Queue a batch and return a `BatchRecord` |
 | `batch(batch_id)` | Read a batch and its current job records |
 | `get(job_id)`, `list(states=None)` | Read saved job records |
 | `wait(job_id, timeout=None, downloads=True)` | Wait for execution and downloads. Return early for blocked or unresolved work, or when output collection failed |
 | `logs(job_id, follow=False)` | Yield persisted logs of a finished run, a bounded snapshot of an unfinished one, or follow the remote log stream |
 | `download(job_id)` | Collect outputs from a submitted job whose execution has terminated |
-| `retry(job_id, request_key=None)` | Create a job from the original saved files and settings |
-| `retry_batch(job_id, request_key=None)` | Create a retry and return its single-job batch |
-| `cancel(job_id)` | Cancel pending work locally, or ask Kaggle to stop a running job |
+| `retry(job_id, request_key=None, account=None)` | Create a job from the original saved files and settings, on the original account unless one is given |
+| `retry_batch(job_id, request_key=None, account=None)` | Create a retry and return its single-job batch |
+| `move(job_id, account)` | Place a job that has not been submitted on another account |
+| `cancel(job_id)` | Cancel pending work locally, or ask the provider to stop a running job |
 | `resolve_not_submitted(job_id)` | Record an operator's confirmation that an unresolved attempt created no remote execution |
-| `quota()` | Query accelerator quota information |
+| `quota(account=None)` | Query one account's accelerator quota, or every account's |
+| `provider(account=None)` | Return the provider adapter for an account |
 | `worker_health()` | Read worker lock ownership and heartbeat data |
 | `worker()` | Construct a worker for this configuration |
 | `agent()` | Return the compact automation interface |
 
-Use complete job IDs with `Client`. Optional parameters shown after the first argument are keyword arguments. Creating a client or reading local state does not authenticate to Kaggle. Submission is local, while logs, downloads, and quota queries access Kaggle when needed.
+Use complete job IDs with `Client`. Optional parameters shown after the first argument are keyword arguments. Creating a client or reading local state does not authenticate to any provider. Submission is local, while logs, downloads, and quota queries contact the job's provider when needed.
 
 `wait` raises `TimeoutError` when its local wait deadline expires. This does not cancel the job. With `downloads=False`, it returns after execution terminates. A blocked or uncertain job is returned for inspection, as is a finished job whose `download_state` is `error`; the worker keeps retrying that download. Waiting raises an error once no worker has run for 30 seconds.
 
@@ -224,6 +262,8 @@ compute-runner agent changes --batch BATCH_ID --after 0
 compute-runner agent logs JOB_ID --tail 50 --max-bytes 8192
 compute-runner agent wait --batch BATCH_ID --timeout 300
 compute-runner agent outputs JOB_ID
+compute-runner agent accounts
+compute-runner agent move JOB_ID --account kaggle:bob
 compute-runner agent health
 ```
 
@@ -243,6 +283,14 @@ Retries use the original saved files:
 compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 ```
 
+`agent submit` and `agent retry` accept `--account`. An explicit account is part of the request, so a replay must repeat it; requests without one keep their original fingerprint.
+
+### Accounts
+
+`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used` and `limit`), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check, and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
+
+`agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs stay where they are; `not_moved` lists jobs the target account cannot run.
+
 ### Status and pagination
 
 Status, submit, retry, and cancel responses contain `schema_version`, `batch_id`, `total`, `counts`, `jobs`, `next_offset`, and `worker`. Submit and retry also return `replayed`.
@@ -259,11 +307,13 @@ Each job summary contains:
 | Field | Meaning |
 | --- | --- |
 | `id`, `name`, `state` | Job identity and current execution state |
+| `account` | Account the job runs on |
 | `batch_id`, `batch_index` | Batch membership and zero-based input position |
 | `resource`, `internet` | CPU or GPU configuration and network setting |
 | `downloads`, `outputs_ready` | Download state and completion flag |
-| `url` | Kaggle notebook URL, when an attempt exists |
+| `url` | Provider URL of the run, when an attempt exists |
 | `reason`, `error`, `download_error` | Available diagnostic messages, limited to 400 characters each |
+| `suggested_account` | Another account that can start a waiting job now (failover `ask`) |
 | `output_dir` | Local results directory after downloads complete |
 | `parent_id` | Original job ID for a retry |
 
@@ -341,14 +391,16 @@ cursor = page["cursor"]
 
 | Method | Result |
 | --- | --- |
-| `submit(specs, request_key=...)` | Batch status and replay flag |
+| `submit(specs, request_key=..., account=None)` | Batch status and replay flag |
 | `preview(specs)` | Aggregate upload inventory |
 | `status(job_ids=None, batch_id=None, states=None, limit=20, offset=0)` | Paginated job summaries and counts |
 | `changes(after=0, batch_id=None, limit=20)` | Changed jobs and the next event cursor |
 | `logs(job_id, tail=50, max_bytes=8192, refresh=False)` | Bounded text and cache metadata |
 | `wait(job_ids=None, batch_id=None, timeout=300, downloads=True, limit=20)` | Status once the selection settles or the timeout passes |
 | `outputs(job_id, limit=100, offset=0)` | Downloaded file listing |
-| `retry(job_id, request_key=...)` | Retry batch status and replay flag |
+| `accounts()` | Accounts, failover policy, slots in use, and last known GPU quota |
+| `move(job_ids=None, batch_id=None, account=..., limit=20)` | Status of the selection and the number moved |
+| `retry(job_id, request_key=..., account=None)` | Retry batch status and replay flag |
 | `cancel(job_id)` | Updated job status. Repeated cancellation of a cancelled job is accepted |
 | `health()` | Worker lock and heartbeat summary |
 
@@ -367,7 +419,7 @@ Agents without skill support can be pointed at `SKILL.md` directly. The skill ex
 
 ## Worker configuration
 
-`compute-runner service install` enables and starts `compute-runner.service` as a systemd user service. It starts on login and restarts after a process failure. Installation does not enable user lingering, so processing may stop after logout. The host must remain running and connected to submit jobs and collect results. Submitted Kaggle jobs continue remotely and are reconciled when the worker resumes.
+`compute-runner service install` enables and starts `compute-runner.service` as a systemd user service. It starts on login and restarts after a process failure. Installation does not enable user lingering, so processing may stop after logout. The host must remain running and connected to submit jobs and collect results. Submitted jobs continue remotely and are reconciled when the worker resumes.
 
 ```bash
 compute-runner service status
@@ -382,21 +434,23 @@ Use `compute-runner worker run` to run in the foreground, or `compute-runner wor
 
 | Setting | Default |
 | --- | --- |
-| Managed CPU concurrency | 5 |
-| Managed GPU concurrency | 1 |
+| Managed CPU concurrency per account | 5 |
+| Managed GPU concurrency per account | 1 |
+| Failover policy | `ask` |
 | Status polling interval | 30 seconds |
 | Account discovery interval | 300 seconds |
 | Workload visibility | Private |
 | Strict mode | Off |
 
-Set resource limits, polling, and strict mode through `compute-runner init`, then restart the worker. Omitted options keep their saved values:
+Set an account's resource limits through `compute-runner account add`, and failover, polling, and strict mode through `compute-runner init`, then restart the worker. Omitted options keep their saved values:
 
 ```bash
-compute-runner init --owner YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1 --poll-seconds 30
+compute-runner account add kaggle YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1
+compute-runner init --failover ask --poll-seconds 30
 compute-runner service restart
 ```
 
-A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
+A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
 Dataset preparation and uploads run in the dispatcher and can extend a polling cycle. Output downloads run separately.
 
@@ -405,7 +459,7 @@ Dataset preparation and uploads run in the dispatcher and can extend a polling c
 Strict mode is off by default, so ordinary workload output and network setups work unchanged. Turn it on when logs or downloads must be locked down, then restart the worker:
 
 ```bash
-compute-runner init --owner YOUR_KAGGLE_USERNAME --strict      # --no-strict turns it off again
+compute-runner init --strict      # --no-strict turns it off again
 compute-runner service restart
 ```
 
@@ -425,13 +479,14 @@ Error messages saved with jobs always receive the strict redaction, because they
 | Unresolved remote execution | Set `needs_attention` and continue reserving capacity |
 | Workload failure | Set `failed` and collect available outputs without rerunning the computation |
 | Nonretryable upload or authentication error | Set `blocked` and retain the diagnostic message |
+| Job's account no longer configured | Set `blocked`; add the account again or move the job |
 | Download failure | Preserve execution status and retry output collection independently after 1, 2, 4, … minutes, then hourly |
 
 Each attempt records its notebook slug before the remote request. The worker creates a new slug for each attempt and does not overwrite an existing experiment notebook.
 
 `retry` accepts a terminal or blocked job when no execution remains outstanding. It uses saved snapshots. Submit a new workload to change the code or settings.
 
-For an unresolved submission, inspect its Kaggle URL first. If no remote execution exists, record that confirmation before retrying:
+For an unresolved submission, inspect its URL first. If no remote execution exists, record that confirmation before retrying:
 
 ```bash
 compute-runner resolve JOB_ID --not-submitted
@@ -442,7 +497,7 @@ compute-runner agent retry JOB_ID --request-key resolved-retry-v1
 
 `compute-runner logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
 
-`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on Kaggle` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
+`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
 ## State and outputs
 
@@ -456,9 +511,9 @@ Default locations:
 | `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
 | `~/.local/share/compute-runner/results/JOB_ID/` | Downloaded files and provenance |
 
-Global `--config-dir` and `--state-dir` options select alternate CLI locations. Python callers can use `Client(config=Config(...))` or a `state_dir` override. Each state directory is bound to one Kaggle account.
+Global `--config-dir` and `--state-dir` options select alternate CLI locations. Python callers can use `Client(config=Config(...))` or a `state_dir` override. One state directory can hold jobs for several accounts.
 
-`COMPUTE_RUNNER_CONFIG_DIR` and `COMPUTE_RUNNER_STATE_DIR` select alternate default directories; the older `KGR_CONFIG_DIR` and `KGR_STATE_DIR` variables remain supported. Existing installations are discovered automatically when the new default locations contain no configuration or queue. Installation of the renamed service disables the previous managed service so only one worker owns the queue. Workload-facing `KGR_*` variables, bundle formats, and remote artifact IDs remain stable for saved jobs and training scripts.
+Configurations and job records saved by single-account versions are read as the account `kaggle:OWNER`; their URLs and request keys keep working. `COMPUTE_RUNNER_CONFIG_DIR` and `COMPUTE_RUNNER_STATE_DIR` select alternate default directories; the older `KGR_CONFIG_DIR` and `KGR_STATE_DIR` variables remain supported. Existing installations are discovered automatically when the new default locations contain no configuration or queue. Installation of the renamed service disables the previous managed service so only one worker owns the queue. Workload-facing `KGR_*` variables, bundle formats, and remote artifact IDs remain stable for saved jobs and training scripts.
 
 A completed download has this layout:
 
@@ -503,8 +558,23 @@ Back up the database before upgrading. To restore an older application version, 
 .venv/bin/python -m compileall -q src
 ```
 
-Tests use a fake Kaggle backend and local execution of generated launchers. They cover scheduling, restart recovery, submission ambiguity, batch transactions, idempotency, cursor pagination, packaging, downloads, and CLI behavior. Automated tests do not create remote resources.
+Tests use a Kaggle adapter with simulated network calls and local execution of generated launchers. They cover scheduling, restart recovery, submission ambiguity, batch transactions, idempotency, cursor pagination, packaging, downloads, and CLI behavior. Automated tests do not create remote resources.
 
-The adapter pins `kaggle==2.2.4` and `kagglesdk==0.1.37`. SDK transport retries are disabled. The worker determines whether a remote operation can be retried. The Kaggle client is imported when a remote operation is required.
+### Adding a provider
+
+The queue talks to providers only through the `Provider` protocol in `src/compute_runner/providers/__init__.py`, one instance per account; `connect()` chooses the adapter by `Account.provider`. An adapter:
+
+| Method | Contract |
+| --- | --- |
+| `check(spec)` | Raise `ValueError` for a specification the provider cannot run |
+| `ensure_bundle(bundle)`, `resolve_dataset(ref)` | Make local snapshots and hosted datasets available; `None` while a bundle is still processing |
+| `stage(job, number)` | Build the attempt's launch package locally and return its deterministic remote reference |
+| `submit(job)` | Launch the staged attempt; raise `RemoteError` with `definitive=True` only when nothing was launched |
+| `status(ref)` | Return a state of `queued`, `running`, `cancelling`, `succeeded`, `failed`, or `cancelled` (or `None`), the raw provider state, and an error |
+| `url`, `cancel`, `active_runs`, `quota`, `logs`, `live_log`, `download` | Links, cancellation, capacity discovery, quota, logs, and outputs |
+
+The reference returned by `stage` is saved before `submit` runs, so an interrupted submission is reconciled through `status` rather than launched twice. Workloads read the provider-neutral `KGR_*` runtime variables; `providers/downloads.py` verifies outputs exposed as signed HTTPS URLs.
+
+The Kaggle adapter pins `kaggle==2.2.4` and `kagglesdk==0.1.37`. SDK transport retries are disabled. The worker determines whether a remote operation can be retried. The Kaggle client is imported when a remote operation is required.
 
 Example workloads are under [examples](examples). The GPU smoke test requires `--gpu --internet`. Running examples on Kaggle creates private resources and uses the corresponding compute allocation. See [VALIDATION.md](VALIDATION.md) for recorded test results and live checks.

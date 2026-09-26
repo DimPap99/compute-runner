@@ -1,8 +1,8 @@
 """Submit and observe compute workloads without authentication side effects on import."""
 
-from .models import BatchRecord, Config, JobRecord, JobSpec
+from .models import Account, BatchRecord, Config, JobRecord, JobSpec
 
-__all__ = ["AgentClient", "BatchRecord", "Client", "Config", "JobRecord", "JobSpec"]
+__all__ = ["Account", "AgentClient", "BatchRecord", "Client", "Config", "JobRecord", "JobSpec"]
 
 
 def __getattr__(name):

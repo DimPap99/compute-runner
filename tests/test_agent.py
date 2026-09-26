@@ -25,7 +25,7 @@ def test_request_replay_survives_restart_missing_source_and_completion(setup):
         client.store.update(job.id, next_action_at=0)
     client.worker().tick()
     spec.source.unlink()
-    restarted = Client(config=client.config, backend=backend).agent()
+    restarted = Client(config=client.config, providers={"kaggle:tester": backend}).agent()
     replay = restarted.submit([spec, spec], request_key="experiment-v1")
     assert replay["batch_id"] == first["batch_id"] and replay["replayed"]
     assert replay["counts"] == {"succeeded": 2}
@@ -51,7 +51,7 @@ def test_concurrent_replays_commit_one_batch(setup):
     barrier = Barrier(6)
 
     def submit(_):
-        other = Client(config=client.config, backend=backend)
+        other = Client(config=client.config, providers={"kaggle:tester": backend})
         barrier.wait()
         return other.submit_batch([spec] * 3, request_key="parallel")
 
@@ -300,7 +300,7 @@ def test_cli_agent_batch_workflow_and_structured_errors(setup, tmp_path, monkeyp
     assert len(backend.pushes) == 2
     running_log = command(["logs", job_id])
     assert running_log["text"] == "epoch 1\n" and running_log["live"]
-    assert command(["cancel", job_id])["jobs"][0]["reason"] == "Cancellation requested on Kaggle"
+    assert command(["cancel", job_id])["jobs"][0]["reason"] == "Cancellation requested on kaggle:tester"
     backend.cancel_error = ValueError("No session ID in this run's log yet")
     assert "No session ID" in command(["cancel", first["jobs"][1]["id"]], code=1)["error"]
     assert "error" in command(["status", "--limit", "101"], code=1)
