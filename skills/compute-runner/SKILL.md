@@ -5,30 +5,33 @@ description: "Submit and monitor workloads with the local Compute Runner queue o
 
 # Compute Runner
 
-Jobs run on accounts the user has connected: Kaggle accounts such as `kaggle:alice`, and machines reached over SSH such as `ssh:lab`. Commands and responses are the same on both. `compute-runner agent accounts` lists them. On an SSH account, set `internet: true` (the machine cannot block network access, and a job without it is refused), use `gpu: true` without an accelerator ID, and give data already on the machine as `inputs: {data: "ssh:/path/on/machine"}` instead of uploading it; submission records it as `ssh:NAME:/path`, and a job elsewhere uses it only as a copy the user approves.
+Jobs run on accounts the user has connected: Kaggle accounts such as `kaggle:alice`, and machines reached over SSH such as `ssh:lab`. Commands and responses are the same on both. `compute-runner agent accounts` lists them. On an SSH account, submit with `--internet` (the machine cannot block network access, and a job without it is refused), use `--gpu` without an accelerator ID, and give data already on the machine as `--input data=ssh:/path/on/machine` instead of uploading it; submission records it as `ssh:NAME:/path`, and a job elsewhere uses it only as a copy the user approves.
 
 Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent status`, which lists the newest jobs first.
 
-## Permissions
+## Let the application do its work
+
+Everything the application offers goes through `compute-runner` commands: packaging and uploading code and data, launching, monitoring, cancelling, moving jobs between accounts, copying datasets, downloading outputs and continuing from checkpoints. Do not do any of it yourself. Do not copy, move, archive or delete files, connect to providers (`ssh`, `scp`, `rsync`, `kaggle`), run the workload locally to try it, or fetch outputs by hand. Use the shell only for `compute-runner`, and read files with your file-reading tools.
 
 | Action | Commands | When |
 | --- | --- | --- |
 | Read state | `agent status`, `changes`, `accounts`, `outputs`, `health`, `wait`, `logs`, `submit --dry-run` | Freely. All are local except `logs`, which can read the provider |
-| Queue requested work | `agent submit` | For work the user asked to run. It spends the account's compute; enable `gpu` or `internet` only when the workload needs them |
+| Queue requested work | `agent submit` | For work the user asked to run. It spends the account's compute; enable `--gpu` or `--internet` only when the workload needs them |
 | Start processing | `compute-runner service start` | When `worker.running` is false and the user's request needs the queue to progress |
 | Choose or change account | `--account` on `submit`/`retry`/`continue`, `agent move` | See [Accounts](#accounts) |
 | Copy a dataset to another account | `agent move --transfer` | Only after the user approves the copy |
 | Rerun | `agent retry` | Only when the user wants a rerun |
 | Continue a stopped resumable run | `agent continue` | When the user wants it continued |
 | Stop work | `agent cancel` | Only work the user wants stopped |
+| Change the user's files | Workload code, a workload YAML | Only after the user approves the change; see below |
 | User decisions | `init`, `service install`/`stop`/`restart`, `account remove`, `resolve --not-submitted` | Only when the user explicitly asks |
-| Accounts and credentials | `account add`, `--trust-new-host`, key, password and Kaggle credential files | Never. The user sets these up; give them the command to run |
+| Accounts and credentials | `account add`, the credentials file, host keys | Never. The user sets these up |
 
-Use the shell only to run `compute-runner` commands. Never run commands that write, move, copy, rename, or delete files or folders (`cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `ln`, `tee`, redirections such as `>`, `sed -i`, and the like), and never reach providers yourself (`ssh`, `scp`, `rsync`, `sftp`, `kaggle`). Read files with your file-reading tools. Create or edit workload code or YAML only when the user asks for it, with your file-editing tools.
+**The user's code.** Change workload code, or add a file to the user's project, only with the user's permission, and say what you will change before you do. This covers adding checkpointing for a resumable job and writing a workload YAML. Submit the workload as it is first: the application checks, packages and ships it. Propose a code change only when the application reports a problem. That means a submission that is refused, a job that is `blocked`, or a run that `failed` with its log pointing at the code. Show the user the error and the fix you suggest, and change the code once they agree. Then submit it again through the application. Do not edit code in advance to work around a problem the application has not reported.
 
-Never read, print, or copy credential files, and never put credentials in workload `env`, `args`, `params`, or source files. Account and credential setup is the user's: when an account is missing or its login fails (an `auth` error, an unknown host key), tell the user what to run, such as `compute-runner account add ssh NAME --host HOST --login USER --key ~/.ssh/KEY --trust-new-host`, and that key, password and credentials files must be `chmod 600`. Never trust a host key or change `known_hosts` for them.
+**Credentials.** Account and credential setup is the user's. Never read, print or copy the credentials file (`~/.config/compute-runner/credentials.json`), key files or `kaggle.json`, and never put credentials in workload `env`, `args`, `params` or source files. When an account is missing or its login fails (an `auth` error or an unknown host key), tell the user what to run, for example `compute-runner account add kaggle NAME --enter-key` or `compute-runner account add ssh NAME --host HOST --login USER --key ~/.ssh/KEY --trust-new-host`. `compute-runner doctor --offline` shows where each account's login comes from, without secrets.
 
-Results are written by the queue, never by you. Do not create, move, copy, rename, or delete anything in a results folder, the state directory, or an SSH machine's work directory, and do not build results paths yourself: every path you need is in a command's response. Never remove a workspace, run folder or dataset, locally or on a machine.
+**Results.** The queue writes results, never you. Do not create, change or delete anything in a results folder, the state directory or an SSH machine's work directory, and do not build results paths yourself: every path you need is in a command's response.
 
 ## Decide resumability
 
@@ -39,7 +42,7 @@ Resumability is an explicit user choice, not a default. For training, optimizati
 - If the user chooses resumable but did not give a checkpoint cadence, ask whether to checkpoint by elapsed minutes or completed epochs and ask for the positive interval. Do not invent a cadence.
 - If the user chooses non-resumable, do not add checkpoint code merely because the job is long.
 
-Do not ask this question for a stateless workload that has no meaningful progress to restore. When resumability is chosen, or when inspecting or migrating an already resumable job, read [references/resumability.md](references/resumability.md) before editing or submitting it. The reusable helper is [assets/checkpointing.py](assets/checkpointing.py); when the user asks for resumable code, adapt its code into the workload source with your file-editing tools rather than assuming `compute_runner` is installed inside the remote session.
+Do not ask this question for a stateless workload that has no meaningful progress to restore. When resumability is chosen, or when inspecting or migrating an already resumable job, read [references/resumability.md](references/resumability.md) before editing or submitting it. Adding checkpointing changes the user's code: describe the change and get their permission first. The reusable helper is [assets/checkpointing.py](assets/checkpointing.py); adapt its code into the workload source rather than assuming `compute_runner` is installed where the job runs.
 
 ## Accounts
 
@@ -55,13 +58,21 @@ When a job cannot start on its account (slots busy, GPU quota exhausted, a launc
 
 Only jobs that have not been submitted can move, and moving uploads their local inputs again.
 
-An account may be unable to read a job's dataset, such as another account's private dataset. When a suggestion needs a copy, the summary also shows `suggested_transfer: true`: tell the user which datasets would be copied to that account and move with `--transfer` only after they approve. A job whose own account cannot read a dataset is `blocked`, and its `error` names an account that can: ask the user whether to move the job there, or to copy the dataset (`compute-runner agent move JOB_ID --account ITS_ACCOUNT --transfer`). The user can allow copies for every job with `compute-runner init --transfer`. Only datasets given as aliased `inputs` can be copied. A job is also `blocked`, before anything runs, when no connected account can find a dataset (a wrong reference, a version that does not exist, or no access); its `error` says so. Show the user the reference and ask them to correct it or to give one of the accounts access, then submit the corrected workload and cancel the blocked one, or `agent retry` the job if only access changed. Do not guess a different dataset. The worker reads accounts and settings when it starts: after the user adds an account or changes a setting, `compute-runner service restart` applies it. A job whose `reason` says its account is unknown to the running worker needs that restart.
+An account may be unable to read a job's dataset, such as another account's private dataset. When a suggestion needs a copy, the summary also shows `suggested_transfer: true`: tell the user which datasets would be copied to that account and move with `--transfer` only after they approve. A job whose own account cannot read a dataset is `blocked`, and its `error` names an account that can: ask the user whether to move the job there, or to copy the dataset (`compute-runner agent move JOB_ID --account ITS_ACCOUNT --transfer`). The user can allow copies for every job with `compute-runner init --transfer`. Only datasets given as aliased `inputs` can be copied. A job is also `blocked`, before anything runs, when no connected account can find a dataset (a wrong reference, a version that does not exist, or no access); its `error` says so. Show the user the reference and ask them to correct it or to give one of the accounts access, then submit the corrected workload and cancel the blocked one, or `agent retry` the job if only access changed. Do not guess a different dataset. The worker reads accounts and settings when it starts: after the user adds an account or changes a setting, `compute-runner service restart` applies it (ask first, as it is the user's decision). A job whose `reason` says its account is unknown to the running worker needs that restart.
 
 ## Submit
 
-For one file, use `compute-runner agent submit /path/train.py --request-key experiment-v1`, adding `--param NAME=VALUE` for the settings that distinguish this run. For folders or multiple jobs, write a workload YAML with your file-editing tools; read [references/workloads.md](references/workloads.md) when creating or changing workload definitions. GPU and internet are disabled by default and can be set per job in YAML.
+Submit with flags; most workloads need no YAML:
 
-Name each workload after what it does (`cifar10-resnet18`, not `test`), and put its settings in `params`: the name becomes the experiment folder, and the parameters are recorded with each run so the user can tell runs apart. Workloads read their inputs from `KGR_INPUT_<ALIAS>` and write results to `KGR_OUTPUT_DIR`; never hardcode provider paths.
+```bash
+compute-runner agent submit /path/train.py --request-key cifar10-v1 --name cifar10-resnet18 --param lr=0.01
+compute-runner agent submit /path/project --entrypoint train.py --request-key cifar10-v2 --gpu --internet \
+  --input data=/path/to/data --input weights=kaggle:owner/weights/3 --requirements requirements.txt
+```
+
+`--input ALIAS=VALUE` takes a local path or a reference (`kaggle:OWNER/SLUG[/VERSION]`, `ssh:/PATH`, `job:JOB_ID[/PATH]`). A workload YAML is for several jobs in one batch or for settings without a flag, such as `exclude` or `output_patterns`. Writing one adds a file to the user's project, so ask first. Read [references/workloads.md](references/workloads.md) before writing or changing one. GPU and internet are off by default.
+
+Name each workload after what it does (`cifar10-resnet18`, not `test`), and put its settings in `--param`: the name becomes the experiment folder, and the parameters are recorded with each run so the user can tell runs apart. Workloads read their inputs from `KGR_INPUT_<ALIAS>` and write results to `KGR_OUTPUT_DIR`; never hardcode provider paths.
 
 Choose one stable request key per intended submission. Reuse the exact same key and settings after an interrupted call: the original batch is returned with `replayed: true`, even if source files subsequently change. Different settings with the same key fail. To run changed code or intentionally repeat an experiment, use a new key. Submissions snapshot all files before committing the batch, and the worker then uploads and runs it privately.
 
@@ -106,10 +117,12 @@ Log responses contain a bounded `text` tail and a `path` to the full private cac
 
 ## Recovery
 
+When a job `failed`, read its log with `agent logs` and tell the user what went wrong. If the code is at fault, propose the fix and wait for approval before changing anything (see [the user's code](#let-the-application-do-its-work)). Then submit the corrected code with a new request key.
+
 Use `compute-runner agent retry JOB_ID --request-key retry-v1` for an explicitly intended rerun of saved code. The retry key is also safe to replay. A retry is the next run of the same experiment. Computation failures are not retried automatically. A run that started never moves between accounts.
 
 To continue a stopped resumable run, use `compute-runner agent continue JOB_ID --request-key KEY`, adding `--account ID` to continue elsewhere, for example after GPU quota ran out. It verifies the downloaded checkpoint and attaches it; do not handle checkpoint files yourself. Read [references/resumability.md](references/resumability.md) first.
 
 `needs_attention` means a remote submission is uncertain, or the provider no longer knows a run it accepted (for example, a deleted notebook). Give the user the recorded `url` to inspect; do not retry, and do not generate new keys to bypass the uncertainty. Only the user can assert that no run exists, with `compute-runner resolve JOB_ID --not-submitted`; a retry is possible after that.
 
-`compute-runner agent cancel JOB_ID` cancels pending work locally, or asks the provider to stop a running job. The job then shows `reason: Cancellation requested on ACCOUNT` until it becomes `cancelled`, and its partial outputs are still collected. A job still queued on the provider is removed before it starts and becomes `cancelled` at once, with `reason: Cancelled before it started on ACCOUNT`. A job that is starting but has not logged its session yet cannot be cancelled; try again a few seconds later. The queue starts jobs as capacity becomes available; timed or recurring schedules are not implemented.
+`compute-runner agent cancel JOB_ID` cancels pending work locally, or asks the provider to stop a running job. The job then shows `reason: Cancellation requested on ACCOUNT` until it becomes `cancelled`, and its partial outputs are still collected. A job still queued on the provider is removed before it starts and becomes `cancelled` at once, with `reason: Cancelled before it started on ACCOUNT`. On Kaggle, a job that is starting but has not logged its session yet cannot be cancelled; try again a few seconds later. The queue starts jobs as capacity becomes available; timed or recurring schedules are not implemented.

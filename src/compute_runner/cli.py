@@ -18,6 +18,7 @@ from rich.table import Table
 from .agent import ERRORS
 from .agent_cli import agent_app
 from .client import Client
+from .credentials import account_secrets, credentials_path, kaggle_secrets, save_secrets
 from .models import Account, Config
 from .providers import connect, safe_message
 from .security import redacted_env_record
@@ -148,16 +149,53 @@ def initialize(
     )
 
 
-def _secret_file(path: Path | None, label: str, *, private=False) -> Path | None:
-    """An existing file's absolute path; private files must not be readable by other users."""
+def _read_file(path: Path | None, label: str) -> str | None:
     if path is None:
         return None
-    path = path.expanduser().resolve()
+    path = path.expanduser()
     if not path.is_file():
-        raise ValueError(f"{label} not found: {path}")
-    if private and path.stat().st_mode & 0o077:
-        raise ValueError(f"{label} {path} is readable by other users; run: chmod 600 {path}")
-    return path
+        raise ValueError(f"{label} not found: {path.absolute()}")
+    return path.read_text()
+
+
+def _secret_input(label: str) -> str:
+    """Typed without echo; the prompt goes to stderr, so --json output stays parseable."""
+    value = typer.prompt(label, hide_input=True, err=True).strip()
+    if not value:
+        raise ValueError(f"{label} is empty")
+    return value
+
+
+def _account_secrets(provider, user, *, credentials, enter_key, key, password_file, enter_password):
+    """Secrets given to account add, for the credentials file; None when none were given."""
+    kaggle = {"--credentials": credentials, "--enter-key": enter_key or None}
+    ssh = {"--key": key, "--password-file": password_file, "--enter-password": enter_password or None}
+    for flags, owner in [(kaggle, "kaggle"), (ssh, "ssh")]:
+        given = [flag for flag, value in flags.items() if value is not None]
+        if given and provider != owner:
+            raise ValueError(
+                f"{given[0]} applies to {'Kaggle' if owner == 'kaggle' else 'SSH'} accounts only"
+            )
+        if len(given) > 1:
+            raise ValueError(f"Choose one of {', '.join(flags)}")
+    if provider == "kaggle":
+        if enter_key:
+            return kaggle_secrets(_secret_input("Kaggle API key or access token"))
+        if credentials is None:
+            return None
+        secrets = kaggle_secrets(_read_file(credentials, "Credentials file"))
+        if secrets.get("username", user).casefold() != user.casefold():
+            raise ValueError(f"{credentials} holds the key of {secrets['username']}, not {user}")
+        return secrets
+    if key is not None:
+        if not key.expanduser().is_file():
+            raise ValueError(f"Key file not found: {key.expanduser().absolute()}")
+        return {"key": str(key.expanduser().absolute())}
+    if password_file is not None:
+        return {"password": _read_file(password_file, "Password file").rstrip("\n")}
+    if enter_password:
+        return {"password": _secret_input(f"Password of {user}")}
+    return None
 
 
 @account_app.command("add")
@@ -167,8 +205,11 @@ def account_add(
     user: Annotated[str, typer.Argument(help="Kaggle username, or a name you choose for an SSH machine")],
     credentials: Annotated[
         Path | None,
-        typer.Option(help="Kaggle: credentials file for this account only; default: Kaggle's usual location"),
+        typer.Option(help="Kaggle: a kaggle.json or access-token file to save in the credentials file"),
     ] = None,
+    enter_key: Annotated[
+        bool, typer.Option("--enter-key", help="Kaggle: type the API key or access token (not shown)")
+    ] = False,
     cpu_limit: Annotated[int | None, typer.Option(help="Default 5; unchanged when omitted")] = None,
     gpu_limit: Annotated[
         int | None,
@@ -179,11 +220,15 @@ def account_add(
     port: Annotated[int | None, typer.Option(help="SSH: port; default 22")] = None,
     login: Annotated[str | None, typer.Option(help="SSH: user name on the machine")] = None,
     key: Annotated[
-        Path | None, typer.Option(help="SSH: private key file; default: ssh-agent and ~/.ssh keys")
+        Path | None,
+        typer.Option(help="SSH: private key file, saved as a path; default: ssh-agent and ~/.ssh keys"),
     ] = None,
     password_file: Annotated[
-        Path | None, typer.Option(help="SSH: file holding the password (chmod 600), instead of a key")
+        Path | None, typer.Option(help="SSH: a file holding the password, to save in the credentials file")
     ] = None,
+    enter_password: Annotated[
+        bool, typer.Option("--enter-password", help="SSH: type the password (not shown)")
+    ] = False,
     workdir: Annotated[
         str | None,
         typer.Option(help="SSH: work directory on the machine, relative to home; default .compute-runner"),
@@ -196,45 +241,44 @@ def account_add(
         typer.Option("--trust-new-host", help="SSH: accept the machine's host key if it is not known yet"),
     ] = False,
 ):
-    """Add or update an account. Only the paths of credential, key and password files are saved."""
+    """Add or update an account. Keys, passwords and tokens go to the credentials file only."""
     if trust_new_host and provider != "ssh":
         raise ValueError("--trust-new-host applies to SSH accounts only")
-    credentials = _secret_file(credentials, "Credentials file", private=True)
+    secrets = _account_secrets(
+        provider,
+        user,
+        credentials=credentials,
+        enter_key=enter_key,
+        key=key,
+        password_file=password_file,
+        enter_password=enter_password,
+    )
     accounts = _client(ctx).config.accounts
     key_id = f"{provider}:{user}".casefold()
     index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key_id), len(accounts))
     saved = accounts[index].model_dump() if index < len(accounts) else {}
-    changes = dict(credentials=credentials, cpu_limit=cpu_limit, gpu_limit=gpu_limit)
-    ssh = dict(
-        host=host,
-        port=port,
-        username=login,
-        key=_secret_file(key, "Key file", private=True),
-        password_file=_secret_file(password_file, "Password file", private=True),
-        workdir=workdir,
-        python=python,
-    )
+    changes = dict(cpu_limit=cpu_limit, gpu_limit=gpu_limit)
+    ssh = dict(host=host, port=port, username=login, workdir=workdir, python=python)
     ssh = {name: value for name, value in ssh.items() if value is not None}
     if ssh and provider != "ssh":
-        flag = {"username": "login"}.get(name := next(iter(ssh)), name).replace("_", "-")
+        flag = {"username": "login"}.get(name := next(iter(ssh)), name)
         raise ValueError(f"--{flag} applies to SSH accounts only")
     if provider == "ssh":
-        if key is not None and password_file is not None:
-            raise ValueError("Choose --key or --password-file, not both")
-        # A new key replaces a saved password file, and the other way round.
-        kept = {
-            k: v
-            for k, v in (saved.get("ssh") or {}).items()
-            if not (k in {"key", "password_file"} and (key or password_file))
-        }
-        changes["ssh"] = kept | ssh
+        changes["ssh"] = (saved.get("ssh") or {}) | ssh
     # An existing account keeps its saved ID, whatever the casing typed now; its jobs refer to it.
     values = dict(provider=provider, user=user) | saved | {k: v for k, v in changes.items() if v is not None}
+    if secrets is not None:  # New secrets replace those an older configuration named by path.
+        values["credentials"] = None
+        if values.get("ssh"):
+            values["ssh"] = values["ssh"] | dict(key=None, password_file=None)
     account = Account.model_validate(values)
+    result = dict(account=account.id)
+    if secrets is not None:
+        result["credentials_file"] = str(save_secrets(account.id, secrets))
     others = [a.model_dump() for a in accounts if a.id.casefold() != key_id]
     others.insert(0 if default else index, account.model_dump())
     config = _save(ctx, accounts=others)
-    result = dict(account=account.id, accounts=[a.id for a in config.accounts])
+    result["accounts"] = [a.id for a in config.accounts]
     if trust_new_host:
         result["host_key"] = connect(account, config).trust_host()
     _emit(ctx, result)
@@ -253,6 +297,7 @@ def account_remove(ctx: typer.Context, account_id: str):
     if busy:
         raise ValueError(f"{busy} unfinished jobs use {account.id}; move, cancel or finish them first")
     config = _save(ctx, accounts=[a.model_dump() for a in client.config.accounts if a.id != account.id])
+    save_secrets(account.id, None)  # Its key, password or token is forgotten with it.
     _emit(ctx, dict(removed=account.id, accounts=[a.id for a in config.accounts]))
 
 
@@ -277,6 +322,17 @@ def submit(
         list[str] | None,
         typer.Option("--param", help="NAME=VALUE passed as --NAME VALUE and recorded with the results"),
     ] = None,
+    name: Annotated[str | None, typer.Option(help="Experiment name, and its results folder")] = None,
+    input: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--input",
+            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); read as KGR_INPUT_ALIAS",
+        ),
+    ] = None,
+    requirements: Annotated[
+        str | None, typer.Option(help="Requirements file in the source folder to install; needs internet")
+    ] = None,
     dry_run: bool = False,
     request_key: str | None = None,
     account: Annotated[str | None, typer.Option(help="Account ID such as kaggle:USER; default first")] = None,
@@ -292,6 +348,9 @@ def submit(
         timeout=timeout,
         arg=arg,
         param=param,
+        name=name,
+        input=input,
+        requirements=requirements,
     )
     if dry_run:
         _emit(ctx, [_client(ctx).preview(spec, account) for spec in specs])
@@ -445,12 +504,29 @@ def quota(ctx: typer.Context, account: str | None = None):
     _emit(ctx, _client(ctx).quota(account))
 
 
+def _credentials_source(account) -> str:
+    """Where an account's login comes from; never the secret itself."""
+    try:
+        if saved := account_secrets(account.id):
+            return "credentials file: " + ", ".join(sorted(saved))
+    except ValueError as error:
+        return f"error: {error}"
+    older = account.credentials or (account.ssh and (account.ssh.key or account.ssh.password_file))
+    if older:
+        return f"file named in config.json: {older}"
+    return (
+        "Kaggle's default (~/.kaggle, KAGGLE_*)" if account.provider == "kaggle" else "ssh-agent and ~/.ssh"
+    )
+
+
 @app.command()
 def doctor(ctx: typer.Context, offline: bool = False):
     """Check configuration, disk and worker, and each account's quota and active runs unless --offline."""
     client = _client(ctx)
     info = dict(
         accounts=[account.id for account in client.config.accounts],
+        credentials_file=str(credentials_path()),
+        credentials={account.id: _credentials_source(account) for account in client.config.accounts},
         failover=client.config.failover,
         transfer=client.config.transfer,
         results_dir=str(client.config.results_dir) if client.config.results_dir else None,

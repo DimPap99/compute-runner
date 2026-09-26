@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e . --no-deps
 source .venv/bin/activate
 
-compute-runner account add kaggle YOUR_KAGGLE_USERNAME
+compute-runner account add kaggle YOUR_KAGGLE_USERNAME --enter-key
 compute-runner doctor
 compute-runner service install
 ```
@@ -39,7 +39,7 @@ The lock file includes `paramiko` for [SSH machines](#ssh-machines); an installa
 
 `compute-runner` is the primary command; `kgr` remains an alias for existing scripts. Python callers import `compute_runner`.
 
-The service must be able to authenticate without an interactive shell. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
+The service must be able to authenticate without an interactive shell, so keep credentials in the [credentials file](#credentials) or Kaggle's standard locations. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
 
 ## Quick start
 
@@ -77,14 +77,15 @@ These commands return full records. Use `compute-runner agent` for bounded respo
 An account is one set of credentials on one provider. Its ID is `PROVIDER:USER`, such as `kaggle:alice`. Accounts are kept in order of preference, and the first is the default for new jobs:
 
 ```bash
-compute-runner account add kaggle alice                   # standard Kaggle credentials
-compute-runner account add kaggle bob --credentials ~/.config/kaggle-bob/kaggle.json --gpu-limit 1
+compute-runner account add kaggle alice                   # Kaggle's standard credentials (~/.kaggle)
+compute-runner account add kaggle bob --enter-key         # type bob's API key or access token
+compute-runner account add kaggle carol --credentials ~/Downloads/kaggle.json --gpu-limit 1
 compute-runner account add kaggle bob --default          # prefer bob from now on
 compute-runner account list
 compute-runner account remove kaggle:bob
 ```
 
-Without `--credentials`, the account uses Kaggle's usual discovery (`KAGGLE_*` variables, `~/.kaggle`). A credentials file is used for that account alone, can hold a `kaggle.json` username and key or a Kaggle access token, and must be readable by you alone (`chmod 600`). Only its path is saved. Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
+Every account checks that its credentials authenticate as its user, so a global token cannot act for another account. An account cannot be removed while unfinished jobs, or pending downloads, use it. Failed downloads of its runs are not retried while it is removed and resume if it is added again.
 
 SSH machines are accounts too; see [SSH machines](#ssh-machines).
 
@@ -112,6 +113,21 @@ compute-runner service restart
 
 Failover counts jobs already preparing on the other account, so a burst moves only as many jobs as that account can start. A job whose inputs are already uploading stays on its account, and jobs queued behind it wait for it rather than failing over. An account that rejected one of a job's launches is not chosen for that job again, so a job cannot bounce between two full accounts. Moving a job uploads its inputs again, because private datasets belong to one account. Failover checks that the other account can read the job's provider datasets; see [Datasets across accounts](#datasets-across-accounts). Runs that have started never move; continue a stopped resumable run on another account with `compute-runner continue JOB_ID --account ID`, as described in [Optional resumable training](#optional-resumable-training).
 
+### Credentials
+
+Every account's secrets live in one file, `~/.config/compute-runner/credentials.json`, beside the configuration. `account add` writes it: `--enter-key` and `--enter-password` ask for the secret without showing it, `--credentials` and `--password-file` read it from a file you downloaded, and `--key` records the path of an SSH private key. You can also edit the file yourself:
+
+```json
+{
+  "kaggle:alice": {"username": "alice", "key": "0123abcd..."},
+  "kaggle:bob": {"token": "KGAT_..."},
+  "ssh:lab": {"key": "~/.ssh/id_ed25519", "passphrase": "only if the key has one"},
+  "ssh:lab-cpu": {"password": "..."}
+}
+```
+
+The file is created readable by you alone and never leaves this machine: it is not uploaded, stored with jobs, logged, or shown in any response, and `account remove` deletes the account's entry. An account without an entry uses its provider's defaults: Kaggle's `~/.kaggle` and `KAGGLE_*` variables, or ssh-agent and the keys in `~/.ssh`. Configurations from earlier versions that name a credentials, key or password file keep working until `account add` saves new secrets for the account. `compute-runner doctor --offline` shows where each account's login comes from, without the secrets.
+
 ### Datasets across accounts
 
 A job can attach existing provider datasets, such as another account's private dataset, and the account that runs it may not be able to read them. Before attaching a dataset, the worker asks the job's account whether it can read it, then:
@@ -133,14 +149,14 @@ A machine you can log in to over SSH runs jobs like a Kaggle account: the same c
 
 ```bash
 compute-runner account add ssh lab --host 10.0.0.5 --login alice --key ~/.ssh/id_ed25519 --trust-new-host
-compute-runner account add ssh lab-cpu --host lab.example.org --port 2222 --login alice --password-file ~/.lab-password
+compute-runner account add ssh lab-cpu --host lab.example.org --port 2222 --login alice --enter-password
 compute-runner account add ssh lab --gpu-limit 2        # the machine has two GPUs jobs may use
 compute-runner doctor                                   # Python version, GPUs and runs on each machine
 ```
 
-Without `--key` or `--password-file`, the login uses ssh-agent and the default keys in `~/.ssh`. Key and password files must be readable by you alone (`chmod 600`); a password file is checked again at every login. Only the paths of key and password files are saved. The machine's host key must be known: `--trust-new-host` reads the key without logging in, accepts a host that is not in `known_hosts` yet and prints its fingerprint, and a host key that changes later is refused until you remove the old one. Compare the printed fingerprint with the one the machine's administrator gives you (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the machine). Setting up an account, its key and its host key is yours to do; the agent skill leaves it to you. `~/.ssh/config` is not read, so give the host, port and login on the account.
+The key or password goes to the [credentials file](#credentials); without either, the login uses ssh-agent and the default keys in `~/.ssh`. The machine's host key must be known: `--trust-new-host` reads it without logging in, accepts a host that is not in `known_hosts` yet and prints its fingerprint, and a host key that changes later is refused until you remove the old one. Compare the printed fingerprint with the one the machine shows (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). `~/.ssh/config` is not read, so give the host, port and login on the account.
 
-Each job runs as your login, in its own folder under the work directory on the machine (`~/.compute-runner`, or `--workdir`: a folder below your home folder, without `..`), started by a supervisor that keeps running when the connection or the worker stops. The supervisor enforces `timeout_seconds` and records how the run ended. A timeout or `cancel` sends SIGTERM to every process the run started, including ones in a session of their own such as a notebook's kernel, and SIGKILL 20 seconds later; processes a finished workload leaves behind are stopped the same way. The run's end is recorded only once they are all gone, so its GPU is not given to another job while still in use. Source and input bundles are uploaded once, verified, and kept read-only for later runs. A `requirements` file installs into a virtual environment of that run, which can still use packages installed on the machine. Notebooks run with `nbconvert` from the machine's Python, and the executed notebook is downloaded with the outputs.
+Each job runs as your login, in its own folder under the work directory on the machine (`~/.compute-runner`, or `--workdir`: a folder below your home folder, without `..`), started by a supervisor that keeps running when the connection or the worker stops. The supervisor enforces `timeout_seconds` and records how the run ended. A timeout or `cancel` stops every process the run started, including a notebook's kernel, with SIGTERM and then SIGKILL 20 seconds later; so does a workload that exits and leaves processes behind. A GPU is handed to the next job only once they are gone. Source and input bundles are uploaded once, verified, and kept read-only for later runs. A `requirements` file installs into a virtual environment of that run, which can still use packages installed on the machine. Notebooks run with `nbconvert` from the machine's Python, and the executed notebook is downloaded with the outputs.
 
 What differs from Kaggle:
 
@@ -148,10 +164,10 @@ What differs from Kaggle:
 | --- | --- |
 | Network | Cannot be blocked, so SSH jobs must set `internet: true`; jobs without it are refused and never fail over to an SSH machine |
 | GPUs | `gpu: true` only, no accelerator IDs. GPU slots are the account's `--gpu-limit` (0 unless set), each GPU job gets its own device through `CUDA_VISIBLE_DEVICES`, and CPU jobs see no GPU. There is no GPU time quota |
-| Data on the machine | `inputs: {data: "ssh:/data/imagenet"}` attaches a folder already on the machine where it is, without uploading it. A single file arrives as a folder holding it, as a copy does. Links to files count as the files, broken links are left out, and a folder holding links to folders cannot be copied. Submission records the machine, as `ssh:lab:/data/imagenet`, so the reference keeps meaning that machine: on another account, including another SSH machine with the same path, the folder is used only as a copy (see [Datasets across accounts](#datasets-across-accounts)), which is made again when its files change. A job on a Kaggle account names the machine itself: `ssh:lab:/data/imagenet` |
+| Data on the machine | `inputs: {data: "ssh:/data/imagenet"}` attaches a folder already on the machine where it is, without uploading it. A single file arrives as a folder holding it, as a copy does. Submission records the machine, as `ssh:lab:/data/imagenet`, so the reference keeps meaning that machine: on another account, including another SSH machine with the same path, the folder is used only as a copy (see [Datasets across accounts](#datasets-across-accounts)), which is made again when its files change. A job on a Kaggle account names the machine itself: `ssh:lab:/data/imagenet` |
 | Kaggle datasets | Copied through a connected Kaggle account when copies are allowed |
 | Capacity | `--cpu-limit` and `--gpu-limit` count only this runner's jobs, not other work on the machine |
-| Cleanup | The runner writes only inside its work directory and never deletes run folders, bundles or your data. To reclaim the space, remove the work directory yourself when no jobs use it: bundles are read-only, so `chmod -R u+w ~/.compute-runner && rm -rf ~/.compute-runner` |
+| Cleanup | The runner writes only inside its work directory and never deletes run folders, bundles or your data. To reclaim the space when no jobs use it, remove the work directory yourself; bundles are read-only, so `chmod -R u+w ~/.compute-runner && rm -rf ~/.compute-runner` |
 
 ## Workload configuration
 
@@ -221,23 +237,23 @@ jobs:
 
 A batch accepts 1 to 1000 jobs. Every source and local input is snapshotted before the jobs are committed in one database transaction. A snapshot or database failure leaves none of that batch's jobs queued. Unused local bundles may remain. Jobs execute independently after the commit.
 
-Both submit commands accept `--entrypoint`, `--module`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, `--account`, and repeated `--arg` and `--param NAME=VALUE` options. `--param` values are read as YAML scalars, so `lr=0.01` is a number and `amp=true` a flag, and they are merged into each job's `params`. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
+Both submit commands accept `--name`, `--entrypoint`, `--module`, `--requirements`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, `--account`, and repeated `--arg`, `--param NAME=VALUE` and `--input ALIAS=VALUE` options, so a single job rarely needs a YAML file. `--input` takes a local path, relative to the current folder, or a reference such as `kaggle:owner/slug/3`, `ssh:/data/set` or `job:JOB_ID/PATH`, and adds to the workload's `inputs`. `--param` values are read as YAML scalars, so `lr=0.01` is a number and `amp=true` a flag, and they are merged into each job's `params`. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
 
 ### Packaging and runtime
 
 Source selection respects the root `.gitignore`, `.kgrignore`, and `exclude` patterns. Input folders honor only their own `.kgrignore`, because data folders often `.gitignore` the very files they carry. Credential filenames, Git metadata, virtual environments, caches, and `node_modules` are excluded. Before saving a snapshot, the runner also rejects high-confidence private keys and service-token patterns without printing the detected value. This screening reduces accidental disclosure but cannot recognize every possible credential, so keep secrets outside source and input folders. Symlinks are rejected. Notebook outputs and execution counts are removed from the saved snapshot. A notebook entrypoint must be a valid Python notebook; other notebooks in the project, such as R notebooks, are cleaned when possible and otherwise copied unchanged.
 
-Single files are embedded in a generated private kernel. Project directories and local inputs become private datasets. Identical content reuses the same dataset. Managed datasets are immutable and retain source license metadata.
+On Kaggle, single files are embedded in a generated private notebook, and project directories and local inputs become private datasets; identical content reuses the same dataset, and managed datasets are immutable and retain source license metadata. On an SSH machine, they are uploaded once into its work directory. Either way the runtime verifies every file against its checksum before the workload starts.
 
-Unversioned dataset references are resolved when the worker prepares the job. Supply a version to select a specific dataset revision. The runtime accepts expanded Kaggle inputs or archives and verifies bundle contents before execution.
+Unversioned dataset references are resolved when the worker prepares the job. Supply a version to select a specific dataset revision.
 
-Project code runs from `/kaggle/working/project`. Write result files under `KGR_OUTPUT_DIR`, which points to `/kaggle/working/outputs`; a file written there is saved locally as `RUN_FOLDER/outputs/NAME`. Downloads skip the runtime's copy of the snapshot files under `project/` and its `__pycache__` bytecode; new files the workload writes under `project/` are still collected, into `RUN_FOLDER/working/project/`. Every named input, whether uploaded, attached from a provider, copied, or taken from another job, is exposed through `KGR_INPUT_<UPPERCASE_ALIAS>` and the `KGR_INPUTS_JSON` mapping, so workloads never depend on provider paths. Datasets in the unaliased `datasets` list remain under `/kaggle/input`. Parameters are in `KGR_PARAMS_JSON`.
+Project code runs from the `project/` folder of the run's working directory (`/kaggle/working` on Kaggle). Write result files under `KGR_OUTPUT_DIR`, the working directory's `outputs/`; a file written there is saved locally as `RUN_FOLDER/outputs/NAME`. Downloads skip the runtime's copy of the snapshot files under `project/` and its `__pycache__` bytecode; new files the workload writes under `project/` are still collected, into `RUN_FOLDER/working/project/`. Every named input, whether uploaded, attached from a provider, copied, or taken from another job, is exposed through `KGR_INPUT_<UPPERCASE_ALIAS>` and the `KGR_INPUTS_JSON` mapping, so workloads never depend on provider paths. Datasets in the unaliased `datasets` list remain under `/kaggle/input`. Parameters are in `KGR_PARAMS_JSON`.
 
 Output downloads and full log caches have no configured size limit. Before writing, the runner checks free space on the filesystem containing the state directory. Known download sizes are checked up front; unknown or compressed bodies and log streams are checked as chunks arrive. A write that cannot fit with 16 MiB of operational headroom is stopped without replacing an existing file. The worker emits one warning when that filesystem falls below 10% free space and can warn again after space recovers and crosses the threshold later.
 
 Downloads use the environment's proxy and certificate settings by default. [Strict mode](#strict-mode) ignores them and fetches only public HTTPS addresses.
 
-The workload uses Kaggle's Python environment. A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. `env` is only for nonsecret configuration: secret-like variable names and recognizable credential values are rejected because these values must be stored with the job and embedded in the private Kaggle workload.
+The workload uses the provider's Python: Kaggle's environment, or the machine's `python3` (with a virtual environment of the run when it has requirements). A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. `env` is only for nonsecret configuration: secret-like variable names and recognizable credential values are rejected because these values are stored with the job and shipped with the workload.
 
 ### Optional resumable training
 
@@ -265,7 +281,7 @@ RESULTS/NAME/
     job.json
     run.log
     outputs/        files the workload wrote to KGR_OUTPUT_DIR
-    working/        other files it left in /kaggle/working
+    working/        other files it left in its working directory
   002_2026-09-26_15-02-47/
 ```
 
@@ -426,13 +442,13 @@ compute-runner agent logs JOB_ID --tail 50 --max-bytes 8192
 compute-runner agent logs JOB_ID --refresh
 ```
 
-Kaggle stores a session's log only after it ends. While a submitted job is unfinished, every call reads a live snapshot from Kaggle's log stream, which replays the log from the start. The read stops after 5 idle seconds or 20 seconds in total, and the response has `live: true`.
+While a submitted job is unfinished, every call reads a live snapshot, and the response has `live: true`. Kaggle stores a session's log only after it ends, so on Kaggle the snapshot comes from its log stream, which replays the log from the start and is read for at most 20 seconds (5 when idle). On an SSH machine it is the end of the run's log file.
 
 For a finished job, the first call fetches the stored log and saves a private local copy. Later calls read that copy unless `--refresh` is supplied or the job has finished since the copy was saved. A failed refresh preserves the existing cache.
 
 The response contains `text`, `bytes`, `total_bytes`, `truncated`, `path`, `fetched`, `cached_at`, and `live`, together with `schema_version` and the job `id`. `path` identifies the full cached log. `cached_at` is its modification time as a Unix timestamp.
 
-The default response contains at most 50 lines and 8192 UTF-8 bytes. The maximum permitted limits are 500 lines and 65536 bytes. Lines are split on `\n` only, so carriage-return progress bars count as one line. Byte truncation can leave a partial first line. The size limit applies to the returned text, not the download from Kaggle. Agent log retrieval does not follow a stream.
+The default response contains at most 50 lines and 8192 UTF-8 bytes. The maximum permitted limits are 500 lines and 65536 bytes. Lines are split on `\n` only, so carriage-return progress bars count as one line. Byte truncation can leave a partial first line. The size limit applies to the returned text, not the download from the provider. Agent log retrieval does not follow a stream.
 
 Logs are cached and returned with known credential formats replaced by `[redacted]`: Kaggle tokens and keys, private key blocks, cloud and service API tokens, JSON web tokens, long values assigned to names such as `api_key` or `password`, and passwords in URLs. [Strict mode](#strict-mode) redacts more broadly.
 
@@ -494,14 +510,13 @@ Agent methods return JSON-compatible dictionaries and raise Python exceptions on
 
 ### Agent skill
 
-The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, which actions need the user's approval, the rule that the agent's shell use is limited to `compute-runner` commands (it reads files but never writes, moves, copies or deletes them through the shell, and leaves account and credential setup to you), request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
+The interface works with any LLM agent that can run shell commands. The [bundled skill](skills/compute-runner/SKILL.md) is plain Markdown with a short front matter (`name`, `description`). It documents the commands, request keys, cursor handling and recovery, and what the agent may do on its own. The agent leaves packaging, uploads, downloads and file handling to the application. It changes your code, for example to add checkpointing or to fix a job that failed, only after you approve. It never handles credentials. For agents that load skills from a folder, link it into that folder so installed copies stay current:
 
 ```bash
-ln -s ~/compute-runner/skills/compute-runner ~/.claude/skills/compute-runner  # Claude Code
-ln -s ~/compute-runner/skills/compute-runner ~/.codex/skills/compute-runner   # Codex
+ln -s ~/compute-runner/skills/compute-runner PATH/TO/YOUR/AGENT/skills/compute-runner
 ```
 
-Agents without skill support can be pointed at `SKILL.md` directly. The skill expects `compute-runner` on PATH or at `~/compute-runner/.venv/bin/compute-runner`. No MCP server or model API key is required.
+Agents without skill support can be pointed at `SKILL.md` directly, for example from their instructions file. The skill expects `compute-runner` on PATH or at `~/compute-runner/.venv/bin/compute-runner`. No MCP server or model API key is required.
 
 ## Worker configuration
 
@@ -521,7 +536,7 @@ Use `compute-runner worker run` to run in the foreground, or `compute-runner wor
 | Setting | Default |
 | --- | --- |
 | Managed CPU concurrency per account | 5 |
-| Managed GPU concurrency per account | 1 |
+| Managed GPU concurrency per account | 1 on Kaggle, 0 on SSH machines |
 | Failover policy | `ask` |
 | Status polling interval | 30 seconds |
 | Account discovery interval | 300 seconds |
@@ -541,7 +556,7 @@ compute-runner service restart
 
 The results folder applies to jobs submitted after the change; existing jobs keep their run folders.
 
-A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. Each discovery also reads the account's GPU quota, and the worker accounts for discovered external runs and quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
+A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. Each discovery also reads the account's GPU quota, and the worker accounts for discovered external runs and quota before admission. On Kaggle, discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits, and reads each active run's own settings once, because Kaggle's notebook listing reports every notebook as CPU. On an SSH machine, it lists the runner's own runs in the work directory. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
 Dataset preparation, uploads and dataset copies run in the dispatcher and can extend a polling cycle. A copy needs local disk space for about three times the dataset: the download, the snapshot, and its archive. Output downloads run separately.
 
@@ -565,8 +580,8 @@ Error messages saved with jobs always receive the strict redaction, because they
 
 | Condition | Behavior |
 | --- | --- |
-| Capacity or quota rejection | Back off and retry with a fresh notebook slug; the failover policy can move the job to another account |
-| Uncertain submission | Query the recorded notebook reference before attempting another submission |
+| Capacity or quota rejection | Back off and retry with a fresh remote reference; the failover policy can move the job to another account |
+| Uncertain submission | Query the recorded remote reference before attempting another submission |
 | Unresolved remote execution | Set `needs_attention` and continue reserving capacity |
 | Workload failure | Set `failed` and collect available outputs without rerunning the computation |
 | Transient upload error | Keep the job preparing on its account; completed uploads are kept and the rest retried |
@@ -576,7 +591,7 @@ Error messages saved with jobs always receive the strict redaction, because they
 | Job's account unknown to the running worker | Keep the job queued with that reason; restart the worker after adding the account, or move the job |
 | Download failure | Preserve execution status and retry output collection independently after 1, 2, 4, … minutes, then hourly |
 
-Each attempt records its notebook slug before the remote request. The worker creates a new slug for each attempt and does not overwrite an existing experiment notebook.
+Each attempt records its remote reference (a Kaggle notebook slug, or a run folder on an SSH machine) before the remote request. The worker creates a new reference for each attempt and never overwrites an earlier one.
 
 `retry` accepts a terminal or blocked job when no execution remains outstanding. It uses saved snapshots. Submit a new workload to change the code or settings.
 
@@ -591,7 +606,7 @@ compute-runner agent retry JOB_ID --request-key resolved-retry-v1
 
 `compute-runner logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
 
-`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job still queued on Kaggle has no session yet: cancellation deletes that attempt's launch notebook instead, which removes the run from Kaggle's queue, and the job becomes `cancelled` at once with the reason `Cancelled before it started on ACCOUNT`. A job that is starting but has not printed its session ID yet, or was submitted by an older version of the runner, cannot be cancelled; try again shortly or stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
+`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job on an SSH machine, the run's supervisor stops it (see [SSH machines](#ssh-machines)). On Kaggle, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job still queued on Kaggle has no session yet: cancellation deletes that attempt's launch notebook instead, which removes the run from Kaggle's queue, and the job becomes `cancelled` at once with the reason `Cancelled before it started on ACCOUNT`. A job that is starting but has not printed its session ID yet, or was submitted by an older version of the runner, cannot be cancelled; try again shortly or stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
 ## State and outputs
 
@@ -599,7 +614,9 @@ Default locations:
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/compute-runner/config.json` | Account and worker configuration |
+| `~/.config/compute-runner/config.json` | Account and worker configuration, without secrets |
+| `~/.config/compute-runner/credentials.json` | Every account's keys, tokens and passwords; see [Credentials](#credentials) |
+| `~/.config/compute-runner/known_hosts` | SSH host keys accepted with `--trust-new-host` |
 | `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, events, run numbers, downloaded-file receipts, and dataset copies |
 | `~/.local/share/compute-runner/bundles/` | Immutable source, input, and dataset-copy snapshots |
 | `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
@@ -611,13 +628,13 @@ Global `--config-dir` and `--state-dir` options select alternate CLI locations. 
 
 Configurations and job records saved by single-account versions are read as the account `kaggle:OWNER`; their URLs and request keys keep working. `COMPUTE_RUNNER_CONFIG_DIR` and `COMPUTE_RUNNER_STATE_DIR` select alternate default directories; the older `KGR_CONFIG_DIR` and `KGR_STATE_DIR` variables remain supported. Existing installations are discovered automatically when the new default locations contain no configuration or queue. Installation of the renamed service disables the previous managed service so only one worker owns the queue. Workload-facing `KGR_*` variables, bundle formats, and remote artifact IDs remain stable for saved jobs and training scripts.
 
-Results go to run folders outside the state directory; see [Results](#results). The queue database is the source of truth for them: it records each run's number and folder, and the size and SHA-256 of every file downloaded, so an interrupted download resumes without fetching verified files again. `run.log` is present when Kaggle exposes a log.
+Results go to run folders outside the state directory; see [Results](#results). The queue database is the source of truth for them: it records each run's number and folder, and the size and SHA-256 of every file downloaded, so an interrupted download resumes without fetching verified files again. `run.log` is present when the provider exposes a log.
 
-Output filters match remote relative paths such as `outputs/*.json`. Logs are collected independently of those filters. Files unavailable from Kaggle after a failure or timeout cannot be recovered by the controller.
+Output filters match remote relative paths such as `outputs/*.json`. Logs are collected independently of those filters. Files the provider no longer has after a failure or timeout cannot be recovered.
 
-Execution and download states are separate. `succeeded` means Kaggle reported completion. `download_state=complete`, exposed as `outputs_ready: true` by the agent interface, means output collection completed. Downloads can be pending or failed after a successful computation.
+Execution and download states are separate. `succeeded` means the provider reported completion. `download_state=complete`, exposed as `outputs_ready: true` by the agent interface, means output collection completed. Downloads can be pending or failed after a successful computation.
 
-No automatic cleanup removes notebooks, datasets, snapshots, logs, or results. Stop the worker before backing up or moving the complete state directory.
+No automatic cleanup removes notebooks, datasets, SSH run folders, snapshots, logs, or results. Stop the worker before backing up or moving the complete state directory.
 
 ### Database upgrades
 

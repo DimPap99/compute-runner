@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from .. import runtime
+from ..credentials import account_secrets, credentials_path
 from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets
 from ..store import atomic_json, atomic_write, config_path
@@ -96,28 +97,31 @@ class SshProvider:
             definitive=True,
         )
 
+    def _secrets(self):
+        """The credentials file's entry, else the key or password file of an older configuration.
+
+        With neither, the login uses ssh-agent and the default keys in ~/.ssh.
+        """
+        if secrets := account_secrets(self.account.id):
+            return secrets
+        if self.settings.password_file is not None:
+            return {"password": self.settings.password_file.expanduser().read_text().rstrip("\n")}
+        return {"key": str(self.settings.key)} if self.settings.key else {}
+
     def _connect(self, policy):
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         if known_hosts_path().is_file():
             client.load_host_keys(str(known_hosts_path()))
         client.set_missing_host_key_policy(policy)
-        password = None
-        if self.settings.password_file is not None:
-            path = self.settings.password_file.expanduser()
-            try:
-                if path.stat().st_mode & 0o077:
-                    raise RemoteError(
-                        f"Password file {path} is readable by other users; run: chmod 600 {path}",
-                        "auth",
-                        definitive=True,
-                    )
-                password = path.read_text().rstrip("\n")
-            except OSError as error:
-                raise RemoteError(
-                    f"Cannot read password file {path}: {error}", "auth", definitive=True
-                ) from error
-        key = str(self.settings.key.expanduser()) if self.settings.key else None
+        try:
+            secrets = self._secrets()
+        except (OSError, ValueError) as error:  # Messages name the file, never its contents.
+            raise RemoteError(
+                f"Cannot read the credentials of {self.account.id}: {error}", "auth", definitive=True
+            ) from error
+        key, password = secrets.get("key"), secrets.get("password")
+        key = str(Path(key).expanduser()) if key else None
         try:
             client.connect(
                 self.settings.host,
@@ -125,6 +129,7 @@ class SshProvider:
                 username=self.settings.username,
                 key_filename=key,
                 password=password,
+                passphrase=secrets.get("passphrase"),
                 allow_agent=key is None and password is None,
                 look_for_keys=key is None and password is None,
                 timeout=30,
@@ -136,7 +141,7 @@ class SshProvider:
         except paramiko.AuthenticationException as error:
             raise RemoteError(
                 f"SSH login to {self.settings.username}@{self._host_key_name} was refused; check the key or "
-                "password file",
+                f"password of {self.account.id} (compute-runner account add, or {credentials_path()})",
                 "auth",
                 definitive=True,
             ) from error

@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 from compute_runner import Account, Client, Config, JobSpec
 from compute_runner.bundle import snapshot_bundle
 from compute_runner.cli import app
+from compute_runner.credentials import account_secrets, credentials_path
 from compute_runner.models import SshSettings, input_reference
 from compute_runner.providers import RemoteError
 from compute_runner.providers import ssh_remote
@@ -480,30 +481,24 @@ def test_ssh_account_settings_and_references():
     assert input_reference("ssh:relative") is None and input_reference("kaggle:/abs") is None
 
 
-def test_account_add_saves_ssh_settings_and_checks_secret_files(tmp_path, monkeypatch):
+def test_account_add_saves_ssh_settings_and_its_secrets_apart(tmp_path, monkeypatch):
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
     password, key = tmp_path / "password", tmp_path / "key"
-    password.write_text("secret")
+    password.write_text("secret\n")
     key.write_text("key")
-    password.chmod(0o644)
-    key.chmod(0o644)
     add = ["--json", "account", "add", "ssh", "lab", "--host", "10.0.0.5", "--login", "me"]
-    result = runner.invoke(app, [*add, "--password-file", str(password)])
-    assert result.exit_code != 0 and "chmod 600" in str(result.exception)
-    password.chmod(0o600)
     assert runner.invoke(app, [*add, "--password-file", str(password), "--gpu-limit", "1"]).exit_code == 0
-    # Updating keeps other settings; a key replaces the saved password file. Keys must be private too.
-    readable = runner.invoke(app, ["--json", "account", "add", "ssh", "lab", "--key", str(key)])
-    assert readable.exit_code != 0 and "chmod 600" in str(readable.exception)
-    key.chmod(0o600)
+    assert account_secrets("ssh:lab") == {"password": "secret"}
+    # Updating keeps other settings; a key replaces the saved password.
     assert runner.invoke(app, ["--json", "account", "add", "ssh", "lab", "--key", str(key)]).exit_code == 0
     [account] = Client().config.accounts
-    assert account.ssh.host == "10.0.0.5" and account.ssh.key == key and account.ssh.password_file is None
-    assert account.gpu_limit == 1 and "secret" not in (tmp_path / "config/config.json").read_text()
+    assert account.ssh.host == "10.0.0.5" and account.gpu_limit == 1
+    assert account_secrets("ssh:lab") == {"key": str(key)}
+    assert "secret" not in (tmp_path / "config/config.json").read_text()
     both = runner.invoke(app, [*add, "--key", str(key), "--password-file", str(password)])
-    assert both.exit_code != 0 and "not both" in str(both.exception)
+    assert both.exit_code != 0 and "Choose one of" in str(both.exception)
     kaggle = runner.invoke(app, ["--json", "account", "add", "kaggle", "someone", "--host", "x"])
     assert kaggle.exit_code != 0 and "SSH accounts only" in str(kaggle.exception)
     login = runner.invoke(app, ["--json", "account", "add", "kaggle", "someone", "--login", "x"])
@@ -668,13 +663,17 @@ def test_a_supervisor_that_records_its_result_as_status_reads_is_not_a_failure(t
     assert ssh_remote.cancel(str(run)) == {"signalled": False}
 
 
-def test_the_password_file_is_checked_again_at_each_login(lab, tmp_path):
+def test_logins_use_the_credentials_file_then_an_older_password_file(lab, tmp_path):
     password = tmp_path / "password"
-    password.write_text("secret")
-    password.chmod(0o644)
+    password.write_text("older\n")
     settings = lab.machine.settings.model_copy(update={"password_file": password})
     machine = SshProvider(lab.machine.account.model_copy(update={"ssh": settings}), lab.tmp)
-    with pytest.raises(RemoteError, match="chmod 600") as error:
+    assert machine._secrets() == {"password": "older"}
+    credentials_path().parent.mkdir(parents=True, exist_ok=True)
+    credentials_path().write_text(json.dumps({"ssh:lab": {"key": "~/.ssh/lab", "passphrase": "p"}}))
+    assert machine._secrets() == {"key": "~/.ssh/lab", "passphrase": "p"}
+    credentials_path().write_text("{broken")
+    with pytest.raises(RemoteError, match="not valid JSON") as error:
         machine._connect(None)
     assert error.value.kind == "auth" and error.value.definitive
 

@@ -52,6 +52,17 @@ def submit(
         list[str] | None,
         typer.Option("--param", help="NAME=VALUE passed as --NAME VALUE and recorded with the results"),
     ] = None,
+    name: Annotated[str | None, typer.Option(help="Experiment name, and its results folder")] = None,
+    input: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--input",
+            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); read as KGR_INPUT_ALIAS",
+        ),
+    ] = None,
+    requirements: Annotated[
+        str | None, typer.Option(help="Requirements file in the source folder to install; needs internet")
+    ] = None,
     dry_run: bool = False,
     account: Annotated[
         str | None, typer.Option(help="Account ID from agent accounts; default: the first account")
@@ -71,6 +82,9 @@ def submit(
         timeout=timeout,
         arg=arg,
         param=param,
+        name=name,
+        input=input,
+        requirements=requirements,
     )
     if dry_run:
         return ctx.obj["client"].agent().preview(specs, account=account)

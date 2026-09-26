@@ -45,7 +45,20 @@ def parse_params(items) -> dict:
     return result
 
 
-def workload_specs(source: Path, *, timeout=None, arg=None, param=None, **overrides) -> list[JobSpec]:
+def parse_inputs(items) -> dict:
+    """ALIAS=VALUE options: a local path (relative to the current folder) or a reference."""
+    result = {}
+    for item in items or []:
+        alias, separator, value = item.partition("=")
+        if not separator or not alias or not value:
+            raise ValueError(f"--input takes ALIAS=PATH or ALIAS=REFERENCE, not {item}")
+        result[alias] = Path(value) if input_reference(value) else Path(value).expanduser().absolute()
+    return result
+
+
+def workload_specs(
+    source: Path, *, timeout=None, arg=None, param=None, input=None, **overrides
+) -> list[JobSpec]:
     """Load a workload and apply the submit commands' overrides to every job."""
     overrides |= dict(timeout_seconds=timeout, args=arg)
     values = {key: value for key, value in overrides.items() if value is not None}
@@ -53,8 +66,10 @@ def workload_specs(source: Path, *, timeout=None, arg=None, param=None, **overri
         if overrides["accelerator"] is not None:
             raise ValueError("--cpu cannot be combined with a GPU accelerator")
         values["accelerator"] = None
-    params = parse_params(param)
+    params, inputs = parse_params(param), parse_inputs(input)
     return [
-        JobSpec.model_validate(spec.model_dump() | values | {"params": spec.params | params})
+        JobSpec.model_validate(
+            spec.model_dump() | values | {"params": spec.params | params, "inputs": spec.inputs | inputs}
+        )
         for spec in load_specs(source)
     ]

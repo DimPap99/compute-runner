@@ -1,6 +1,6 @@
 # Resumable workloads
 
-Resumability is opt-in. This reference applies after the user chooses it, or when an existing resumable job must be inspected, resumed, or migrated.
+Resumability is opt-in. This reference applies after the user chooses it, or when an existing resumable job must be inspected, resumed, or migrated. Adding checkpointing changes the user's code: describe the change and wait for the user's permission before editing.
 
 ## Resolve the user's choice
 
@@ -35,9 +35,9 @@ Prefer this interface unless the workload's framework has an established equival
 
 Use `KGR_OUTPUT_DIR/checkpoints` for new checkpoints. A named workload input called `resume` is exposed as `KGR_INPUT_RESUME`. Do not put checkpoints in the source directory or rely on a process-exit hook: cancellation can occur between hooks, so periodic checkpoints are the recovery mechanism.
 
-For raw training loops, adapt the code of [../assets/checkpointing.py](../assets/checkpointing.py) into the workload source with your file-editing tools (never `cp`). It provides cadence calculation, atomic numbered checkpoint files, a checksummed `latest.json`, compatibility checks, and `auto`/`required`/`never`/explicit-path discovery. It deliberately accepts serializer callbacks so the training code remains responsible for framework state.
+For raw training loops, adapt the code of [../assets/checkpointing.py](../assets/checkpointing.py) into the workload source. It provides cadence calculation, atomic numbered checkpoint files, a checksummed `latest.json`, compatibility checks, and `auto`/`required`/`never`/explicit-path discovery. It deliberately accepts serializer callbacks so the training code remains responsible for framework state.
 
-Use native checkpoint facilities instead when they preserve the required state correctly, such as Hugging Face Trainer or Lightning checkpoints. Keep the same command-line semantics and Kaggle input/output locations where practical.
+Use native checkpoint facilities instead when they preserve the required state correctly, such as Hugging Face Trainer or Lightning checkpoints. Keep the same command-line semantics, and read and write through `KGR_INPUT_RESUME` and `KGR_OUTPUT_DIR`.
 
 A raw PyTorch integration should have this shape; adapt the state fields to the actual loop:
 
@@ -119,15 +119,22 @@ Minute-based checkpointing must occur at a safe boundary. If the workload cannot
 Emit concise machine-readable lines after successful operations:
 
 ```text
-CHECKPOINT_SAVED step=12500 path=/kaggle/working/outputs/checkpoints/checkpoint-step-000000012500.pt
-RESUMED_FROM step=12500 path=/kaggle/input/.../checkpoint-step-000000012500.pt
+CHECKPOINT_SAVED step=12500 path=$KGR_OUTPUT_DIR/checkpoints/checkpoint-step-000000012500.pt
+RESUMED_FROM step=12500 path=$KGR_INPUT_RESUME/checkpoint-step-000000012500.pt
 ```
 
 If resume input is present but corrupt or incompatible, fail loudly instead of silently starting over.
 
 ## Workload configuration
 
-The first run has no `resume` input:
+The first run has no `resume` input. With flags:
+
+```bash
+compute-runner agent submit ./project --entrypoint train.py --name model-training --gpu --request-key training-v1 \
+  --param resume=auto --param checkpoint-mode=minutes --param checkpoint-every=10
+```
+
+Or, when the user wants a workload file:
 
 ```yaml
 name: model-training

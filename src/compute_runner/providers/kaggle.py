@@ -17,6 +17,7 @@ import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 
+from ..credentials import account_secrets, credentials_path, kaggle_secrets
 from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets, redacted_env_record
 from ..store import atomic_json
@@ -44,6 +45,7 @@ def _utc(value):
     """The service returns naive UTC timestamps."""
     return value.replace(tzinfo=value.tzinfo or timezone.utc)
 
+
 # Read timeout for calls without an explicit timeout; lowered while snapshotting a live log stream.
 READ_TIMEOUT = contextvars.ContextVar("kgr_read_timeout", default=90)
 
@@ -60,7 +62,8 @@ def _quiet():
     return contextlib.redirect_stdout(io.StringIO())
 
 
-def _api_class(credentials: Path | None):
+def _api_class(secrets: dict | None):
+    """Kaggle's client bound to secrets (see credentials.kaggle_secrets), or its usual discovery for None."""
     # Kaggle's package authenticates eagerly on import. Keep it out of public model/API imports.
     with _quiet():
         from kaggle.api.kaggle_api_extended import AuthMethod, KaggleApi
@@ -81,22 +84,14 @@ def _api_class(credentials: Path | None):
             return client
 
         def _load_config(self):
-            if credentials is None:
+            if secrets is None:
                 return super()._load_config()
-            # An explicit file is authoritative: KAGGLE_* variables and ~/.kaggle belong to another account.
-            text = credentials.read_text().strip()
-            try:
-                values = json.loads(text)
-            except ValueError:
-                values = None
-            if isinstance(values, dict):
-                self.config_values = {key: str(values[key]) for key in ("username", "key") if key in values}
-                self._file_token = None
-            else:
-                self.config_values, self._file_token = {}, text
+            # Saved secrets are authoritative: KAGGLE_* variables and ~/.kaggle belong to another account.
+            self.config_values = {key: secrets[key] for key in ("username", "key") if key in secrets}
+            self._file_token = secrets.get("token")
 
         def _authenticate_with_access_token(self):
-            if credentials is None:
+            if secrets is None:
                 return super()._authenticate_with_access_token()
             username = self._file_token and self._introspect_token(self._file_token)
             if not username:
@@ -109,7 +104,7 @@ def _api_class(credentials: Path | None):
             return True
 
         def _authenticate_with_oauth_creds(self):
-            return credentials is None and super()._authenticate_with_oauth_creds()
+            return secrets is None and super()._authenticate_with_oauth_creds()
 
     return BoundedApi
 
@@ -123,16 +118,31 @@ class KaggleProvider:
         self._api = None
         self._resources = {}
 
+    def _secrets(self):
+        """The credentials file's entry, else an older per-account file, else Kaggle's discovery."""
+        if secrets := account_secrets(self.account.id):
+            return secrets
+        if self.account.credentials is not None:
+            return kaggle_secrets(self.account.credentials.expanduser().read_text())
+        return None
+
     @property
     def api(self):
         if self._api is None:
             try:
-                api = _api_class(self.account.credentials)()
+                secrets = self._secrets()
+            except (OSError, ValueError) as error:  # Messages name the file, never its contents.
+                raise RemoteError(
+                    f"Cannot read the credentials of {self.account.id}: {error}", "auth"
+                ) from error
+            try:
+                api = _api_class(secrets)()
                 with _quiet():
                     api.authenticate()
             except (SystemExit, Exception) as error:
                 raise RemoteError(
-                    f"Kaggle authentication unavailable for {self.account.id}; configure its credentials",
+                    f"Kaggle authentication unavailable for {self.account.id}. Add its credentials "
+                    f"with compute-runner account add, or in {credentials_path()}",
                     "auth",
                 ) from error
             user = api.config_values.get(api.CONFIG_NAME_USER) or ""

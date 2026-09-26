@@ -182,6 +182,32 @@ def test_param_options_are_read_like_yaml_and_screened(tmp_path):
         specs("--lr=1")
 
 
+def test_names_inputs_and_requirements_need_no_workload_file(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("")
+    (project / "requirements.txt").write_text("")
+    (tmp_path / "data").mkdir()
+    monkeypatch.chdir(tmp_path)
+    options = dict(module=None, gpu=None, internet=True, accelerator=None)
+    [spec] = workload_specs(
+        project,
+        entrypoint="train.py",
+        name="cifar10-resnet18",
+        requirements="requirements.txt",
+        input=["data=data", "weights=kaggle:owner/weights/3", "machine=ssh:/data/set"],
+        **options,
+    )
+    assert spec.name == "cifar10-resnet18" and spec.requirements == "requirements.txt"
+    assert spec.inputs == {
+        "data": tmp_path / "data",
+        "weights": Path("kaggle:owner/weights/3"),
+        "machine": Path("ssh:/data/set"),
+    }
+    with pytest.raises(ValueError, match="ALIAS=PATH"):
+        workload_specs(project, entrypoint="train.py", input=["data"], **options)
+
+
 def test_earlier_request_keys_still_replay(setup):
     client, _, spec = setup
     intent = client._intent(client._normalize(spec))

@@ -1,3 +1,0 @@
-interface:
-  display_name: "Compute Runner"
-  short_description: "Queue compute workloads and inspect compact job updates"

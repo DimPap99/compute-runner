@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from compute_runner import Account, Config
 from compute_runner.cli import app
 from compute_runner.providers import RemoteError
+from compute_runner.credentials import account_secrets, credentials_path, kaggle_secrets
 from compute_runner.providers.kaggle import KaggleProvider, _api_class
 from conftest import due
 
@@ -204,11 +205,6 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
     missing = tmp_path / "missing.json"
     with pytest.raises(ValueError, match="Credentials file not found"):
         run("account", "add", "kaggle", "other", "--credentials", str(missing))
-    readable = tmp_path / "kaggle.json"
-    readable.write_text("{}")
-    readable.chmod(0o644)
-    with pytest.raises(ValueError, match="chmod 600"):
-        run("account", "add", "kaggle", "other", "--credentials", str(readable))
     run("account", "add", "kaggle", "tester")
     assert run("account", "add", "kaggle", "other", "--default")["accounts"] == ["kaggle:other", "kaggle:tester"]
     # Updating an account typed in other casing keeps the ID its jobs refer to.
@@ -227,7 +223,7 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
 def credentials_api(path, monkeypatch, **env):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    api = _api_class(path)()
+    api = _api_class(kaggle_secrets(path.read_text()))()
     api.authenticate()
     return api
 
@@ -246,6 +242,61 @@ def test_account_credentials_file_ignores_ambient_kaggle_settings(tmp_path, monk
     with pytest.raises(RemoteError, match="authenticate as tester") as error:
         provider.api
     assert error.value.kind == "auth"
+
+
+def test_account_add_keeps_every_secret_in_the_credentials_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
+    runner = CliRunner()
+
+    def add(*args, input=None):
+        result = runner.invoke(app, ["--json", "account", "add", *args], input=input)
+        if result.exception and not isinstance(result.exception, SystemExit):
+            raise result.exception
+        return json.loads(result.output.splitlines()[-1])
+
+    kaggle_json = tmp_path / "kaggle.json"
+    kaggle_json.write_text(json.dumps({"username": "alice", "key": "a" * 32}))
+    kaggle_json.chmod(0o644)  # Read as it is; no permission requirement.
+    assert add("kaggle", "alice", "--credentials", str(kaggle_json))["credentials_file"] == str(credentials_path())
+    with pytest.raises(ValueError, match="holds the key of alice, not bob"):
+        add("kaggle", "bob", "--credentials", str(kaggle_json))
+    # Typed secrets are not echoed, so the JSON output stays clean.
+    add("kaggle", "bob", "--enter-key", input="KGAT_typed_token\n")
+    add("ssh", "lab", "--host", "h", "--login", "me", "--enter-password", input="hunter2\n")
+    assert account_secrets("kaggle:alice") == {"username": "alice", "key": "a" * 32}
+    assert account_secrets("KAGGLE:BOB") == {"token": "KGAT_typed_token"}
+    assert account_secrets("ssh:lab") == {"password": "hunter2"}
+    # A key replaces the password; only its path is kept.
+    key = tmp_path / "id_ed25519"
+    key.write_text("key")
+    add("ssh", "lab", "--key", str(key))
+    assert account_secrets("ssh:lab") == {"key": str(key)}
+    # Secrets never reach the configuration, and the credentials file is private to this user.
+    config = (tmp_path / "config/config.json").read_text()
+    assert "a" * 32 not in config and "KGAT" not in config and "hunter2" not in config
+    assert oct(credentials_path().stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(ValueError, match="applies to SSH accounts only"):
+        add("kaggle", "alice", "--enter-password")
+    with pytest.raises(ValueError, match="Choose one of"):
+        add("ssh", "lab", "--key", str(key), "--enter-password")
+    runner.invoke(app, ["--json", "account", "remove", "kaggle:bob"])
+    assert account_secrets("kaggle:bob") == {} and account_secrets("kaggle:alice")
+
+
+def test_providers_read_the_credentials_file_before_older_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    older = tmp_path / "old.json"
+    older.write_text(json.dumps({"username": "alice", "key": "o" * 32}))
+    provider = KaggleProvider(Account(user="alice", credentials=older), tmp_path)
+    assert provider._secrets() == {"username": "alice", "key": "o" * 32}
+    credentials_path().parent.mkdir(parents=True)
+    credentials_path().write_text(json.dumps({"kaggle:alice": {"username": "alice", "key": "n" * 32}}))
+    assert provider._secrets()["key"] == "n" * 32
+    credentials_path().write_text(json.dumps({"kaggle:alice": {"password": "x"}}))
+    with pytest.raises(RemoteError, match="take text fields: key, token, username") as error:
+        provider.api
+    assert "x" not in str(error.value).split("take text fields")[0].split(":")[-1]
 
 
 def test_account_token_file_wins_over_the_environment_token(tmp_path, monkeypatch):
@@ -380,3 +431,15 @@ def test_cancel_never_touches_a_notebook_the_runner_did_not_launch(tmp_path):
     for ref in ["tester/my-analysis", "someone/kgr-x-a1"]:
         with pytest.raises(ValueError, match="not a launch notebook"):
             provider.cancel(ref, "job")
+
+
+def test_doctor_says_where_each_login_comes_from_without_the_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
+    runner = CliRunner()
+    runner.invoke(app, ["--json", "account", "add", "kaggle", "alice", "--enter-key"], input="KGAT_secret_value\n")
+    runner.invoke(app, ["--json", "account", "add", "kaggle", "bob"])
+    result = runner.invoke(app, ["--json", "doctor", "--offline"])
+    assert "KGAT_secret_value" not in result.output
+    found = json.loads(result.output)["credentials"]
+    assert found == {"kaggle:alice": "credentials file: token", "kaggle:bob": "Kaggle's default (~/.kaggle, KAGGLE_*)"}

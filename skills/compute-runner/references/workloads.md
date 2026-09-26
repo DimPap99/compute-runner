@@ -1,5 +1,7 @@
 # Workload files
 
+Most workloads need no file: `agent submit` takes `--name`, `--entrypoint` or `--module`, `--param`, `--input ALIAS=VALUE`, `--requirements`, `--gpu`, `--internet`, `--timeout` and `--arg`. Use a YAML for several jobs in one batch or for fields without a flag (`exclude`, `output_patterns`, `env`, `results_dir`, `auto_download`). It is a new file in the user's project, so write it only after the user agrees.
+
 YAML accepts one job mapping or a `jobs:` list. Source and input paths are relative to the YAML file (`~` is expanded); entrypoint and requirements paths are relative to the source folder.
 
 ```yaml
@@ -46,6 +48,6 @@ Quote references in YAML. The older `datasets: [OWNER/SLUG/VERSION]` list still 
 
 Optional fields: `accelerator: NvidiaTeslaT4`, `env: {SEED: "42"}`, `requirements: requirements.txt` (requires internet), `exclude: [checkpoints/]`, `auto_download: true`, `output_patterns: ["outputs/*.json"]`. Leave GPU accelerator unspecified unless a particular accelerator is needed. `accelerator`, dataset references, and the timeout limit are provider-specific and are checked against the job's account at submission; on Kaggle the timeout is 1–43200 seconds. SSH machines take no accelerator ID, require `internet: true`, and run notebooks only when the machine has `nbconvert`. The account is chosen with `--account`, not in YAML.
 
-The runner excludes credential filenames, virtual environments, caches, and Git metadata. The source folder respects its `.gitignore`, `.kgrignore`, and `exclude`; input folders respect only `.kgrignore`. It does not detect secrets embedded in ordinary code. `env` is persisted configuration, so use it for nonsecret values only. No local environment or virtual environment is automatically forwarded. Runtime output goes in `os.environ["KGR_OUTPUT_DIR"]`. CPU code can also use Kaggle's preinstalled libraries without internet; on an SSH machine, packages installed in its Python are available, and `requirements` installs into a virtual environment of the run.
+The runner excludes credential filenames, virtual environments, caches, and Git metadata. The source folder respects its `.gitignore`, `.kgrignore`, and `exclude`; input folders respect only `.kgrignore`. It does not detect secrets embedded in ordinary code. `env` is persisted configuration, so use it for nonsecret values only. No local environment or virtual environment is automatically forwarded. Runtime output goes in `os.environ["KGR_OUTPUT_DIR"]`. On Kaggle, code can use its preinstalled libraries without internet; on an SSH machine, packages installed in its Python are available, and `requirements` installs into a virtual environment of the run.
 
-The ordinary CLI and Python API retain full records for deeper diagnostics. Read `~/compute-runner/README.md` only for details outside this reference.
+The ordinary CLI and Python API retain full records for deeper diagnostics. Read the project's `README.md` only for details outside this reference.

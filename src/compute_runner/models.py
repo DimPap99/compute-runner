@@ -105,14 +105,14 @@ class JobSpec(Model):
 
 
 class SshSettings(Model):
-    """How to reach one machine over SSH. Secrets stay in files; only their paths are saved."""
+    """How to reach one machine over SSH. Its key or password is in the credentials file."""
 
     host: str = Field(min_length=1)
     port: int = Field(default=22, ge=1, le=65535)
     username: str = Field(min_length=1)
-    # A private key file; None tries ssh-agent and the default keys in ~/.ssh.
+    # Older configurations named a key or password file here; account add now keeps both in the
+    # credentials file (see credentials.py), which takes precedence.
     key: Path | None = None
-    # A file holding the password, for machines without key login.
     password_file: Path | None = None
     # Where runs, bundles and virtual environments live on the machine; relative to the home folder.
     workdir: str = ".compute-runner"
@@ -134,7 +134,9 @@ class Account(Model):
     provider: Literal["kaggle", "ssh"] = "kaggle"
     # The account's name: the Kaggle username, or a name chosen for an SSH machine.
     user: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
-    # A credentials file for this account only; None uses the provider's standard discovery.
+    # An older configuration's credentials file for this account; account add now saves secrets in
+    # the credentials file (see credentials.py), which takes precedence. With neither, the
+    # provider's standard discovery applies.
     credentials: Path | None = None
     cpu_limit: int = Field(default=5, ge=0)
     gpu_limit: int = Field(default=1, ge=0)
