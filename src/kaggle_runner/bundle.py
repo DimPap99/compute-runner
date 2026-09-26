@@ -14,6 +14,7 @@ import nbformat
 import pathspec
 
 from .models import JobSpec
+from .security import detected_secret, secret_filename
 from .store import atomic_json
 
 MANIFEST = "kgr-manifest.json"
@@ -31,17 +32,11 @@ PROTECTED = {
     ".ssh",
     ".aws",
     ".azure",
+    ".docker",
     ".gnupg",
+    ".kube",
+    ".password-store",
     "node_modules",
-}
-SECRET_NAMES = {
-    ".env",
-    "kaggle.json",
-    "access_token",
-    "credentials",
-    "credentials.json",
-    "id_rsa",
-    "id_ed25519",
 }
 
 
@@ -68,10 +63,8 @@ def inventory(source: Path, exclude: list[str]) -> tuple[Path, list[Path]]:
 
     def protect(path):
         return (
-            any(p in PROTECTED for p in path.parts)
-            or path.name in SECRET_NAMES
-            or path.name.startswith(".env.")
-            or path.suffix in {".pem", ".key", ".p12"}
+            any(p.casefold() in PROTECTED for p in path.parts)
+            or secret_filename(path.name)
         )
 
     candidates = []
@@ -193,15 +186,23 @@ def snapshot_bundle(source: Path, exclude: list[str], bundle_root: Path, *, note
             with destination.open("wb") as output:
                 if notebooks and original.suffix == ".ipynb":
                     data = clean_notebook(original)
+                    if kind := detected_secret(data):
+                        raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
                     output.write(data)
                     digest.update(data)
                     size = len(data)
                 else:
+                    tail = b""
                     with original.open("rb") as input_file:
                         while chunk := input_file.read(1024 * 1024):
+                            if kind := detected_secret(tail + chunk):
+                                raise ValueError(
+                                    f"Detected {kind} in {relative}; remove or exclude that credential"
+                                )
                             digest.update(chunk)
                             output.write(chunk)
                             size += len(chunk)
+                            tail = chunk[-512:]
                 output.flush()
                 os.fsync(output.fileno())
             after = original.stat()

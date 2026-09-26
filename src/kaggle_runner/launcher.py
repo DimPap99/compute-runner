@@ -7,6 +7,7 @@ import nbformat
 
 from . import runtime
 from .models import JobRecord
+from .security import redacted_env_record
 from .store import atomic_json
 
 
@@ -71,5 +72,5 @@ def prepare_kernel(job: JobRecord, state_dir: Path) -> Path:
     if job.spec.accelerator:
         metadata["machine_shape"] = job.spec.accelerator
     atomic_json(folder / "kernel-metadata.json", metadata)
-    atomic_json(folder / "provenance.json", job.model_dump(mode="json"))
+    atomic_json(folder / "provenance.json", redacted_env_record(job.model_dump(mode="json")))
     return folder

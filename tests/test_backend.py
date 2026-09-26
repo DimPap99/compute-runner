@@ -3,18 +3,26 @@ from types import SimpleNamespace as Obj
 import pytest
 import requests
 
-from kaggle_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error
+from kaggle_runner import store as store_module
+from kaggle_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error, safe_message
+from kaggle_runner.store import atomic_write
 
 
 class Response:
-    def __init__(self, data=b"hello", fail=False):
+    def __init__(self, data=b"hello", fail=False, status_code=200, location=None):
         self.data, self.fail = data, fail
+        self.status_code = status_code
         self.headers = {"Content-Length": str(len(data))}
+        if location:
+            self.headers["Location"] = location
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
+        pass
+
+    def close(self):
         pass
 
     def raise_for_status(self):
@@ -71,6 +79,102 @@ def test_download_rejects_symlink_escape(tmp_path):
     (root / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="outside"):
         download_outputs([page("link/file")], tmp_path / "result", get=lambda *a, **k: Response())
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://storage.googleapis.com/file",
+        "https://127.0.0.1/file",
+        "https://169.254.169.254/latest/meta-data",
+        "https://user:" + "pass" + "word@example.test/file",
+        "https://example.test:8443/file",
+    ],
+)
+def test_download_rejects_unsafe_urls_before_connecting(tmp_path, url):
+    calls = []
+    pages = [Obj(files=[Obj(file_name="one.txt", url=url)], log=None)]
+    with pytest.raises(ValueError):
+        download_outputs(pages, tmp_path, get=lambda *a, **k: calls.append(a) or Response())
+    assert calls == []
+
+
+def test_download_validates_redirect_destination(tmp_path):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response(status_code=302, location="https://127.0.0.1/private")
+
+    with pytest.raises(ValueError, match="non-public"):
+        download_outputs([page("one.txt")], tmp_path, get=get)
+    assert len(calls) == 1
+    assert calls[0][1]["allow_redirects"] is False
+
+
+def test_safe_message_redacts_credentials():
+    key = "a" * 32
+    message = safe_message(
+        "failed https://name:" + f"pass{'word'}@example.test/file?signature=value KAGGLE_KEY={key}"
+    )
+    assert "password" not in message and key not in message and "signature" not in message
+
+
+def test_downloaded_log_redacts_credentials(tmp_path):
+    token = "KGAT_" + "a" * 24
+    download_outputs([page(log=f"failed with {token}")], tmp_path, get=lambda *a, **k: Response())
+    saved = (tmp_path / "run.log").read_text()
+    assert token not in saved and "[redacted]" in saved
+
+
+def test_low_disk_warning_is_emitted_once_per_filesystem(tmp_path, monkeypatch, caplog):
+    gib = 1024**3
+    free = 64 * 1024**2
+    monkeypatch.setattr(
+        store_module.shutil,
+        "disk_usage",
+        lambda path: Obj(total=gib, used=gib - free, free=free),
+    )
+    store_module._LOW_DISK_DEVICES.clear()
+    caplog.set_level("WARNING", logger="kaggle_runner.store")
+    try:
+        atomic_write(tmp_path / "one", b"one", check_space=True, expected_bytes=3)
+        atomic_write(tmp_path / "two", b"two", check_space=True, expected_bytes=3)
+        warnings = [record for record in caplog.records if "Low disk space" in record.message]
+        assert len(warnings) == 1 and "6.2% free" in warnings[0].message
+    finally:
+        store_module._LOW_DISK_DEVICES.clear()
+
+
+def test_known_download_that_cannot_fit_is_rejected_before_writing(tmp_path, monkeypatch):
+    headroom = store_module.DISK_WRITE_HEADROOM
+    monkeypatch.setattr(
+        store_module.shutil,
+        "disk_usage",
+        lambda path: Obj(total=1024**3, used=1024**3 - headroom, free=headroom),
+    )
+    pages = [page("one.txt", log=None)]
+    with pytest.raises(OSError, match="Insufficient disk space"):
+        download_outputs(pages, tmp_path, get=lambda *a, **k: Response())
+    assert not (tmp_path / "outputs/one.txt").exists()
+
+
+def test_unknown_download_size_is_checked_while_streaming(tmp_path, monkeypatch):
+    free = store_module.DISK_WRITE_HEADROOM + 2
+    monkeypatch.setattr(
+        store_module.shutil,
+        "disk_usage",
+        lambda path: Obj(total=1024**3, used=1024**3 - free, free=free),
+    )
+
+    def get(*args, **kwargs):
+        response = Response()
+        response.headers = {}
+        return response
+
+    with pytest.raises(OSError, match="Insufficient disk space"):
+        download_outputs([page("one.txt", log=None)], tmp_path, get=get)
+    assert not (tmp_path / "outputs/one.txt").exists()
 
 
 def test_push_error_body_is_not_success(tmp_path):

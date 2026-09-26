@@ -132,7 +132,7 @@ Both submit commands accept `--entrypoint`, `--module`, `--gpu/--cpu`, `--intern
 
 ### Packaging and runtime
 
-Source selection respects the root `.gitignore`, `.kgrignore`, and `exclude` patterns. Credential filenames, Git metadata, virtual environments, caches, and `node_modules` are excluded. Symlinks are rejected. Exclusions operate on filenames and do not detect secrets embedded in source code. Notebook outputs and execution counts are removed from the saved snapshot.
+Source selection respects the root `.gitignore`, `.kgrignore`, and `exclude` patterns. Credential filenames, Git metadata, virtual environments, caches, and `node_modules` are excluded. Before saving a snapshot, the runner also rejects high-confidence private keys and service-token patterns without printing the detected value. This screening reduces accidental disclosure but cannot recognize every possible credential, so keep secrets outside source and input folders. Symlinks are rejected. Notebook outputs and execution counts are removed from the saved snapshot.
 
 Single files are embedded in a generated private kernel. Project directories and local inputs become private datasets. Identical content reuses the same dataset. Managed datasets are immutable and retain source license metadata.
 
@@ -140,7 +140,9 @@ Unversioned dataset references are resolved when the worker prepares the job. Su
 
 Project code runs from `/kaggle/working/project`. Write result files under `KGR_OUTPUT_DIR`, which points to `/kaggle/working/outputs`. Output names are relative to `/kaggle/working`, so a file written to `KGR_OUTPUT_DIR` is saved locally as `results/JOB_ID/outputs/outputs/NAME`. Downloads skip the runtime's copy of the snapshot files under `project/` and its `__pycache__` bytecode; new files the workload writes under `project/` are still collected. Named inputs are exposed through `KGR_INPUT_<UPPERCASE_ALIAS>` and the `KGR_INPUTS_JSON` mapping. Existing Kaggle dataset attachments remain under `/kaggle/input`.
 
-The workload uses Kaggle's Python environment. A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. Do not put credentials in `env`, as those values are stored with the job.
+Output downloads and full log caches have no configured size limit. Before writing, the runner checks free space on the filesystem containing the state directory. Known download sizes are checked up front; unknown or compressed bodies and log streams are checked as chunks arrive. A write that cannot fit with 16 MiB of operational headroom is stopped without replacing an existing file. The worker emits one warning when that filesystem falls below 10% free space and can warn again after space recovers and crosses the threshold later.
+
+The workload uses Kaggle's Python environment. A configured requirements file is installed before execution. Local virtual environments and process environment variables are not forwarded. `env` is only for nonsecret configuration: secret-like variable names and recognizable credential values are rejected because these values must be stored with the job and embedded in the private Kaggle workload.
 
 ## Python API
 

@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
+import logging
 import os
+import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .models import BatchRecord, Config, JobRecord
+
+logger = logging.getLogger(__name__)
+LOW_DISK_FRACTION = 0.10
+DISK_WRITE_HEADROOM = 16 * 1024 * 1024
+_LOW_DISK_DEVICES = set()
+_LOW_DISK_LOCK = threading.Lock()
 
 
 def config_path() -> Path:
@@ -31,18 +41,62 @@ def load_config() -> Config:
     return Config.model_validate_json(path.read_text()) if path.exists() else Config()
 
 
-def atomic_write(path: Path, data):
+def _disk_status(path: Path):
+    usage = shutil.disk_usage(path.parent)
+    device = path.parent.stat().st_dev
+    low = usage.total > 0 and usage.free / usage.total < LOW_DISK_FRACTION
+    with _LOW_DISK_LOCK:
+        warned = device in _LOW_DISK_DEVICES
+        if low:
+            _LOW_DISK_DEVICES.add(device)
+        else:
+            _LOW_DISK_DEVICES.discard(device)
+    if low and not warned:
+        logger.warning(
+            "Low disk space for %s: %.1f%% free (%s of %s bytes)",
+            path,
+            usage.free / usage.total * 100,
+            usage.free,
+            usage.total,
+        )
+    return usage
+
+
+def _require_disk_space(path: Path, required: int):
+    usage = _disk_status(path)
+    needed = required + DISK_WRITE_HEADROOM
+    if usage.free < needed:
+        raise OSError(
+            errno.ENOSPC,
+            f"Insufficient disk space: need {needed} bytes including write headroom, "
+            f"have {usage.free}",
+            str(path),
+        )
+    return usage
+
+
+def atomic_write(path: Path, data, *, check_space=False, expected_bytes=None):
     """Privately replace path with bytes or byte chunks. A failure midway keeps the old file."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if expected_bytes is not None:
+        if type(expected_bytes) is not int or expected_bytes < 0:
+            raise ValueError("expected_bytes must be a nonnegative integer")
+        _require_disk_space(path, expected_bytes)
+    elif check_space:
+        _require_disk_space(path, 0)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
             for chunk in [data] if isinstance(data, bytes) else data:
+                if check_space:
+                    _require_disk_space(path, len(chunk))
                 stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if check_space or expected_bytes is not None:
+            _disk_status(path)
     finally:
         temporary.unlink(missing_ok=True)
 

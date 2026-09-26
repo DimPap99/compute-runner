@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .security import validate_nonsecret_env
+
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +54,7 @@ class JobSpec(Model):
             raise ValueError("Input names must be unique ignoring case")
         if any(key.startswith("KGR_") for key in self.env):
             raise ValueError("KGR_ environment variables are reserved")
+        validate_nonsecret_env(self.env)
         for ref in self.datasets:
             if not re.fullmatch(r"[\w-]+/[\w-]+(?:/[1-9]\d*)?", ref):
                 raise ValueError(f"Invalid dataset reference: {ref}")

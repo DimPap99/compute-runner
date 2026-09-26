@@ -195,7 +195,11 @@ class AgentClient:
             or (job.finished_at is not None and path.stat().st_mtime < job.finished_at)
         )
         if fetched:
-            atomic_write(path, (chunk.encode() for chunk in self.client.logs(job_id, follow=False)))
+            atomic_write(
+                path,
+                (chunk.encode() for chunk in self.client.logs(job_id, follow=False)),
+                check_space=True,
+            )
         with path.open("rb") as stream:
             stat = os.fstat(stream.fileno())
             stream.seek(max(0, stat.st_size - max_bytes))

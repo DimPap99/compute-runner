@@ -18,6 +18,7 @@ from rich.table import Table
 
 from .client import Client
 from .models import Config, JobSpec
+from .security import redacted_env_record
 from .store import atomic_json, config_path
 from . import service
 
@@ -46,7 +47,10 @@ def _client(ctx):
 
 
 def _job_dict(job):
-    return job.model_dump(mode="json") | {"url": job.url, "remote_ref": job.remote_ref}
+    return redacted_env_record(job.model_dump(mode="json")) | {
+        "url": job.url,
+        "remote_ref": job.remote_ref,
+    }
 
 
 def _emit(ctx, value):

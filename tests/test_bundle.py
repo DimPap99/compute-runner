@@ -27,7 +27,18 @@ def test_snapshot_is_immutable_and_reused(setup):
 def test_credential_cache_and_ignore_exclusions(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
-    for name in ["main.py", ".env", ".env.production", "kaggle.json", "key.pem", "skip.txt", "keep.txt"]:
+    for name in [
+        "main.py",
+        ".env",
+        ".env.production",
+        ".netrc",
+        ".npmrc",
+        "KAGGLE.JSON",
+        "key.PEM",
+        "state.tfstate.backup",
+        "skip.txt",
+        "keep.txt",
+    ]:
         (project / name).write_text("example")
     (project / ".gitignore").write_text("skip.txt\n")
     (project / ".kgrignore").write_text("keep.txt\n")
@@ -35,6 +46,24 @@ def test_credential_cache_and_ignore_exclusions(tmp_path):
     (project / ".venv" / "secret").write_text("example")
     _, files = inventory(project, [])
     assert {p.name for p in files} == {"main.py", ".gitignore", ".kgrignore"}
+
+
+def test_snapshot_rejects_detected_credential_without_echoing_it(tmp_path):
+    source = tmp_path / "main.py"
+    credential = "KAGGLE_KEY=" + "a" * 32
+    source.write_text("print('before')\n" + credential + "\n")
+    with pytest.raises(ValueError, match="Detected Kaggle API key") as error:
+        snapshot_bundle(source, [], tmp_path / "bundles")
+    assert credential not in str(error.value)
+
+
+def test_job_env_rejects_secret_names_and_values(tmp_path):
+    source = tmp_path / "main.py"
+    source.write_text("pass")
+    with pytest.raises(ValueError, match="looks secret"):
+        JobSpec(source=source, env={"API_TOKEN": "anything"})
+    with pytest.raises(ValueError, match="detected Kaggle token"):
+        JobSpec(source=source, env={"VALUE": "KGAT_" + "a" * 24})
 
 
 def test_rejects_symlink_and_missing_entrypoint(tmp_path):

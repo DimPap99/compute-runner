@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .backend import RemoteError, safe_message
 from .launcher import prepare_kernel
 from .models import ACTIVE, TERMINAL, Attempt, Config
+from .security import redacted_env_record
 from .store import Store, atomic_json
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,10 @@ def collect_outputs(store, backend, job_id):
                 job.remote_ref, job.result_dir, job.spec.output_patterns, skip=source_copies(job)
             )
             updated = store.update(job_id, download_state="complete", download_error=None)
-            atomic_json(job.result_dir / "provenance.json", updated.model_dump(mode="json"))
+            atomic_json(
+                job.result_dir / "provenance.json",
+                redacted_env_record(updated.model_dump(mode="json")),
+            )
             return updated
         except Exception as error:
             store.update(
@@ -183,7 +187,7 @@ class Worker:
             remote_state=remote,
             last_polled_at=now,
             attempts=job.attempts,
-            error=status.get("error"),
+            error=safe_message(status["error"]) if status.get("error") else None,
             wait_reason="Cancellation requested on Kaggle" if remote == "CANCEL_REQUESTED" else None,
             next_action_at=now + self.config.poll_seconds,
         )

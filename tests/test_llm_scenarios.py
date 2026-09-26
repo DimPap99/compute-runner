@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace as Obj
+from urllib.parse import urlsplit
 
 import nbformat
 import pytest
@@ -236,7 +237,9 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
 
     remote = sorted(p.relative_to(working).as_posix() for p in working.rglob("*") if p.is_file())
     assert "project/pkg/helper.py" in remote and any("__pycache__" in name for name in remote)
-    pages = [Obj(files=[Obj(file_name=n, url=n) for n in remote], log="done")]
+    pages = [
+        Obj(files=[Obj(file_name=n, url="https://example.test/" + n) for n in remote], log="done")
+    ]
 
     class Response:
         def __init__(self, name):
@@ -257,7 +260,10 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
 
     destination = tmp_path / "result"
     receipts = download_outputs(
-        pages, destination, skip=source_copies(job), get=lambda url, **k: Response(url)
+        pages,
+        destination,
+        skip=source_copies(job),
+        get=lambda url, **k: Response(urlsplit(url).path.lstrip("/")),
     )
     assert sorted(receipts) == ["outputs/metrics.json", "project/checkpoint.bin"]
     assert (destination / "outputs/outputs/metrics.json").read_text() == "7"
