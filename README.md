@@ -634,4 +634,4 @@ The reference returned by `stage` is saved before `submit` runs, so an interrupt
 
 The Kaggle adapter pins `kaggle==2.2.4` and `kagglesdk==0.1.37`. SDK transport retries are disabled. The worker determines whether a remote operation can be retried. The Kaggle client is imported when a remote operation is required.
 
-Example workloads are under [examples](examples). The GPU smoke test requires `--gpu --internet`. Running examples on Kaggle creates private resources and uses the corresponding compute allocation. See [VALIDATION.md](VALIDATION.md) for recorded test results and live checks.
+Example workloads are under [examples](examples). The GPU smoke test requires `--gpu --internet`. Running examples on Kaggle creates private resources and uses the corresponding compute allocation.
