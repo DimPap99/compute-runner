@@ -109,7 +109,11 @@ class AgentClient:
         return value
 
     def status(self, job_ids=None, *, batch_id=None, states=None, limit=20, offset=0):
-        """Read local state only. Page size is bounded; counts cover the whole selection."""
+        """Read local state only. Page size is bounded; counts cover the whole selection.
+
+        A batch lists in submission order; other selections list the newest jobs first, so a new
+        conversation sees current work on the first page.
+        """
         _page_bounds(limit, offset)
         job_ids = self._job_ids(job_ids)
         if states is not None:
@@ -122,6 +126,7 @@ class AgentClient:
             states=states,
             limit=limit,
             offset=offset,
+            newest_first=batch_id is None,
         )
         total = sum(counts.values())
         return dict(

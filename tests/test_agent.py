@@ -326,6 +326,19 @@ def test_status_and_changes_are_local_only(setup):
     assert client._backend is None
 
 
+def test_status_lists_the_newest_jobs_first_but_a_batch_in_order(setup):
+    client, _, spec = setup
+    batch = client.submit_batch([spec.model_copy(update={"name": f"job{i}"}) for i in range(3)])
+    latest = client.submit(spec.model_copy(update={"name": "latest"}))
+    agent = client.agent()
+    # A new conversation sees current work first, not the oldest page of a long-lived queue.
+    first = agent.status(limit=2)
+    assert [job["name"] for job in first["jobs"]] == ["latest", "job2"] and first["next_offset"] == 2
+    assert [job["name"] for job in agent.status(limit=2, offset=2)["jobs"]] == ["job1", "job0"]
+    assert [job["name"] for job in agent.status(batch_id=batch.id)["jobs"]] == ["job0", "job1", "job2"]
+    assert agent.status([latest.id])["jobs"][0]["id"] == latest.id
+
+
 def test_cli_reports_invalid_yaml_and_database_failures_as_json(setup, tmp_path, monkeypatch):
     client, _, _ = setup
     monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)

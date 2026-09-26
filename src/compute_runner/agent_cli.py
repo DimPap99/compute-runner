@@ -87,7 +87,7 @@ def status(
     limit: int = 20,
     offset: int = 0,
 ):
-    """Local status for a batch, specific jobs, or all jobs; paginated, with aggregate counts."""
+    """Local status for a batch, specific jobs, or all jobs (newest first); paginated, with counts."""
     return ctx.obj["client"].agent().status(job_ids, batch_id=batch, states=state, limit=limit, offset=offset)
 
 

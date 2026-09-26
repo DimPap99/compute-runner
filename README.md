@@ -347,7 +347,7 @@ compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 
 Status, submit, retry, and cancel responses contain `schema_version`, `batch_id`, `total`, `counts`, `jobs`, `next_offset`, and `worker`. Submit and retry also return `replayed`.
 
-The default page size is 20 jobs, with a maximum of 100. `counts` and `total` cover the full selection. Follow `next_offset` until it is null:
+The default page size is 20 jobs, with a maximum of 100. A batch is listed in submission order; any other selection lists the newest jobs first. `counts` and `total` cover the full selection. Follow `next_offset` until it is null:
 
 ```bash
 compute-runner agent status --batch BATCH_ID --limit 20 --offset 0

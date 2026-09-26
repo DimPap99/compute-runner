@@ -7,7 +7,7 @@ description: "Submit and monitor workloads with the local Compute Runner queue o
 
 Jobs run on provider accounts the user has connected, such as `kaggle:alice`. Kaggle is the only provider today; the user may have several Kaggle accounts.
 
-Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent status`.
+Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent status`, which lists the newest jobs first.
 
 ## Permissions
 
@@ -78,7 +78,7 @@ RESULTS/NAME/
     working/                 other files it left in its working directory
 ```
 
-`job.json` and `runs.md` are regenerated from the queue whenever the job changes; treat them as read-only. A new conversation can find earlier work with `compute-runner agent status`, which lists every job with its `run_dir`.
+`job.json` and `runs.md` are regenerated from the queue whenever the job changes; treat them as read-only. A new conversation can find earlier work with `compute-runner agent status`, which lists jobs newest first with their `run_dir`; follow `next_offset` for older ones.
 
 ## Observe efficiently
 

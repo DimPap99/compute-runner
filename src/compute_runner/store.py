@@ -350,7 +350,8 @@ class Store:
             args.extend(states)
         return " AND ".join(clauses) or "1", args
 
-    def page(self, *, batch_id=None, job_ids=None, states=None, limit=20, offset=0):
+    def page(self, *, batch_id=None, job_ids=None, states=None, limit=20, offset=0, newest_first=False):
+        """A batch in submission order; otherwise by creation time, oldest first unless newest_first."""
         with self.connection() as db:
             db.execute("BEGIN")
             where, args = self._filters(db, batch_id, job_ids, states)
@@ -359,9 +360,10 @@ class Store:
                     f"SELECT j.state,COUNT(*) FROM jobs j WHERE {where} GROUP BY j.state", args
                 ).fetchall()
             )
-            order = (
-                "(SELECT position FROM batch_jobs b WHERE b.job_id=j.id)" if batch_id else "j.created,j.id"
-            )
+            if batch_id:
+                order = "(SELECT position FROM batch_jobs b WHERE b.job_id=j.id)"
+            else:
+                order = "j.created DESC,j.id DESC" if newest_first else "j.created,j.id"
             rows = db.execute(
                 f"SELECT j.record FROM jobs j WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 [*args, limit, offset],
