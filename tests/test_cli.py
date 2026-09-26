@@ -2,9 +2,9 @@ import json
 
 from typer.testing import CliRunner
 
-from kaggle_runner import Client
-from kaggle_runner.cli import app, load_specs
-from kaggle_runner.service import unit_text
+from compute_runner import Client
+from compute_runner.cli import app, load_specs
+from compute_runner.service import unit_text
 
 
 def test_cli_init_dry_run_and_submit(tmp_path, monkeypatch):

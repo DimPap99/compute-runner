@@ -6,11 +6,11 @@ import zipfile
 import nbformat
 import pytest
 
-from kaggle_runner import JobSpec
-from kaggle_runner.bundle import describe, inventory, snapshot, snapshot_bundle
-from kaggle_runner.launcher import prepare_kernel
-from kaggle_runner.models import Attempt
-from kaggle_runner.runtime import _find_bundle, _unpack
+from compute_runner import JobSpec
+from compute_runner.bundle import describe, inventory, snapshot, snapshot_bundle
+from compute_runner.launcher import prepare_kernel
+from compute_runner.models import Attempt
+from compute_runner.runtime import _find_bundle, _unpack
 
 
 def test_snapshot_is_immutable_and_reused(setup):

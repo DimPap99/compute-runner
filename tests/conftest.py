@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from kaggle_runner import Client, Config, JobSpec
-from kaggle_runner.backend import RemoteError
+from compute_runner import Client, Config, JobSpec
+from compute_runner.backend import RemoteError
 
 
 class FakeBackend:

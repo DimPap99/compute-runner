@@ -1,4 +1,4 @@
-"""End-to-end scenarios for an LLM driving the queue through `kgr agent` and AgentClient."""
+"""End-to-end scenarios for an LLM driving the queue through `compute-runner agent` and AgentClient."""
 
 import json
 import os
@@ -15,12 +15,12 @@ import requests
 import urllib3
 from typer.testing import CliRunner
 
-from kaggle_runner import JobSpec
-from kaggle_runner.backend import READ_TIMEOUT, KaggleBackend, RemoteError, download_outputs
-from kaggle_runner.cli import app
-from kaggle_runner.launcher import prepare_kernel
-from kaggle_runner.models import Attempt
-from kaggle_runner.worker import source_copies
+from compute_runner import JobSpec
+from compute_runner.backend import READ_TIMEOUT, KaggleBackend, RemoteError, download_outputs
+from compute_runner.cli import app
+from compute_runner.launcher import prepare_kernel
+from compute_runner.models import Attempt
+from compute_runner.worker import source_copies
 from conftest import due
 
 
@@ -67,7 +67,7 @@ def workload(tmp_path):
 
 def test_llm_submit_monitor_wait_and_read_results(setup, workload, monkeypatch):
     client, backend, _ = setup
-    monkeypatch.setattr("kaggle_runner.cli.Client", lambda **_: client)
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
     monkeypatch.chdir(workload.parent)
     command = agent_cli()
     preview = command("submit", workload, "--request-key", "exp-1", "--dry-run")
@@ -360,7 +360,7 @@ def test_push_reference_case_differences_are_accepted(setup):
 
 def test_structured_errors_for_common_llm_mistakes(setup, tmp_path, monkeypatch):
     client, _, _ = setup
-    monkeypatch.setattr("kaggle_runner.cli.Client", lambda **_: client)
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
     monkeypatch.chdir(tmp_path)
     fail = agent_cli(code=1)
     assert fail("changes", "--batch", "nope")["error"] == "No batch nope"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from pathlib import Path
@@ -11,10 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .security import validate_nonsecret_env
-
-
-def xdg_dir(variable: str, default: str) -> Path:
-    return Path(os.environ.get(variable) or Path.home() / default)
+from .paths import application_dir
 
 
 class Model(BaseModel):
@@ -75,11 +71,7 @@ class Config(Model):
     reconcile_seconds: float = Field(default=300, ge=1)
     # Broad log redaction and locked-down output downloads; see README "Strict mode".
     strict: bool = False
-    state_dir: Path = Field(
-        default_factory=lambda: Path(
-            os.environ.get("KGR_STATE_DIR") or xdg_dir("XDG_DATA_HOME", ".local/share") / "kaggle-runner"
-        )
-    )
+    state_dir: Path = Field(default_factory=lambda: application_dir("STATE"))
 
     @model_validator(mode="after")
     def validate_owner(self):

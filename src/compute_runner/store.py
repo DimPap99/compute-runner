@@ -15,7 +15,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import BatchRecord, Config, JobRecord, xdg_dir
+from .models import BatchRecord, Config, JobRecord
+from .paths import application_dir
 
 logger = logging.getLogger(__name__)
 LOW_DISK_FRACTION = 0.10
@@ -25,10 +26,7 @@ _LOW_DISK_LOCK = threading.Lock()
 
 
 def config_path() -> Path:
-    return (
-        Path(os.environ.get("KGR_CONFIG_DIR") or xdg_dir("XDG_CONFIG_HOME", ".config") / "kaggle-runner")
-        / "config.json"
-    )
+    return application_dir("CONFIG") / "config.json"
 
 
 def try_lock(stream) -> bool:

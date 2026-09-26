@@ -3,10 +3,13 @@
 import subprocess
 import sys
 
-from .models import xdg_dir
+from .paths import LEGACY_APP_NAME, xdg_dir
 from .store import config_path
 
-UNIT_NAME = "kaggle-runner.service"
+UNIT_NAME = "compute-runner.service"
+LEGACY_UNIT_NAME = f"{LEGACY_APP_NAME}.service"
+DESCRIPTION = "Description=Persistent compute workload queue"
+LEGACY_DESCRIPTION = "Description=Persistent Kaggle workload queue"
 
 
 def _quote(value):
@@ -19,14 +22,14 @@ def _quote(value):
 def unit_text(config, python=None):
     executable = python or sys.executable
     return f"""[Unit]
-Description=Persistent Kaggle workload queue
+{DESCRIPTION}
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart={_quote(executable)} -m kaggle_runner --state-dir {_quote(config.state_dir)} worker run
+ExecStart={_quote(executable)} -m compute_runner --state-dir {_quote(config.state_dir)} worker run
 WorkingDirectory={str(config.state_dir).replace("%", "%%")}
-Environment={_quote("KGR_CONFIG_DIR=" + str(config_path().parent))}
+Environment={_quote("COMPUTE_RUNNER_CONFIG_DIR=" + str(config_path().parent))}
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=15
@@ -41,7 +44,12 @@ WantedBy=default.target
 def control(action):
     if action not in {"start", "stop", "restart", "status"}:
         raise ValueError("Invalid service action")
-    return subprocess.run(["systemctl", "--user", action, UNIT_NAME, "--no-pager"], check=action != "status")
+    root = xdg_dir("XDG_CONFIG_HOME", ".config") / "systemd/user"
+    unit = UNIT_NAME
+    legacy = root / LEGACY_UNIT_NAME
+    if not (root / UNIT_NAME).exists() and legacy.is_file() and LEGACY_DESCRIPTION in legacy.read_text():
+        unit = LEGACY_UNIT_NAME
+    return subprocess.run(["systemctl", "--user", action, unit, "--no-pager"], check=action != "status")
 
 
 def install(config, *, start=True):
@@ -49,9 +57,12 @@ def install(config, *, start=True):
     root.mkdir(parents=True, exist_ok=True)
     path = root / UNIT_NAME
     text = unit_text(config)
-    if path.exists() and "Description=Persistent Kaggle workload queue" not in path.read_text():
+    if path.exists() and DESCRIPTION not in path.read_text():
         raise ValueError(f"Refusing to replace an unrelated service: {path}")
     path.write_text(text)
+    legacy = root / LEGACY_UNIT_NAME
+    if legacy.is_file() and LEGACY_DESCRIPTION in legacy.read_text():
+        subprocess.run(["systemctl", "--user", "disable", "--now", LEGACY_UNIT_NAME], check=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     command = ["systemctl", "--user", "enable"]
     if start:

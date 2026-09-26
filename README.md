@@ -1,6 +1,10 @@
-# Kaggle Runner
+# Compute Runner
 
-Run Python scripts, notebooks, and project directories on Kaggle through a local Python API or CLI. A background worker manages uploads, execution status, resource admission, and output downloads. Jobs and submission attempts are stored in SQLite. Source files are snapshotted when a job is submitted.
+Submit, monitor, and resume Python workloads through a local Python API or CLI.
+
+Currently support only Kaggle.
+
+A background worker manages uploads, execution status, resource admission, and output downloads. Jobs and submission attempts are stored in SQLite. Source files are snapshotted when a job is submitted. Resuming training requires checkpoint support in the workload.
 
 The agent interface provides compact JSON responses, persistent batches, idempotent submissions, paginated status queries, change cursors, and bounded log retrieval. It uses the same queue and worker as the standard CLI.
 
@@ -23,12 +27,14 @@ python3 -m venv .venv
 .venv/bin/pip install -e . --no-deps
 source .venv/bin/activate
 
-kgr init --owner YOUR_KAGGLE_USERNAME
-kgr doctor
-kgr service install
+compute-runner init --owner YOUR_KAGGLE_USERNAME
+compute-runner doctor
+compute-runner service install
 ```
 
-`kgr init` saves the account name, local scheduling limits, and [strict mode](#strict-mode). Rerunning it changes only the options you pass. It does not configure Kaggle credentials. `kgr doctor` checks the local configuration, remote quota information, and active runs. Use `kgr doctor --offline` for local checks only.
+`compute-runner init` saves the account name, local scheduling limits, and [strict mode](#strict-mode). Rerunning it changes only the options you pass. It does not configure Kaggle credentials. `compute-runner doctor` checks the local configuration, remote quota information, and active runs. Use `compute-runner doctor --offline` for local checks only.
+
+`compute-runner` is the primary command; `kgr` remains an alias for existing scripts. Python callers import `compute_runner`.
 
 The service must be able to authenticate without an interactive shell. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
 
@@ -37,19 +43,19 @@ The service must be able to authenticate without an interactive shell. Credentia
 Preview the files selected for upload, then submit a workload:
 
 ```bash
-kgr submit examples/hello.py --dry-run
-kgr submit examples/hello.py
-kgr submit examples/project.yaml
-kgr submit examples/batch.yaml
+compute-runner submit examples/hello.py --dry-run
+compute-runner submit examples/hello.py
+compute-runner submit examples/project.yaml
+compute-runner submit examples/batch.yaml
 ```
 
 Inspect a submitted job using the ID returned by `submit`:
 
 ```bash
-kgr list
-kgr status JOB_ID
-kgr logs JOB_ID --follow
-kgr wait JOB_ID
+compute-runner list
+compute-runner status JOB_ID
+compute-runner logs JOB_ID --follow
+compute-runner wait JOB_ID
 ```
 
 Submission writes to the local queue. A running worker is required to upload and launch jobs. CLI job IDs may be unambiguous prefixes. Batch IDs must be complete.
@@ -57,11 +63,11 @@ Submission writes to the local queue. A running worker is required to upload and
 The standard CLI supports JSON output through the global `--json` option:
 
 ```bash
-kgr --json list
-kgr --json status JOB_ID
+compute-runner --json list
+compute-runner --json status JOB_ID
 ```
 
-These commands return full records. Use `kgr agent` for bounded responses intended for automation.
+These commands return full records. Use `compute-runner agent` for bounded responses intended for automation.
 
 ## Workload configuration
 
@@ -152,14 +158,14 @@ Resumability is a workload-code decision, not a runner default. When an agent is
 
 Resumable scripts should expose `--resume auto|required|never|PATH`, `--checkpoint-mode minutes|epochs`, and `--checkpoint-every NUMBER`. Write checkpoints below `KGR_OUTPUT_DIR/checkpoints`; attach a downloaded checkpoint directory to a replacement job as the named input `resume`, which becomes `KGR_INPUT_RESUME`. Use `required` for an intended continuation so a missing or invalid checkpoint cannot silently restart training.
 
-The skill includes a framework-neutral helper at `skills/kaggle-runner/assets/checkpointing.py`. It provides cadence checks, atomic numbered files, a checksummed `latest.json`, compatibility validation, and resume discovery. Training code must still serialize and restore its framework-specific model, optimizer, scheduler, scaler, progress, RNG, and data-loader state. See `skills/kaggle-runner/references/resumability.md` for the complete agent and migration contract.
+The skill includes a framework-neutral helper at `skills/compute-runner/assets/checkpointing.py`. It provides cadence checks, atomic numbered files, a checksummed `latest.json`, compatibility validation, and resume discovery. Training code must still serialize and restore its framework-specific model, optimizer, scheduler, scaler, progress, RNG, and data-loader state. See `skills/compute-runner/references/resumability.md` for the complete agent and migration contract.
 
 ## Python API
 
-Install the package into the calling environment with `pip install -e /path/to/kaggle-runner`.
+Install the package into the calling environment with `pip install -e /path/to/compute-runner`.
 
 ```python
-from kaggle_runner import Client, JobSpec
+from compute_runner import Client, JobSpec
 
 client = Client()
 batch = client.submit_batch(
@@ -206,26 +212,26 @@ Use complete job IDs with `Client`. Optional parameters shown after the first ar
 
 ## Agent interface
 
-`kgr agent` returns one compact JSON object per operation. It does not require `--json`. Responses omit source manifests, full specifications, and environment values. The background worker performs polling and downloads without model calls.
+`compute-runner agent` returns one compact JSON object per operation. It does not require `--json`. Responses omit source manifests, full specifications, and environment values. The background worker performs polling and downloads without model calls.
 
 ```bash
-kgr agent submit examples/batch.yaml --request-key experiment-v1 --dry-run
-kgr agent submit examples/batch.yaml --request-key experiment-v1
-kgr agent status --batch BATCH_ID
-kgr agent status JOB_ID_1 JOB_ID_2
-kgr agent status --state running --state failed
-kgr agent changes --batch BATCH_ID --after 0
-kgr agent logs JOB_ID --tail 50 --max-bytes 8192
-kgr agent wait --batch BATCH_ID --timeout 300
-kgr agent outputs JOB_ID
-kgr agent health
+compute-runner agent submit examples/batch.yaml --request-key experiment-v1 --dry-run
+compute-runner agent submit examples/batch.yaml --request-key experiment-v1
+compute-runner agent status --batch BATCH_ID
+compute-runner agent status JOB_ID_1 JOB_ID_2
+compute-runner agent status --state running --state failed
+compute-runner agent changes --batch BATCH_ID --after 0
+compute-runner agent logs JOB_ID --tail 50 --max-bytes 8192
+compute-runner agent wait --batch BATCH_ID --timeout 300
+compute-runner agent outputs JOB_ID
+compute-runner agent health
 ```
 
-`--dry-run` returns aggregate file sizes, file counts, and resource counts without queueing jobs. The response includes `total`, `files`, `bytes`, `gpu_jobs`, `internet_jobs`, and `private`. Use the standard `kgr submit --dry-run` command for individual filenames.
+`--dry-run` returns aggregate file sizes, file counts, and resource counts without queueing jobs. The response includes `total`, `files`, `bytes`, `gpu_jobs`, `internet_jobs`, and `private`. Use the standard `compute-runner submit --dry-run` command for individual filenames.
 
 ### Submission keys
 
-Agent submissions and retries require `--request-key`. Standard `kgr submit` and the Python submission methods also accept a key.
+Agent submissions and retries require `--request-key`. Standard `compute-runner submit` and the Python submission methods also accept a key.
 
 A key identifies one intended operation within a state directory. Repeating the same request returns the original batch with `replayed: true`. This holds across concurrent callers, process restarts, and completed runs. Reusing the key with different settings raises an error. Submit and retry operations share the same key namespace.
 
@@ -234,7 +240,7 @@ Keys must match `[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`. The comparison uses normal
 Retries use the original saved files:
 
 ```bash
-kgr agent retry JOB_ID --request-key experiment-retry-v1
+compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 ```
 
 ### Status and pagination
@@ -244,8 +250,8 @@ Status, submit, retry, and cancel responses contain `schema_version`, `batch_id`
 The default page size is 20 jobs, with a maximum of 100. `counts` and `total` cover the full selection. Follow `next_offset` until it is null:
 
 ```bash
-kgr agent status --batch BATCH_ID --limit 20 --offset 0
-kgr agent status --batch BATCH_ID --limit 20 --offset 20
+compute-runner agent status --batch BATCH_ID --limit 20 --offset 0
+compute-runner agent status --batch BATCH_ID --limit 20 --offset 20
 ```
 
 Each job summary contains:
@@ -268,8 +274,8 @@ Optional fields are omitted when unavailable. Jobs created before batch support 
 `changes` returns the latest state of each job with an event after `--after`. Start at 0, then pass the returned `cursor` to the next call:
 
 ```bash
-kgr agent changes --batch BATCH_ID --after 0
-kgr agent changes --batch BATCH_ID --after RETURNED_CURSOR
+compute-runner agent changes --batch BATCH_ID --after 0
+compute-runner agent changes --batch BATCH_ID --after RETURNED_CURSOR
 ```
 
 Responses contain `schema_version`, `batch_id`, `cursor`, `has_more`, `jobs`, and `worker`. Drain additional pages while `has_more` is true. Page size defaults to 20 and is limited to 100.
@@ -281,8 +287,8 @@ Keep a separate cursor for each state directory and batch filter. Reset to 0 whe
 ### Log retrieval
 
 ```bash
-kgr agent logs JOB_ID --tail 50 --max-bytes 8192
-kgr agent logs JOB_ID --refresh
+compute-runner agent logs JOB_ID --tail 50 --max-bytes 8192
+compute-runner agent logs JOB_ID --refresh
 ```
 
 Kaggle stores a session's log only after it ends. While a submitted job is unfinished, every call reads a live snapshot from Kaggle's log stream, which replays the log from the start. The read stops after 5 idle seconds or 20 seconds in total, and the response has `live: true`.
@@ -298,8 +304,8 @@ Logs are cached and returned with known credential formats replaced by `[redacte
 ### Waiting
 
 ```bash
-kgr agent wait --batch BATCH_ID --timeout 300
-kgr agent wait JOB_ID_1 JOB_ID_2 --timeout 600 --no-downloads
+compute-runner agent wait --batch BATCH_ID --timeout 300
+compute-runner agent wait JOB_ID_1 JOB_ID_2 --timeout 600 --no-downloads
 ```
 
 `wait` blocks until every selected job settles or the timeout passes, then returns the same fields as `status` plus `settled`, `timed_out`, and `waited_seconds`. A job is settled when it is terminal and its downloads are complete, disabled, or failed, or when it is `blocked` or `needs_attention`. With `--no-downloads`, terminal state is enough. A timeout is not an error, so check `timed_out` and call again if needed. The timeout can be 0 to 86400 seconds. Keep it below the command timeout of the calling tool. `wait` reads local state only. It fails if the worker stays stopped for 30 seconds.
@@ -307,8 +313,8 @@ kgr agent wait JOB_ID_1 JOB_ID_2 --timeout 600 --no-downloads
 ### Outputs
 
 ```bash
-kgr agent outputs JOB_ID
-kgr agent outputs JOB_ID --limit 100 --offset 100
+compute-runner agent outputs JOB_ID
+compute-runner agent outputs JOB_ID --limit 100 --offset 100
 ```
 
 `outputs` lists downloaded files without reading them. The response contains `root`, `total`, `files` (each with `path` relative to `root` and `bytes`), `next_offset`, `state`, `downloads`, `outputs_ready`, and, when available, `download_error` and `log_path`. Files written to `KGR_OUTPUT_DIR` appear as `outputs/NAME`. Read them from `root` with ordinary file tools. The listing can be partial until `outputs_ready` is true.
@@ -316,7 +322,7 @@ kgr agent outputs JOB_ID --limit 100 --offset 100
 ### Python access
 
 ```python
-from kaggle_runner import Client
+from compute_runner import Client
 
 agent = Client().agent()
 page = agent.changes(batch_id="BATCH_ID", after=0)
@@ -331,7 +337,7 @@ while page["has_more"]:
 cursor = page["cursor"]
 ```
 
-`AgentClient()` is also available from `kaggle_runner` and uses the default configuration.
+`AgentClient()` is also available from `compute_runner` and uses the default configuration.
 
 | Method | Result |
 | --- | --- |
@@ -350,29 +356,29 @@ Agent methods return JSON-compatible dictionaries and raise Python exceptions on
 
 ### Agent skill
 
-The interface is model-agnostic: any LLM agent that can run shell commands can drive `kgr agent`. The [bundled skill](skills/kaggle-runner/SKILL.md) documents the commands, request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
+The interface is model-agnostic: any LLM agent that can run shell commands can drive `compute-runner agent`. The [bundled skill](skills/compute-runner/SKILL.md) documents the commands, request keys, cursor handling, and recovery workflow in the standard `SKILL.md` format. Symlink it into your agent's skills directory so installed copies stay current:
 
 ```bash
-ln -s ~/kaggle-runner/skills/kaggle-runner ~/.claude/skills/kaggle-runner  # Claude Code
-ln -s ~/kaggle-runner/skills/kaggle-runner ~/.codex/skills/kaggle-runner   # Codex
+ln -s ~/compute-runner/skills/compute-runner ~/.claude/skills/compute-runner  # Claude Code
+ln -s ~/compute-runner/skills/compute-runner ~/.codex/skills/compute-runner   # Codex
 ```
 
-Agents without skill support can be pointed at `SKILL.md` directly. The skill expects `kgr` on PATH or at `~/kaggle-runner/.venv/bin/kgr`. No MCP server or model API key is required.
+Agents without skill support can be pointed at `SKILL.md` directly. The skill expects `compute-runner` on PATH or at `~/compute-runner/.venv/bin/compute-runner`. No MCP server or model API key is required.
 
 ## Worker configuration
 
-`kgr service install` enables and starts `kaggle-runner.service` as a systemd user service. It starts on login and restarts after a process failure. Installation does not enable user lingering, so processing may stop after logout. The host must remain running and connected to submit jobs and collect results. Submitted Kaggle jobs continue remotely and are reconciled when the worker resumes.
+`compute-runner service install` enables and starts `compute-runner.service` as a systemd user service. It starts on login and restarts after a process failure. Installation does not enable user lingering, so processing may stop after logout. The host must remain running and connected to submit jobs and collect results. Submitted Kaggle jobs continue remotely and are reconciled when the worker resumes.
 
 ```bash
-kgr service status
-kgr service restart
-kgr service stop
-kgr service start
-kgr worker status
-journalctl --user -u kaggle-runner.service -f
+compute-runner service status
+compute-runner service restart
+compute-runner service stop
+compute-runner service start
+compute-runner worker status
+journalctl --user -u compute-runner.service -f
 ```
 
-Use `kgr worker run` to run in the foreground, or `kgr worker run --once` for one dispatch cycle. Only one worker may hold the lock for a state directory.
+Use `compute-runner worker run` to run in the foreground, or `compute-runner worker run --once` for one dispatch cycle. Only one worker may hold the lock for a state directory.
 
 | Setting | Default |
 | --- | --- |
@@ -383,11 +389,11 @@ Use `kgr worker run` to run in the foreground, or `kgr worker run --once` for on
 | Workload visibility | Private |
 | Strict mode | Off |
 
-Set resource limits, polling, and strict mode through `kgr init`, then restart the worker. Omitted options keep their saved values:
+Set resource limits, polling, and strict mode through `compute-runner init`, then restart the worker. Omitted options keep their saved values:
 
 ```bash
-kgr init --owner YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1 --poll-seconds 30
-kgr service restart
+compute-runner init --owner YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1 --poll-seconds 30
+compute-runner service restart
 ```
 
 A resource limit of zero pauses launches for that pool. CPU and GPU queues are independent. The worker accounts for discovered external runs and checks GPU quota before admission. Discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits. Kaggle's notebook listing reports every notebook as CPU, so discovery reads each active run's own settings once to count GPU runs correctly. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
@@ -399,8 +405,8 @@ Dataset preparation and uploads run in the dispatcher and can extend a polling c
 Strict mode is off by default, so ordinary workload output and network setups work unchanged. Turn it on when logs or downloads must be locked down, then restart the worker:
 
 ```bash
-kgr init --owner YOUR_KAGGLE_USERNAME --strict      # --no-strict turns it off again
-kgr service restart
+compute-runner init --owner YOUR_KAGGLE_USERNAME --strict      # --no-strict turns it off again
+compute-runner service restart
 ```
 
 | Behavior | Default | Strict |
@@ -408,7 +414,7 @@ kgr service restart
 | Log redaction | Known credential formats and passwords in URLs | Also URL query strings, words after `Bearer`/`Basic`, and values of fields named like tokens, keys, secrets, or passwords. This can hide ordinary text such as `num_tokens=512` |
 | Output downloads | Environment proxy, certificate, and `.netrc` settings apply; redirects are followed | Environment settings are ignored; every URL and redirect must be HTTPS on port 443 to a public address |
 
-Error messages saved with jobs always receive the strict redaction, because they can contain signed download URLs. Logs cached before a change keep their previous redaction until fetched again with `kgr agent logs JOB_ID --refresh`. Source credential screening and the nonsecret `env` checks apply in both modes.
+Error messages saved with jobs always receive the strict redaction, because they can contain signed download URLs. Logs cached before a change keep their previous redaction until fetched again with `compute-runner agent logs JOB_ID --refresh`. Source credential screening and the nonsecret `env` checks apply in both modes.
 
 ## Failure handling
 
@@ -428,15 +434,15 @@ Each attempt records its notebook slug before the remote request. The worker cre
 For an unresolved submission, inspect its Kaggle URL first. If no remote execution exists, record that confirmation before retrying:
 
 ```bash
-kgr resolve JOB_ID --not-submitted
-kgr agent retry JOB_ID --request-key resolved-retry-v1
+compute-runner resolve JOB_ID --not-submitted
+compute-runner agent retry JOB_ID --request-key resolved-retry-v1
 ```
 
 `resolve` records an operator assertion and does not launch a job. It must not be used to bypass an active or uncertain execution.
 
-`kgr logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
+`compute-runner logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
 
-`kgr cancel JOB_ID` and `kgr agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on Kaggle` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
+`compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on Kaggle` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job that has not started on Kaggle yet, or was submitted by an older version of the runner, cannot be cancelled this way; stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
 ## State and outputs
 
@@ -444,13 +450,15 @@ Default locations:
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/kaggle-runner/config.json` | Account and worker configuration |
-| `~/.local/share/kaggle-runner/queue.sqlite3` | Jobs, batches, request receipts, and events |
-| `~/.local/share/kaggle-runner/bundles/` | Immutable source and input snapshots |
-| `~/.local/share/kaggle-runner/logs/JOB_ID.log` | Agent log cache |
-| `~/.local/share/kaggle-runner/results/JOB_ID/` | Downloaded files and provenance |
+| `~/.config/compute-runner/config.json` | Account and worker configuration |
+| `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, and events |
+| `~/.local/share/compute-runner/bundles/` | Immutable source and input snapshots |
+| `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
+| `~/.local/share/compute-runner/results/JOB_ID/` | Downloaded files and provenance |
 
 Global `--config-dir` and `--state-dir` options select alternate CLI locations. Python callers can use `Client(config=Config(...))` or a `state_dir` override. Each state directory is bound to one Kaggle account.
+
+`COMPUTE_RUNNER_CONFIG_DIR` and `COMPUTE_RUNNER_STATE_DIR` select alternate default directories; the older `KGR_CONFIG_DIR` and `KGR_STATE_DIR` variables remain supported. Existing installations are discovered automatically when the new default locations contain no configuration or queue. Installation of the renamed service disables the previous managed service so only one worker owns the queue. Workload-facing `KGR_*` variables, bundle formats, and remote artifact IDs remain stable for saved jobs and training scripts.
 
 A completed download has this layout:
 

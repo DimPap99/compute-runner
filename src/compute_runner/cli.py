@@ -23,7 +23,10 @@ from .security import redacted_env_record
 from .store import atomic_json, config_path
 from . import service
 
-app = typer.Typer(no_args_is_help=True, help="Queue, run and monitor private Kaggle workloads.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Queue, run and monitor compute workloads. Currently support only Kaggle.",
+)
 worker_app = typer.Typer(no_args_is_help=True)
 service_app = typer.Typer(no_args_is_help=True)
 app.add_typer(worker_app, name="worker")
@@ -39,7 +42,7 @@ def context(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON")] = False,
 ):
     if config_dir:
-        os.environ["KGR_CONFIG_DIR"] = str(config_dir.expanduser().resolve())
+        os.environ["COMPUTE_RUNNER_CONFIG_DIR"] = str(config_dir.expanduser().resolve())
     ctx.obj = {"client": Client(state_dir=state_dir), "json": json_output}
 
 
@@ -155,7 +158,7 @@ def submit(
             for job in jobs:
                 console.print(f"Queued {job.id} ({job.spec.name})")
         if not ctx.obj["json"] and not _client(ctx).worker_health()["running"]:
-            console.print("Queued locally. Start processing with: kgr service start (or kgr worker run)")
+            console.print("Queued locally. Start processing with: compute-runner service start (or compute-runner worker run)")
 
 
 @app.command("list")
@@ -283,7 +286,7 @@ def doctor(ctx: typer.Context, offline: bool = False):
 @worker_app.command("run")
 def worker_run(ctx: typer.Context, once: bool = False):
     if not _client(ctx).config.owner:
-        raise ValueError("Run kgr init --owner YOUR_USERNAME first")
+        raise ValueError("Run compute-runner init --owner YOUR_USERNAME first")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     worker = _client(ctx).worker()
     worker.tick() if once else worker.run()
@@ -297,7 +300,7 @@ def worker_status(ctx: typer.Context):
 @service_app.command("install")
 def service_install(ctx: typer.Context, start: Annotated[bool, typer.Option("--start/--no-start")] = True):
     if not _client(ctx).config.owner:
-        raise ValueError("Run kgr init --owner YOUR_USERNAME first")
+        raise ValueError("Run compute-runner init --owner YOUR_USERNAME first")
     # Persist a state-dir override so API clients and the service use the same queue.
     atomic_json(config_path(), _client(ctx).config.model_dump(mode="json"))
     _emit(ctx, {"unit": str(service.install(_client(ctx).config, start=start))})

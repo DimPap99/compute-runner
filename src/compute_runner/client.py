@@ -66,7 +66,7 @@ class Client:
         A conflicting specification is rejected, even after the original batch finishes.
         """
         if not self.config.owner:
-            raise ValueError("Configure your account first: kgr init --owner YOUR_USERNAME")
+            raise ValueError("Configure your account first: compute-runner init --owner YOUR_USERNAME")
         self.check_batch_size(specs)
         normalized = []
         for spec in specs:
@@ -209,7 +209,7 @@ class Client:
             if self.worker_health()["running"]:
                 stopped_since = None
             elif now - (stopped_since := stopped_since or now) >= 30:
-                raise RuntimeError("No worker is running. Start kgr service start or kgr worker run")
+                raise RuntimeError("No worker is running. Start compute-runner service start or compute-runner worker run")
             time.sleep(min(2, self.config.poll_seconds, deadline - now if deadline else 2))
 
     def logs(self, job_id, *, follow=False):

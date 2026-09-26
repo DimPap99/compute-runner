@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-ASSET = Path(__file__).parents[1] / "skills/kaggle-runner/assets/checkpointing.py"
+ASSET = Path(__file__).parents[1] / "skills/compute-runner/assets/checkpointing.py"
 
 
 @pytest.fixture(scope="module")

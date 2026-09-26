@@ -7,9 +7,9 @@ from threading import Barrier
 import pytest
 from typer.testing import CliRunner
 
-from kaggle_runner import AgentClient, Client, JobSpec
-from kaggle_runner.cli import app
-from kaggle_runner.store import Store
+from compute_runner import AgentClient, Client, JobSpec
+from compute_runner.cli import app
+from compute_runner.store import Store
 from conftest import due
 
 
@@ -273,7 +273,7 @@ def test_agent_bounds_fail_before_remote_access(setup, method, kwargs):
 
 def test_cli_agent_batch_workflow_and_structured_errors(setup, tmp_path, monkeypatch):
     client, backend, spec = setup
-    monkeypatch.setattr("kaggle_runner.cli.Client", lambda **_: client)
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
     config = tmp_path / "batch.yaml"
     config.write_text(
         "jobs:\n  - source: hello.py\n  - source: hello.py\n    gpu: true\n    internet: true\n"
@@ -328,7 +328,7 @@ def test_status_and_changes_are_local_only(setup):
 
 def test_cli_reports_invalid_yaml_and_database_failures_as_json(setup, tmp_path, monkeypatch):
     client, _, _ = setup
-    monkeypatch.setattr("kaggle_runner.cli.Client", lambda **_: client)
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
     broken = tmp_path / "broken.yaml"
     broken.write_text("jobs: [\n")
     runner = CliRunner()
@@ -346,7 +346,7 @@ def test_cli_reports_invalid_yaml_and_database_failures_as_json(setup, tmp_path,
 @pytest.mark.parametrize("agent_mode", [False, True])
 def test_cpu_override_clears_gpu_accelerator(setup, tmp_path, monkeypatch, agent_mode):
     client, _, _ = setup
-    monkeypatch.setattr("kaggle_runner.cli.Client", lambda **_: client)
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
     config = tmp_path / "gpu.yaml"
     config.write_text("source: hello.py\ngpu: true\naccelerator: NvidiaTeslaT4\n")
     command = ["agent"] if agent_mode else ["--json"]

@@ -3,10 +3,10 @@ from types import SimpleNamespace as Obj
 import pytest
 import requests
 
-from kaggle_runner import store as store_module
-from kaggle_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error, safe_message
-from kaggle_runner.security import redact_secrets
-from kaggle_runner.store import atomic_write
+from compute_runner import store as store_module
+from compute_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error, safe_message
+from compute_runner.security import redact_secrets
+from compute_runner.store import atomic_write
 
 
 class Response:
@@ -158,7 +158,7 @@ def test_low_disk_warning_is_emitted_once_per_filesystem(tmp_path, monkeypatch, 
         lambda path: Obj(total=gib, used=gib - free, free=free),
     )
     store_module._LOW_DISK_DEVICES.clear()
-    caplog.set_level("WARNING", logger="kaggle_runner.store")
+    caplog.set_level("WARNING", logger="compute_runner.store")
     try:
         atomic_write(tmp_path / "one", b"one", check_space=True, expected_bytes=3)
         atomic_write(tmp_path / "two", b"two", check_space=True, expected_bytes=3)
@@ -326,7 +326,7 @@ def test_push_accepts_bare_slug_and_saves_receipt(tmp_path):
 
 
 def test_persisted_log_events_are_readable():
-    from kaggle_runner.backend import render_log
+    from compute_runner.backend import render_log
 
     assert render_log('[{"stream_name":"stdout","data":"hello\\n"}]') == "hello\n"
     assert render_log("plain text") == "plain text"

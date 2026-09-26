@@ -2,8 +2,8 @@ import time
 
 import pytest
 
-from kaggle_runner import JobSpec
-from kaggle_runner.backend import RemoteError
+from compute_runner import JobSpec
+from compute_runner.backend import RemoteError
 from conftest import due
 
 
@@ -250,7 +250,7 @@ def test_only_one_worker_holds_lock(setup):
 
 
 def test_owner_binding_prevents_cross_account_use(setup):
-    from kaggle_runner import Client
+    from compute_runner import Client
 
     client, _, _ = setup
     config = client.config.model_copy(update={"owner": "someoneelse"})
@@ -277,7 +277,7 @@ def test_fifo_waits_for_inputs_but_other_resource_pool_progresses(setup, tmp_pat
 
 def test_concurrent_clients_keep_every_submission(setup):
     from concurrent.futures import ThreadPoolExecutor
-    from kaggle_runner import Client
+    from compute_runner import Client
 
     client, backend, spec = setup
 

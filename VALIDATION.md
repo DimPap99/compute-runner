@@ -2,19 +2,28 @@
 
 Verified on 2026-09-26 using the installed Python 3.12 environment.
 
-- 134 automated tests passed (rerun after the code review and strict-mode changes below). These use fake remote services, transactional local queues, and local execution of generated launchers.
+- 150 automated tests passed after the Compute Runner rename. These use fake remote services, transactional local queues, and local execution of generated launchers.
 - Ruff checks, Python compilation, and `pip check` passed.
 - The systemd user unit passed `systemd-analyze --user verify`; the service is enabled and running.
-- `kgr` is installed at `~/.local/bin/kgr` and points to this project's isolated environment.
+- `compute-runner` is installed at `~/.local/bin/compute-runner` and points to this project's isolated environment.
 - The original `/home/dimpap/LocEstim` repository remains clean.
+
+## Compute Runner rename
+
+- Renamed the Python distribution, source package, CLI, documentation, notebook example, installed skill, project directory, and systemd user service. The README and command help state: "Currently support only Kaggle."
+- Rebuilt the virtual environment at `/home/dimpap/compute-runner/.venv` and installed the renamed package. Both `compute-runner` and the `kgr` compatibility alias work from outside the project directory.
+- Moved local configuration and state to the new default directories. Compatibility links preserve paths in existing job records and source snapshots. All seven job records remain byte-for-byte identical, all six downloaded output directories remain accessible, and the queue database checksum was unchanged by the move.
+- Added nine regression cases covering existing-queue discovery, request-key replay, saved outputs, new and legacy environment overrides, and service migration. The renamed service is enabled and running; its unit passed `systemd-analyze --user verify`.
+- The installed skill is now a symlink to the bundled `skills/compute-runner` directory and passes skill validation. Ruff, `pip check`, and `git diff --check` passed.
+- No new remote workloads were submitted for the rename. Existing workload environment variables, snapshot formats, and remote artifact identities were retained.
 
 ## Agent interface (v0.2.0)
 
 - Tested atomic batch submission on snapshot and database failures, concurrent same-key submissions, conflicting request keys, explicit retries, restart/completion replay, and replay after source files change or disappear.
 - Tested bounded status pages, deterministic batch order, per-batch cursors, coalesced changes during pagination, download-error events, quiet polling, and v1 queue migration.
 - Tested bounded Unicode log tails, private full-log caching, offline cache reuse, and preserving an existing cache when a refresh fails. CLI tests cover structured operation errors and CPU overrides of GPU workload files.
-- Validated the skill installed at `~/.codex/skills/kaggle-runner` at that time. Copies do not follow later skill updates, so install the skill as a symlink (see README). Command examples were exercised by the CLI integration tests and read-only live checks.
-- Backed up the live v1 database to `~/.local/share/kaggle-runner/queue.pre-agent-v1.sqlite3` before upgrading. All seven existing local records were preserved. Four pages of changes returned those seven jobs; a subsequent query returned no changed jobs.
+- Validated the bundled agent skill. Its current installation is `~/.codex/skills/compute-runner`, linked to the repository so later updates stay current. Command examples were exercised by the CLI integration tests and read-only live checks.
+- Backed up the live v1 database to `~/.local/share/compute-runner/queue.pre-agent-v1.sqlite3` before upgrading. All seven existing local records were preserved. Four pages of changes returned those seven jobs; a subsequent query returned no changed jobs.
 - On those existing records, the full JSON was 12,057 bytes and compact status was 2,920 bytes (about 76% smaller). This is a response-size measurement on that sample, not a universal token-saving guarantee. A live three-line log query returned 187 bytes from a 528-byte log, retaining the full private cache.
 - The systemd user service was restored and remains enabled. No additional Kaggle workloads were launched for this interface update; submission/worker integration was exercised with the fake backend, and remote log retrieval was checked against an existing successful run.
 
@@ -22,9 +31,9 @@ The agent interface is a CLI/Python API plus a model-agnostic agent skill. It do
 
 ## Code review and strict mode
 
-- A review of the whole codebase fixed notebook slugs ending in `-`, case-sensitive capacity accounting, worker-lock races with health probes, `kgr init` resetting saved limits, `~` in workload YAML, rejected attempts reported as remote runs, retryable dataset-inventory failures, and quota refresh times read as local time. Each fix has a regression test that fails on the previous code.
+- A review of the whole codebase fixed notebook slugs ending in `-`, case-sensitive capacity accounting, worker-lock races with health probes, `compute-runner init` resetting saved limits, `~` in workload YAML, rejected attempts reported as remote runs, retryable dataset-inventory failures, and quota refresh times read as local time. Each fix has a regression test that fails on the previous code.
 - Dispatch with 600 queued jobs dropped from about 50 seconds per worker cycle to under 1 second, measured with the fake backend.
-- Tests cover strict mode on and off for log redaction and downloads, `kgr logs --follow` through quiet periods, non-Python supporting notebooks, input folders that `.gitignore` their data, and download retry backoff.
+- Tests cover strict mode on and off for log redaction and downloads, `compute-runner logs --follow` through quiet periods, non-Python supporting notebooks, input folders that `.gitignore` their data, and download retry backoff.
 
 ## Live Kaggle checks
 
@@ -43,7 +52,7 @@ The final script check exercised the corrected handling of Kaggle's `/code/owner
 
 One initial local project entry was blocked before submission by the absent-dataset 403 behavior. It was explicitly retried after the adapter fix and the superseded local entry was cancelled. All test jobs are now terminal. Private test notebooks and the two small reusable datasets are retained, consistent with the tool's no-automatic-deletion policy.
 
-Results and source/provenance records are under `~/.local/share/kaggle-runner/results`. Existing research notebook executions were observed for capacity accounting and were not modified.
+Results and source/provenance records are under `~/.local/share/compute-runner/results`. Existing research notebook executions were observed for capacity accounting and were not modified.
 
 ## Boundaries
 

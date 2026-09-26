@@ -3,9 +3,9 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kaggle-runner-local"
+name = "compute-runner"
 version = "0.2.0"
-description = "Persistent local queue, Python API and CLI for private Kaggle workloads"
+description = "Persistent local queue, Python API and CLI for compute workloads"
 requires-python = ">=3.12"
 dependencies = ["kaggle==2.2.4", "kagglesdk==0.1.37", "pydantic>=2,<3", "typer>=0.12,<1", "rich>=13,<15", "PyYAML>=6,<7", "pathspec>=0.12,<1", "nbformat>=5,<6"]
 
@@ -13,7 +13,8 @@ dependencies = ["kaggle==2.2.4", "kagglesdk==0.1.37", "pydantic>=2,<3", "typer>=
 dev = ["pytest>=8,<10", "ruff>=0.6,<1"]
 
 [project.scripts]
-kgr = "kaggle_runner.cli:main"
+compute-runner = "compute_runner.cli:main"
+kgr = "compute_runner.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

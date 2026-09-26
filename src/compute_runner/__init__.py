@@ -1,4 +1,4 @@
-"""Submit and observe Kaggle workloads without authentication side effects on import."""
+"""Submit and observe compute workloads without authentication side effects on import."""
 
 from .models import BatchRecord, Config, JobRecord, JobSpec
 
