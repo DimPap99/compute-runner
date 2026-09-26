@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import logging
 import signal
+import tempfile
 import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
+from .bundle import plain_files, snapshot_bundle
 from .models import ACTIVE, TERMINAL, Attempt, Config
 from .providers import RemoteError, safe_message
+from .results import JobOutputs, publish, source_copies  # noqa: F401  source_copies is re-exported
 from .security import redacted_env_record
-from .store import Store, atomic_json, try_lock
+from .store import Store, atomic_json
 
 logger = logging.getLogger(__name__)
 PENDING = {"queued", "preparing"}
@@ -29,24 +33,24 @@ REMOTE_STATES = {
 }
 
 
-def collect_outputs(store, provider, job_id):
+def collect_outputs(store, provider, job_id, *, strict=False):
+    """Download a terminated run's outputs into its run folder; one collector per job at a time."""
     job = store.get(job_id)
     if not job.remote_ref or not job.terminal:
         raise ValueError("Outputs may be collected after a submitted run terminates")
-    job.result_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (job.result_dir / ".download.lock").open("a+") as lock:
-        if not try_lock(lock):
+    with store.download_claim(job_id) as claimed:
+        if not claimed:
             return store.get(job_id)
         try:
             store.update(job_id, download_state="downloading", download_error=None)
-            provider(job.attempts[-1].account).download(
-                job.remote_ref, job.result_dir, job.spec.output_patterns, skip=source_copies(job)
-            )
+            provider(job.attempts[-1].account).download(job.remote_ref, JobOutputs(store, job, strict=strict))
             updated = store.update(job_id, download_state="complete", download_error=None)
-            atomic_json(
-                job.result_dir / "provenance.json",
-                redacted_env_record(updated.model_dump(mode="json")),
-            )
+            if job.run is None:
+                # Run folders get job.json from the worker instead.
+                atomic_json(
+                    job.result_dir / "provenance.json",
+                    redacted_env_record(updated.model_dump(mode="json")),
+                )
             return updated
         except Exception as error:
             store.update(
@@ -58,16 +62,6 @@ def collect_outputs(store, provider, job_id):
                 download_retry_at=time.time() + min(60 * 2**job.download_failures, 3600),
             )
             raise
-
-
-def source_copies(job):
-    """Match output names of the project copy the runtime made; saved bundles already hold them.
-
-    Files the workload creates under the project folder are still downloaded, except
-    __pycache__ bytecode. In-place edits of snapshot files are not collected.
-    """
-    names = {f"project/{name}" for name in job.snapshot["source"]["files"]}
-    return lambda name: name in names or (name.startswith("project/") and "__pycache__" in name.split("/"))
 
 
 def outstanding(job):
@@ -99,22 +93,27 @@ def queued_behind(account):
     return f"Queued behind a job preparing on {account}"
 
 
-def place(store, job_id, account, reason):
+def place(store, job_id, account, reason, *, transfer=None):
     """Put a job that has no remote run on another account; None if it changed meanwhile.
 
     Requeueing also stops a preparation in progress, whose updates expect "preparing".
+    transfer, when given, sets whether its datasets may be copied there.
     """
+    changes = {} if transfer is None else {"transfer": transfer}
     return store.update(
         job_id,
         expected=MOVABLE,
         account=account,
         state="queued",
-        # Uploaded inputs belong to the previous account.
+        # Uploads and attached datasets belong to the previous account; copies stay cached locally.
         upload_refs={},
+        transfers={},
         suggested_account=None,
+        suggested_transfer=False,
         error=None,
         wait_reason=reason,
         next_action_at=0,
+        **changes,
     )
 
 
@@ -146,6 +145,8 @@ class Worker:
         self.discovery = defaultdict(Discovery)
         self.pool = None
         self.downloads = {}
+        # (account, provider, dataset ref) -> (readable, checked_at)
+        self.readable = {}
 
     def tick(self):
         """One complete, locked cycle; also useful for cron and deterministic tests."""
@@ -189,6 +190,7 @@ class Worker:
         if pending and not self.stop_event.is_set():
             self._dispatch(pending)
         self._downloads()
+        publish(self.store)
         atomic_json(
             self.config.state_dir / "accounts.json",
             {account: asdict(found) for account, found in self.discovery.items()},
@@ -291,8 +293,44 @@ class Worker:
             return f"Waiting for available GPU quota on {account}"
         return None
 
+    def _datasets(self, job):
+        """The provider datasets a job attaches: {upload key: (provider, reference)}."""
+        provider = self.config.account(job.account).provider
+        found = {"dataset:" + ref: (provider, ref) for ref in job.spec.datasets}
+        return found | {"input:" + alias: ref for alias, ref in job.spec.dataset_inputs().items()}
+
+    def _readable(self, account, provider, ref):
+        """Whether an account can read a dataset, checked at most discovery_seconds ago; None if unknown."""
+        if self.config.account(account).provider != provider:
+            return False
+        key = (account, provider, ref)
+        cached = self.readable.get(key)
+        if cached and time.time() - cached[1] < self.config.discovery_seconds:
+            return cached[0]
+        try:
+            readable = self.provider(account).resolve_dataset(ref) is not None
+        except (RemoteError, ValueError):
+            return None
+        self.readable[key] = (readable, time.time())
+        return readable
+
+    def _unreadable(self, job, account):
+        """Upload keys of the job's datasets the account cannot read; None if that is unknown now."""
+        missing = []
+        for key, (provider, ref) in self._datasets(job).items():
+            readable = self._readable(account, provider, ref)
+            if readable is None:
+                return None
+            if not readable:
+                missing.append(key)
+        return missing
+
     def _alternative(self, job, pool, targets):
-        """The first other account, in preference order, that can start the job now.
+        """The first other account, in preference order, that can start the job now: (account, copy).
+
+        copy is true when that account cannot read some of the job's datasets, so they would be
+        copied there; an account that reads them all wins over an earlier one that needs copies.
+        Only aliased inputs can be copied. (None, False) when no account fits.
 
         targets caches each account's availability for this cycle. Work already preparing
         there counts, so a burst moves no more jobs than an account can start. An account
@@ -300,6 +338,7 @@ class Worker:
         two full accounts.
         """
         rejected = {attempt.account for attempt in job.attempts if attempt.state == "rejected"}
+        fallback = None
         for account in self.config.accounts:
             key = (account.id, pool)
             if account.id == job.account or account.id in rejected:
@@ -312,13 +351,23 @@ class Worker:
                 self.provider(account.id).check(job.spec)
             except ValueError:
                 continue
-            return account.id
-        return None
+            missing = self._unreadable(job, account.id)
+            if missing == []:
+                return account.id, False
+            if missing and fallback is None and all(key.startswith("input:") for key in missing):
+                fallback = account.id
+        return fallback, fallback is not None
 
-    def _hold(self, job, reason, suggested=None):
+    def _hold(self, job, reason, suggested=None, copy=False):
         """Keep a pending job waiting, with a visible reason and an account that could start it now."""
-        if job.wait_reason != reason or job.suggested_account != suggested:
-            self.store.update(job.id, expected=PENDING, wait_reason=reason, suggested_account=suggested)
+        if job.wait_reason != reason or job.suggested_account != suggested or job.suggested_transfer != copy:
+            self.store.update(
+                job.id,
+                expected=PENDING,
+                wait_reason=reason,
+                suggested_account=suggested,
+                suggested_transfer=copy,
+            )
 
     def _dispatch(self, pending):
         # Jobs start in order within each account's resource pool. waiting[key] is why later jobs
@@ -355,12 +404,13 @@ class Worker:
                 problem = None
             if problem:
                 reason, account_unavailable = problem
-                target = None
+                target, copy = None, False
                 if account_unavailable and self.config.failover != "off":
-                    target = self._alternative(job, pool, targets)
+                    target, copy = self._alternative(job, pool, targets)
+                allowed = target and (not copy or self.config.transfer or job.transfer)
                 # Only queued jobs move by themselves; one that is preparing keeps its uploads.
-                if not (target and self.config.failover == "auto" and job.state == "queued"):
-                    self._hold(job, reason, target)
+                if not (allowed and self.config.failover == "auto" and job.state == "queued"):
+                    self._hold(job, reason, target, copy)
                     continue
                 job = place(self.store, job.id, target, f"Moved from {job.account}: {reason}")
                 if job is None:
@@ -390,6 +440,7 @@ class Worker:
             error=None,
             wait_reason="Preparing private inputs",
             suggested_account=None,
+            suggested_transfer=False,
         )
         if job is None:
             return False
@@ -417,11 +468,23 @@ class Worker:
                     return False
                 refs[key] = ref
                 self.store.update(job.id, expected={"preparing"}, upload_refs=refs)
-            for ref in job.spec.datasets:
-                key = "dataset:" + ref
-                if key not in refs:
-                    refs[key] = provider.resolve_dataset(ref)
-                    self.store.update(job.id, expected={"preparing"}, upload_refs=refs)
+            for key, (dataset_provider, ref) in self._datasets(job).items():
+                if key in refs:
+                    continue
+                if self.store.get(job.id).state != "preparing":
+                    return False
+                attached = self._attach(job, key, dataset_provider, ref)
+                if attached is None:
+                    self.store.update(
+                        job.id,
+                        expected={"preparing"},
+                        upload_refs=refs,
+                        wait_reason="Waiting for dataset processing",
+                        next_action_at=time.time() + self.config.poll_seconds,
+                    )
+                    return False
+                refs[key] = attached
+                self.store.update(job.id, expected={"preparing"}, upload_refs=refs)
             return self.store.get(job.id).state == "preparing"
         except Exception as error:
             kind = getattr(error, "kind", "invalid")
@@ -434,11 +497,78 @@ class Worker:
                 error=safe_message(error),
                 wait_reason="Upload retry pending"
                 if transient
+                else "Move the job or allow copying its dataset; see error"
+                if kind == "access"
                 else "Fix the reported issue, then retry this job",
                 next_action_at=time.time() + self.config.retry_seconds,
                 upload_refs=refs,
             )
             return False
+
+    def _attach(self, job, key, dataset_provider, ref):
+        """What to attach for one dataset: pinned on the job's account, or an uploaded copy.
+
+        None while a copy is still processing. A dataset that no configured account can read
+        is attached as given, so the provider or the run reports what is wrong.
+        """
+        account = self.config.account(job.account)
+        provider = self.provider(account.id)
+        alias = key.removeprefix("input:") if key.startswith("input:") else None
+        copied = job.transfers.get(alias)
+        if copied is None:
+            if account.provider == dataset_provider and (pinned := provider.resolve_dataset(ref)):
+                return pinned
+            reader = self._reader(job, dataset_provider, ref)
+            if reader is None:
+                return ref
+            owner, source = reader
+            if alias is None:
+                raise RemoteError(
+                    f"{job.account} cannot read dataset {ref}, but {owner} can. Move the job to {owner}, "
+                    "or list the dataset under inputs with an alias so it can be copied",
+                    "access",
+                    definitive=True,
+                )
+            if not (self.config.transfer or job.transfer):
+                raise RemoteError(
+                    f"{job.account} cannot read dataset {ref}, but {owner} can. Move the job to {owner}, "
+                    f"or allow a copy: compute-runner agent move {job.id} --account {job.account} --transfer",
+                    "access",
+                    definitive=True,
+                )
+            copied = self._copy(owner, source)
+            job.transfers[alias] = copied
+            self.store.update(job.id, expected={"preparing"}, transfers=job.transfers)
+        self.store.heartbeat(state="running", stage="uploading", job_id=job.id)
+        return provider.ensure_bundle(copied)
+
+    def _reader(self, job, dataset_provider, ref):
+        """Another configured account that can read a dataset: (account, pinned ref), or None."""
+        for account in self.config.accounts:
+            if account.id == job.account or account.provider != dataset_provider:
+                continue
+            try:
+                pinned = self.provider(account.id).resolve_dataset(ref)
+            except (RemoteError, ValueError):
+                continue
+            if pinned:
+                return account.id, pinned
+        return None
+
+    def _copy(self, account, ref):
+        """Bundle a dataset version read through account, once, like a local input."""
+        source = f"{self.config.account(account).provider}:{ref}"
+        bundles = self.config.state_dir / "bundles"
+        saved = self.store.dataset_copy(source)
+        if saved is None or not (bundles / saved["digest"] / "payload.zip").is_file():
+            self.store.heartbeat(state="running", stage=f"copying dataset {ref}")
+            with tempfile.TemporaryDirectory(prefix=".dataset-", dir=self.config.state_dir) as folder:
+                self.provider(account).fetch_dataset(ref, Path(folder))
+                # Copied as published: the owner's files are already on the provider, so not screened.
+                bundle = snapshot_bundle(Path(folder), plain_files(Path(folder)), bundles, screen=False)
+            saved = dict(digest=bundle["digest"], bytes=bundle["bytes"])
+            self.store.save_dataset_copy(source, **saved)
+        return dict(source=source, **saved)
 
     def _submit(self, job):
         provider = self.provider(job.account)
@@ -508,7 +638,7 @@ class Worker:
 
     def _collect(self, job_id):
         try:
-            collect_outputs(self.store, self.provider, job_id)
+            collect_outputs(self.store, self.provider, job_id, strict=self.config.strict)
         except Exception as error:
             logger.warning("Output collection for %s: %s", job_id, safe_message(error))
 

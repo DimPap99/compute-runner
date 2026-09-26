@@ -8,12 +8,30 @@ import time
 import uuid
 from pathlib import Path
 
-from .bundle import describe, snapshot
-from .models import BatchRecord, Config, JobRecord, JobSpec
+from .bundle import describe, snapshot, snapshot_bundle
+from .models import BatchRecord, Config, JobRecord, JobSpec, input_reference
 from .providers import Provider, connect
-from .runtime import json_digest
+from .results import experiment_dir, outputs_dir, verified_checkpoint
+from .runtime import json_digest, safe_relative
 from .store import Store, load_config, try_lock
 from .worker import MOVABLE, Worker, collect_outputs, outstanding, place, settled
+
+
+def resume_required(spec: JobSpec) -> JobSpec:
+    """The spec with --resume required, as a parameter, an argument, or appended."""
+    spec = spec.model_copy(deep=True)
+    if "resume" in spec.params:
+        spec.params["resume"] = "required"
+        return spec
+    for index, arg in enumerate(spec.args):
+        if arg == "--resume" and index + 1 < len(spec.args):
+            spec.args[index + 1] = "required"
+            return spec
+        if arg.startswith("--resume="):
+            spec.args[index] = "--resume=required"
+            return spec
+    spec.args += ["--resume", "required"]
+    return spec
 
 
 class Client:
@@ -34,9 +52,66 @@ class Client:
         return self._providers[account.id]
 
     def preview(self, spec: JobSpec, account: str | None = None):
-        """The files a submission would upload; checks the spec against the account without remote calls."""
+        """The files a submission would upload and its experiment folder; no remote calls."""
+        spec = self._normalize(spec)
         self.provider(account).check(spec)
-        return describe(spec)
+        experiment = self._experiment(spec)
+        return describe(self._local(spec), skip=[experiment.parent]) | {"experiment_dir": str(experiment)}
+
+    def _normalize(self, spec):
+        """Absolute paths, and job:ID inputs naming complete job IDs."""
+        spec = JobSpec.model_validate(spec.model_dump())
+        spec.source = spec.source.expanduser().absolute()
+        if spec.results_dir is not None:
+            spec.results_dir = spec.results_dir.expanduser().absolute()
+        inputs = {}
+        for alias, value in spec.inputs.items():
+            reference = input_reference(value)
+            if reference is None:
+                inputs[alias] = value.expanduser().absolute()
+            elif reference[0] == "job":
+                job_id, _, path = reference[1].partition("/")
+                job_id = self.store.resolve_id(job_id)
+                inputs[alias] = Path(f"job:{job_id}/{safe_relative(path)}" if path else f"job:{job_id}")
+            else:
+                inputs[alias] = value
+        spec.inputs = inputs
+        return spec
+
+    def _local(self, spec):
+        """spec for bundling: job outputs as local paths; provider datasets are attached remotely."""
+        inputs = {}
+        for alias, value in spec.inputs.items():
+            reference = input_reference(value)
+            if reference is None:
+                inputs[alias] = value
+            elif reference[0] == "job":
+                inputs[alias] = self._job_output(reference[1])
+        return spec.model_copy(update={"inputs": inputs})
+
+    def _job_output(self, value):
+        """The downloaded file or folder that job:ID[/PATH] names in that job's KGR_OUTPUT_DIR."""
+        job_id, _, path = value.partition("/")
+        job = self.get(job_id)
+        if job.download_state != "complete":
+            raise ValueError(f"Outputs of job {job.id} are not downloaded yet ({job.download_state})")
+        found = outputs_dir(job) / path
+        if not found.exists():
+            raise ValueError(f"Job {job.id} has no output {path or 'folder'}")
+        return found
+
+    def _experiment(self, spec):
+        folder = experiment_dir(spec, self.config)
+        if spec.source.is_dir() and folder.parent.resolve() == spec.source.resolve():
+            raise ValueError("results_dir must not be the source folder itself")
+        return folder
+
+    @staticmethod
+    def _intent(spec):
+        # Fields added later are left out at their defaults, so earlier request keys still replay.
+        added = {"params": {}, "results_dir": None}
+        unset = {key for key, empty in added.items() if getattr(spec, key) == empty}
+        return spec.model_dump(mode="json", exclude=unset)
 
     def submit(
         self, spec: JobSpec, *, request_key: str | None = None, account: str | None = None
@@ -71,14 +146,9 @@ class Client:
         """
         target = self.config.account(account).id
         self.check_batch_size(specs)
-        normalized = []
-        for spec in specs:
-            spec = JobSpec.model_validate(spec.model_dump())
-            spec.source = spec.source.expanduser().absolute()
-            spec.inputs = {alias: path.expanduser().absolute() for alias, path in spec.inputs.items()}
-            normalized.append(spec)
+        normalized = [self._normalize(spec) for spec in specs]
         fingerprint = self._fingerprint(
-            {"submit": [spec.model_dump(mode="json") for spec in normalized]}, request_key, account and target
+            {"submit": [self._intent(spec) for spec in normalized]}, request_key, account and target
         )
         previous = self.store.request(request_key, fingerprint)
         if previous is not None:
@@ -86,21 +156,34 @@ class Client:
         for spec in normalized:
             self.provider(target).check(spec)
         # Snapshot everything before exposing any job to the worker.
-        jobs = [self._new_job(spec, snapshot(spec, self.config.state_dir), target) for spec in normalized]
-        batch = BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=jobs)
-        return self.store.add_batch(batch, request_key=request_key, fingerprint=fingerprint)
+        jobs = []
+        for spec in normalized:
+            experiment = self._experiment(spec)
+            saved = snapshot(self._local(spec), self.config.state_dir, skip=[experiment.parent])
+            jobs.append(self._new_job(spec, saved, target, experiment))
+        return self._add(jobs, request_key, fingerprint)
 
-    def _new_job(self, spec, saved, account, parent_id=None):
-        job_id = uuid.uuid4().hex
+    def _new_job(self, spec, saved, account, experiment, parent_id=None):
+        """A job for experiment; _add numbers its run folder when the batch commits."""
         return JobRecord(
-            id=job_id,
+            id=uuid.uuid4().hex,
             spec=spec,
             snapshot=saved,
             account=account,
-            result_dir=self.config.state_dir / "results" / job_id,
+            result_dir=experiment,
             download_state="pending" if spec.auto_download else "disabled",
             parent_id=parent_id,
         )
+
+    def _add(self, jobs, request_key, fingerprint):
+        batch = BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=jobs)
+        experiments = {job.id: job.result_dir for job in jobs}
+        return self.store.add_batch(
+            batch, request_key=request_key, fingerprint=fingerprint, experiments=experiments
+        )
+
+    def _same_experiment(self, job):
+        return job.result_dir.parent if job.run is not None else self._experiment(job.spec)
 
     def submit_many(
         self, specs: list[JobSpec], *, request_key: str | None = None, account: str | None = None
@@ -167,28 +250,69 @@ class Client:
             raise ValueError(f"An execution may still exist; resolve it before rerunning: {job.url}")
         if not job.terminal and job.state != "blocked":
             raise ValueError("Retry accepts a terminal or blocked job only")
+        self._check_saved(job)
+        target = explicit or self.config.account(job.account).id
+        self.provider(target).check(job.spec)
+        spec = job.spec.model_copy(deep=True)
+        new = self._new_job(spec, job.snapshot, target, self._same_experiment(job), job.id)
+        return self._add([new], request_key, fingerprint)
+
+    def _check_saved(self, job):
         for bundle in [job.snapshot["source"], *job.snapshot["inputs"].values()]:
             if not (self.config.state_dir / "bundles" / bundle["digest"] / "payload.zip").is_file():
                 raise ValueError("Saved bundle is missing; submit a new workload")
-        target = explicit or self.config.account(job.account).id
-        self.provider(target).check(job.spec)
-        new = self._new_job(job.spec.model_copy(deep=True), job.snapshot, target, parent_id=job.id)
-        return self.store.add_batch(
-            BatchRecord(id=uuid.uuid4().hex, created_at=time.time(), jobs=[new]),
-            request_key=request_key,
-            fingerprint=fingerprint,
-        )
 
-    def move(self, job_id, account: str) -> JobRecord:
-        """Place a job that has not been submitted on another configured account."""
+    def continue_run(self, job_id, *, request_key: str | None = None, account: str | None = None):
+        return self.continue_batch(job_id, request_key=request_key, account=account).jobs[0]
+
+    def continue_batch(self, job_id, *, request_key: str | None = None, account: str | None = None):
+        """Resume a stopped resumable run from its last verified checkpoint as its experiment's next run.
+
+        Reuses the job's saved code and inputs, attaches its downloaded KGR_OUTPUT_DIR/checkpoints
+        as the input resume (only latest.json and the file it names), and passes --resume required.
+        Runs on the job's account unless another is given.
+        """
+        explicit = account and self.config.account(account).id
+        fingerprint = self._fingerprint({"continue": job_id}, request_key, explicit)
+        previous = self.store.request(request_key, fingerprint)
+        if previous is not None:
+            return previous
+        job = self.get(job_id)
+        if not job.terminal:
+            raise ValueError(f"Continue a run after it stops; this one is {job.state}")
+        if job.download_state != "complete":
+            raise ValueError(
+                f"Its outputs are not downloaded yet ({job.download_state}); wait for outputs_ready"
+            )
+        folder = outputs_dir(job) / "checkpoints"
+        checkpoint = verified_checkpoint(folder)
+        self._check_saved(job)
+        spec = resume_required(job.spec)
+        spec.inputs["resume"] = Path(f"job:{job.id}/checkpoints")
+        target = explicit or self.config.account(job.account).id
+        self.provider(target).check(spec)
+        saved = dict(job.snapshot, inputs=dict(job.snapshot["inputs"]))
+        saved["inputs"]["resume"] = snapshot_bundle(
+            folder, ["latest.json", checkpoint], self.config.state_dir / "bundles"
+        )
+        new = self._new_job(spec, saved, target, self._same_experiment(job), job.id)
+        return self._add([new], request_key, fingerprint)
+
+    def move(self, job_id, account: str, *, transfer: bool = False) -> JobRecord:
+        """Place a job that has not been submitted on another configured account.
+
+        transfer allows copying datasets that account cannot read from one that can; it also
+        applies to a job left on its account.
+        """
         job = self.get(job_id)
         target = self.config.account(account).id
-        if target == job.account:
+        if target == job.account and not (transfer and not job.transfer):
             raise ValueError(f"The job is already on {target}")
         if job.state not in MOVABLE:
             raise ValueError(f"Only jobs that have not been submitted can move; this one is {job.state}")
         self.provider(target).check(job.spec)
-        moved = place(self.store, job_id, target, f"Moved from {job.account} on request")
+        reason = f"Moved from {job.account} on request" if target != job.account else "Dataset copies allowed"
+        moved = place(self.store, job_id, target, reason, transfer=transfer or job.transfer)
         if moved is None:
             raise ValueError("Job changed state while moving; inspect its current status")
         return moved
@@ -254,7 +378,7 @@ class Client:
         yield from provider.logs(job.remote_ref, follow=follow)
 
     def download(self, job_id):
-        return collect_outputs(self.store, self.provider, job_id)
+        return collect_outputs(self.store, self.provider, job_id, strict=self.config.strict)
 
     def quota(self, account: str | None = None):
         """One account's quota, or every account's by ID."""

@@ -212,7 +212,7 @@ def test_old_queue_migrates_and_legacy_events_are_visible(setup):
     summary = Client(config=client.config).agent().changes()["jobs"][0]
     assert summary["id"] == job.id and summary["batch_id"] is None
     with migrated.connection() as db:
-        assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "3"
+        assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "4"
 
 
 def test_bounded_utf8_logs_are_cached_and_failed_refresh_keeps_old_copy(setup):

@@ -147,39 +147,19 @@ output_patterns:
   - "outputs/metrics/*"
 ```
 
-After the previous job's downloads complete, attach its checkpoint directory to the replacement job:
+## Continue a stopped run
 
-```yaml
-name: model-training-resumed
-source: ./project
-entrypoint: train.py
-args:
-  - --resume
-  - required
-  - --checkpoint-mode
-  - minutes
-  - --checkpoint-every
-  - "10"
-gpu: true
-inputs:
-  resume: /absolute/path/to/results/JOB_ID/outputs/outputs/checkpoints
-auto_download: true
-output_patterns:
-  - "outputs/checkpoints/*"
-  - "outputs/metrics/*"
-```
-
-Use a new request key for the replacement submission. Reusing the original key replays the original batch rather than creating the intended continuation.
-
-## Migration checks
-
-Before submitting the continuation:
+Continue with the queue, never by hand. Do not locate, copy, or edit checkpoint files, and do not write a continuation YAML for the same code.
 
 1. Stop the old job only when the user asked to stop it.
-2. Wait until partial output downloads settle and `outputs_ready` is true.
-3. Locate `latest.json`, verify its SHA-256 target, and load the checkpoint without starting training.
-4. Confirm that saved progress and compatibility metadata match the intended workload.
-5. Submit the continuation with `--resume required`, the downloaded checkpoint directory as input alias `resume`, and a new request key. To continue on another account, for example when the first account's GPU quota is exhausted, add `--account ID` after the user chooses it (see `compute-runner agent accounts`).
-6. Inspect the initial log for `RESUMED_FROM` at the expected epoch or step.
+2. Wait until its downloads settle and `outputs_ready` is true.
+3. Run `compute-runner agent continue JOB_ID --request-key KEY`. To continue on another account, for example when the first account's GPU quota is exhausted, add `--account ID` after the user chooses it (see `compute-runner agent accounts`).
+4. Inspect the new job's initial log for `RESUMED_FROM` at the expected epoch or step.
+
+`continue` checks that `KGR_OUTPUT_DIR/checkpoints/latest.json` names a checkpoint whose SHA-256 matches, and refuses otherwise. It reruns the job's saved code and inputs with `--resume required` (replacing any other `--resume` value, or the `resume` parameter), attaches only `latest.json` and that checkpoint as the input `resume`, and records the job as the parent. The new run is the next numbered folder of the same experiment, and `runs.md` lists its parent run. Use a new request key for each continuation.
+
+To report progress before continuing, read `RUN_DIR/outputs/checkpoints/latest.json`. The workload itself checks compatibility metadata when it loads the checkpoint with `--resume required`.
+
+If the code or settings must change for the continuation, submit a new workload that attaches the old checkpoints by reference: `inputs: {resume: "job:JOB_ID/checkpoints"}`, with `--resume required` in its args. The runner resolves the reference to the downloaded folder; never write the local results path yourself.
 
 If there is no valid checkpoint, tell the user what progress is recoverable. Do not label a restart from initial weights as a resume.

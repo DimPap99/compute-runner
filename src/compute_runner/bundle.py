@@ -40,9 +40,11 @@ PROTECTED = {
 
 
 def inventory(
-    source: Path, exclude: list[str], ignore_files=(".gitignore", ".kgrignore")
+    source: Path, exclude: list[str], ignore_files=(".gitignore", ".kgrignore"), skip=()
 ) -> tuple[Path, list[Path]]:
+    """skip lists folders left out wherever they appear inside source, such as its results folder."""
     source = source.expanduser().absolute()
+    skipped = {Path(os.path.realpath(folder)) for folder in skip}
     if source.is_symlink():
         raise ValueError(f"Symlink source is not supported: {source}")
     source = source.resolve(strict=True)
@@ -68,7 +70,7 @@ def inventory(
             allowed = []
             for name in sorted(dirs):
                 rel = relative / name
-                if protect(rel) or ignored.match_file(rel.as_posix() + "/"):
+                if protect(rel) or ignored.match_file(rel.as_posix() + "/") or root / rel in skipped:
                     continue
                 if (root / rel).is_symlink():
                     raise ValueError(f"Symlinks are not supported: {rel}")
@@ -111,8 +113,9 @@ def clean_notebook(path: Path, *, python=False) -> bytes:
     return nbformat.writes(notebook).encode()
 
 
-def describe(spec: JobSpec) -> dict:
-    root, files = inventory(spec.source, spec.exclude)
+def describe(spec: JobSpec, *, skip=()) -> dict:
+    """Plan the snapshot of a spec whose inputs are all local paths."""
+    root, files = inventory(spec.source, spec.exclude, skip=skip)
     source = spec.source.expanduser().resolve()
     entrypoint = spec.entrypoint
     if source.is_file():
@@ -140,7 +143,7 @@ def describe(spec: JobSpec) -> dict:
     inputs = {}
     for alias, source_path in spec.inputs.items():
         # Data folders often .gitignore exactly the files they exist to carry; only .kgrignore applies.
-        data_root, data_files = inventory(source_path, [], ignore_files=(".kgrignore",))
+        data_root, data_files = inventory(source_path, [], ignore_files=(".kgrignore",), skip=skip)
         inputs[alias] = dict(
             root=str(data_root),
             files=[p.as_posix() for p in data_files],
@@ -165,8 +168,27 @@ def describe(spec: JobSpec) -> dict:
     )
 
 
-def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=False) -> dict:
-    """Copy an inventory of files into an immutable, content-addressed bundle."""
+def plain_files(root: Path) -> list[str]:
+    """Every regular file below root, for copying data verbatim; symlinks are refused."""
+    files = []
+    for current, dirs, names in os.walk(root):
+        for name in [*dirs, *names]:
+            if (Path(current) / name).is_symlink():
+                raise ValueError(f"Symlinks are not supported: {name}")
+        files += [(Path(current) / name).relative_to(root).as_posix() for name in names]
+    if MANIFEST in files:
+        raise ValueError(f"{MANIFEST} is reserved")
+    if not files:
+        raise ValueError("The dataset has no files")
+    return sorted(files)
+
+
+def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=False, screen=True) -> dict:
+    """Copy an inventory of files into an immutable, content-addressed bundle.
+
+    screen rejects files containing recognizable credentials; copies of provider datasets,
+    which are already on the provider, are not screened.
+    """
     bundle_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix=".building-", dir=bundle_root) as temporary:
         stage = Path(temporary)
@@ -187,7 +209,7 @@ def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=Fal
                     pass  # Only the entrypoint runs, and describe() validated it; copy others unchanged.
             with destination.open("wb") as output:
                 if data is not None:
-                    if kind := detected_secret(data):
+                    if screen and (kind := detected_secret(data)):
                         raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
                     output.write(data)
                     digest.update(data)
@@ -196,7 +218,7 @@ def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=Fal
                     tail = b""
                     with original.open("rb") as input_file:
                         while chunk := input_file.read(1024 * 1024):
-                            if kind := detected_secret(tail + chunk):
+                            if screen and (kind := detected_secret(tail + chunk)):
                                 raise ValueError(
                                     f"Detected {kind} in {relative}; remove or exclude that credential"
                                 )
@@ -234,8 +256,8 @@ def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=Fal
         return dict(digest=fingerprint, bytes=sum(r["size"] for r in records.values()), files=records)
 
 
-def snapshot(spec: JobSpec, state_dir: Path) -> dict:
-    plan = describe(spec)
+def snapshot(spec: JobSpec, state_dir: Path, *, skip=()) -> dict:
+    plan = describe(spec, skip=skip)
     parts = [plan, *plan["inputs"].values()]
     if any((Path(part["root"]) / name).is_relative_to(state_dir) for part in parts for name in part["files"]):
         raise ValueError("The state directory must not be inside a source or input folder")

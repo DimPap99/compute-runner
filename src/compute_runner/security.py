@@ -93,13 +93,13 @@ def detected_secret(data: bytes | str) -> str | None:
     return None
 
 
-def validate_nonsecret_env(env: dict[str, str]) -> None:
-    """The env feature is persisted and uploaded, so reject values that look secret."""
+def validate_nonsecret_env(env: dict[str, str], *, label="env variable") -> None:
+    """env and parameters are persisted and uploaded, so reject values that look secret."""
     for name, value in env.items():
         if _SECRET_ENV_NAME.search(name.upper()):
-            raise ValueError(f"env variable {name} looks secret; env accepts nonsecret values only")
+            raise ValueError(f"{label} {name} looks secret; only nonsecret values are accepted")
         if kind := detected_secret(value):
-            raise ValueError(f"env variable {name} contains a detected {kind}; do not submit credentials")
+            raise ValueError(f"{label} {name} contains a detected {kind}; do not submit credentials")
 
 
 def redacted_env_record(value: dict) -> dict:

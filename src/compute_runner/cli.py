@@ -76,9 +76,12 @@ def _id(ctx, value):
     return _client(ctx).store.resolve_id(value)
 
 
-def _save(ctx, **changes):
-    """Validate and persist configuration; fields that are not changed keep their current values."""
-    changes = {key: value for key, value in changes.items() if value is not None}
+def _save(ctx, *, unset=(), **changes):
+    """Validate and persist configuration; fields that are not changed keep their current values.
+
+    unset names fields restored to their defaults.
+    """
+    changes = {key: value for key, value in changes.items() if value is not None} | dict.fromkeys(unset)
     # The saved file, not this invocation's configuration: a one-off --state-dir must not persist.
     config = Config.model_validate(load_config().model_dump() | changes)
     atomic_json(config_path(), config.model_dump(mode="json"))
@@ -106,9 +109,32 @@ def initialize(
             help="Broad log redaction and locked-down downloads. Default off; unchanged when omitted",
         ),
     ] = None,
+    results_dir: Annotated[
+        str | None,
+        typer.Option(
+            help='Parent folder for experiment folders. Default results/ beside each workload\'s code; "" '
+            "restores it; unchanged when omitted"
+        ),
+    ] = None,
+    transfer: Annotated[
+        bool | None,
+        typer.Option(
+            "--transfer/--no-transfer",
+            help="Copy a dataset the job's account cannot read from an account that can. Default off; "
+            "unchanged when omitted",
+        ),
+    ] = None,
 ):
-    """Save worker-wide settings: failover policy, polling interval and strict mode."""
-    config = _save(ctx, failover=failover, poll_seconds=poll_seconds, strict=strict)
+    """Save worker-wide settings: failover, polling, strict mode, results folder and dataset copies."""
+    config = _save(
+        ctx,
+        unset=("results_dir",) if results_dir == "" else (),
+        failover=failover,
+        poll_seconds=poll_seconds,
+        strict=strict,
+        results_dir=Path(results_dir).expanduser().absolute() if results_dir else None,
+        transfer=transfer,
+    )
     _emit(
         ctx,
         dict(
@@ -116,6 +142,8 @@ def initialize(
             state_dir=str(config.state_dir),
             failover=config.failover,
             strict=config.strict,
+            results_dir=str(config.results_dir or "results/ beside each workload's code"),
+            transfer=config.transfer,
         ),
     )
 
@@ -185,6 +213,10 @@ def submit(
     accelerator: str | None = None,
     timeout: int | None = None,
     arg: Annotated[list[str] | None, typer.Option("--arg")] = None,
+    param: Annotated[
+        list[str] | None,
+        typer.Option("--param", help="NAME=VALUE passed as --NAME VALUE and recorded with the results"),
+    ] = None,
     dry_run: bool = False,
     request_key: str | None = None,
     account: Annotated[str | None, typer.Option(help="Account ID such as kaggle:USER; default first")] = None,
@@ -199,6 +231,7 @@ def submit(
         accelerator=accelerator,
         timeout=timeout,
         arg=arg,
+        param=param,
     )
     if dry_run:
         _emit(ctx, [_client(ctx).preview(spec, account) for spec in specs])
@@ -208,7 +241,7 @@ def submit(
             _emit(ctx, [_job_dict(job) for job in jobs])
         else:
             for job in jobs:
-                console.print(f"Queued {job.id} ({job.spec.name})")
+                console.print(f"Queued {job.id} ({job.spec.name}): results in {job.result_dir}")
         if not ctx.obj["json"] and not _client(ctx).worker_health()["running"]:
             console.print(
                 "Queued locally. Start processing with: compute-runner service start "
@@ -223,11 +256,12 @@ def list_jobs(ctx: typer.Context, state: str | None = None):
     if ctx.obj["json"]:
         _emit(ctx, [_job_dict(job) for job in jobs])
         return
-    table = Table("Job", "Name", "State", "Account", "Resource", "Outputs", "Waiting / error")
+    table = Table("Job", "Name", "Run", "State", "Account", "Resource", "Outputs", "Waiting / error")
     for job in jobs:
         table.add_row(
             job.id[:12],
             job.spec.name,
+            job.result_dir.name if job.run is not None else "",
             job.state,
             job.account,
             job.spec.accelerator or ("GPU" if job.spec.gpu else "CPU"),
@@ -304,10 +338,23 @@ def retry(ctx: typer.Context, job_id: str, account: str | None = None):
     _emit(ctx, _client(ctx).retry(_id(ctx, job_id), account=account))
 
 
+@app.command("continue")
+def continue_run(ctx: typer.Context, job_id: str, account: str | None = None):
+    """Resume a stopped resumable run from its verified checkpoint as the next run of its experiment."""
+    _emit(ctx, _client(ctx).continue_run(_id(ctx, job_id), account=account))
+
+
 @app.command()
-def move(ctx: typer.Context, job_id: str, account: Annotated[str, typer.Option()]):
+def move(
+    ctx: typer.Context,
+    job_id: str,
+    account: Annotated[str, typer.Option()],
+    transfer: Annotated[
+        bool, typer.Option("--transfer", help="Allow copying datasets the account cannot read")
+    ] = False,
+):
     """Place a job that has not been submitted on another account."""
-    _emit(ctx, _client(ctx).move(_id(ctx, job_id), account))
+    _emit(ctx, _client(ctx).move(_id(ctx, job_id), account, transfer=transfer))
 
 
 @app.command()
@@ -345,6 +392,8 @@ def doctor(ctx: typer.Context, offline: bool = False):
     info = dict(
         accounts=[account.id for account in client.config.accounts],
         failover=client.config.failover,
+        transfer=client.config.transfer,
+        results_dir=str(client.config.results_dir) if client.config.results_dir else None,
         state_dir=str(client.config.state_dir),
         strict=client.config.strict,
         free_disk_bytes=shutil.disk_usage(client.config.state_dir).free,

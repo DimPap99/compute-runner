@@ -1,5 +1,5 @@
+import hashlib
 import json
-from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -7,6 +7,7 @@ import pytest
 from compute_runner import Account, Client, Config, JobSpec
 from compute_runner.providers import RemoteError
 from compute_runner.providers.kaggle import STATES, KaggleProvider
+from compute_runner.store import atomic_write
 
 
 class FakeProvider(KaggleProvider):
@@ -30,6 +31,10 @@ class FakeProvider(KaggleProvider):
         self.live_calls = 0
         self.cancelled = []
         self.cancel_error = None
+        # owner/slug datasets this account cannot read, and the files fetch_dataset returns.
+        self.unreadable = set()
+        self.dataset_files = {"train.csv": "a,b\n1,2\n"}
+        self.fetched = []
 
     def active_runs(self):
         if self.discovery_error:
@@ -44,7 +49,15 @@ class FakeProvider(KaggleProvider):
         return f"{self.owner}/kgr-b-{bundle['digest'][:40]}/1" if self.upload_ready else None
 
     def resolve_dataset(self, ref):
+        if "/".join(ref.split("/")[:2]) in self.unreadable:
+            return None
         return ref if len(ref.split("/")) == 3 else ref + "/7"
+
+    def fetch_dataset(self, ref, destination):
+        self.fetched.append(ref)
+        for name, text in self.dataset_files.items():
+            (destination / name).parent.mkdir(parents=True, exist_ok=True)
+            (destination / name).write_text(text)
 
     def push(self, folder, **options):
         metadata = json.loads((Path(folder) / "kernel-metadata.json").read_text())
@@ -63,24 +76,16 @@ class FakeProvider(KaggleProvider):
         raw = self.remote[ref]
         return dict(state=STATES.get(raw["state"]), detail=raw["state"], error=raw["error"])
 
-    def download(self, ref, destination, patterns, skip=None):
+    def download(self, ref, sink):
         self.download_calls += 1
         if self.download_error:
             raise self.download_error
-        destination.mkdir(parents=True, exist_ok=True)
-        (destination / "run.log").write_text("remote completed\n")
+        sink.log("remote completed\n")
         # Remote names are relative to /kaggle/working, as on Kaggle.
-        receipts = {}
         for name, text in self.output_files.items():
-            if (skip and skip(name)) or (
-                patterns is not None and not any(fnmatchcase(name, p) for p in patterns)
-            ):
-                continue
-            target = destination / "outputs" / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text)
-            receipts[name] = {"bytes": len(text)}
-        return receipts
+            if (target := sink.target(name)) is not None:
+                atomic_write(target, text.encode())
+                sink.saved(name, target, hashlib.sha256(text.encode()).hexdigest())
 
     def logs(self, ref, follow=False):
         yield "example log\n"

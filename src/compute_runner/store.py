@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .models import BatchRecord, Config, JobRecord
-from .paths import application_dir
+from .paths import application_dir, run_folder, run_number
 
 logger = logging.getLogger(__name__)
 LOW_DISK_FRACTION = 0.10
@@ -127,8 +127,9 @@ class Store:
                 );
             """)
             version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            # 3: job records name an account; older versions must not open them.
-            if version not in {"1", "2", "3"}:
+            # 3: job records name an account; 4: run folders, output receipts and dataset copies.
+            # Older versions must not open newer queues.
+            if version not in {"1", "2", "3", "4"}:
                 raise RuntimeError(f"Unsupported state schema {version}; do not open with this version")
             db.executescript("""
                 BEGIN IMMEDIATE;
@@ -141,7 +142,19 @@ class Store:
                     PRIMARY KEY (batch_id, position)
                 );
                 CREATE INDEX IF NOT EXISTS event_job ON events(job_id, id);
-                UPDATE meta SET value='3' WHERE key='schema_version';
+                CREATE TABLE IF NOT EXISTS runs (
+                    experiment TEXT NOT NULL, number INTEGER NOT NULL, job_id TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY (experiment, number)
+                );
+                CREATE TABLE IF NOT EXISTS outputs (
+                    job_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                    bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (job_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS dataset_copies (
+                    source TEXT PRIMARY KEY, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
+                    created REAL NOT NULL
+                );
+                UPDATE meta SET value='4' WHERE key='schema_version';
                 COMMIT;
             """)
         os.chmod(self.db, 0o600)
@@ -199,9 +212,12 @@ class Store:
             db.execute("BEGIN")
             return self._request(db, request_key, fingerprint)
 
-    def add_batch(self, batch: BatchRecord, *, request_key, fingerprint):
-        # Snapshots happen before this transaction. No job is visible to the worker
-        # until the entire batch and its idempotency receipt have committed.
+    def add_batch(self, batch: BatchRecord, *, request_key, fingerprint, experiments=None):
+        """Commit a batch; jobs listed in experiments ({job ID: folder}) get their run folder now.
+
+        Snapshots happen before this transaction. No job is visible to the worker
+        until the entire batch and its idempotency receipt have committed.
+        """
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = self._request(db, request_key, fingerprint)
@@ -212,6 +228,8 @@ class Store:
                 (batch.id, batch.created_at, request_key, fingerprint),
             )
             for position, job in enumerate(batch.jobs):
+                if experiments and job.id in experiments:
+                    self._number(db, job, experiments[job.id])
                 db.execute(
                     "INSERT INTO jobs VALUES (?,?,?,?)",
                     (job.id, job.created_at, job.state, job.model_dump_json()),
@@ -219,6 +237,76 @@ class Store:
                 self._event(db, job, "submitted locally")
                 db.execute("INSERT INTO batch_jobs VALUES (?,?,?)", (batch.id, job.id, position))
         return batch
+
+    @staticmethod
+    def _number(db, job, experiment: Path):
+        """Give a new job the next run number in its experiment folder, and that run's folder.
+
+        Inside the batch transaction, so concurrent submitters never share a number. Folders
+        already on disk count too, such as runs recorded by another state directory.
+        """
+        row = db.execute("SELECT MAX(number) FROM runs WHERE experiment=?", (str(experiment),)).fetchone()
+        seen = [run_number(path.name) for path in experiment.iterdir()] if experiment.is_dir() else []
+        job.run = max([row[0] or 0, *(number for number in seen if number is not None)]) + 1
+        job.result_dir = experiment / run_folder(job.run, job.created_at)
+        db.execute("INSERT INTO runs VALUES (?,?,?)", (str(experiment), job.run, job.id))
+
+    def experiment(self, folder: Path) -> list[JobRecord]:
+        """The jobs numbered in an experiment folder, by run number."""
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT j.record FROM runs r JOIN jobs j ON j.id=r.job_id "
+                "WHERE r.experiment=? ORDER BY r.number",
+                (str(folder),),
+            ).fetchall()
+        return [JobRecord.model_validate_json(row[0]) for row in rows]
+
+    def output_receipts(self, job_id) -> dict:
+        """Outputs already saved for a job: {remote name: {path in its run folder, bytes, sha256}}."""
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT name,path,bytes,sha256 FROM outputs WHERE job_id=?", (job_id,)
+            ).fetchall()
+        return {name: dict(path=path, bytes=size, sha256=digest) for name, path, size, digest in rows}
+
+    def record_output(self, job_id, name, *, path, bytes, sha256):
+        with self.connection() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO outputs VALUES (?,?,?,?,?)", (job_id, name, path, bytes, sha256)
+            )
+
+    def dataset_copy(self, source) -> dict | None:
+        """The local bundle made from a provider dataset version, if one was made."""
+        with self.connection() as db:
+            row = db.execute("SELECT digest,bytes FROM dataset_copies WHERE source=?", (source,)).fetchone()
+        return dict(digest=row[0], bytes=row[1]) if row else None
+
+    def save_dataset_copy(self, source, *, digest, bytes):
+        with self.connection() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO dataset_copies VALUES (?,?,?,?)", (source, digest, bytes, time.time())
+            )
+
+    def meta(self, key, default=None):
+        with self.connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_meta(self, key, value):
+        with self.connection() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+
+    @contextmanager
+    def download_claim(self, job_id):
+        """Yield whether this process may collect the job's outputs now; one collector per job.
+
+        A lock file in the state directory, released if the process dies. A shared database
+        could hold the same claim as a leased row.
+        """
+        folder = self.root / "jobs" / job_id
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (folder / "download.lock").open("a+") as lock:
+            yield try_lock(lock)
 
     def batch(self, batch_id):
         with self.connection() as db:
@@ -336,6 +424,7 @@ class Store:
             job.state,
             job.account,
             job.suggested_account,
+            job.suggested_transfer,
             job.remote_state,
             job.wait_reason,
             job.error,

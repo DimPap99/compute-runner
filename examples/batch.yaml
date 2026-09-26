@@ -5,5 +5,5 @@ jobs:
   - name: project-two
     source: project
     module: demo.train
-    args: ["--value", "12"]
+    params: {value: 12}
     timeout_seconds: 300

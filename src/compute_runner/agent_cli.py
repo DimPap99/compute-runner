@@ -48,12 +48,19 @@ def submit(
     accelerator: str | None = None,
     timeout: int | None = None,
     arg: Annotated[list[str] | None, typer.Option("--arg")] = None,
+    param: Annotated[
+        list[str] | None,
+        typer.Option("--param", help="NAME=VALUE passed as --NAME VALUE and recorded with the results"),
+    ] = None,
     dry_run: bool = False,
     account: Annotated[
         str | None, typer.Option(help="Account ID from agent accounts; default: the first account")
     ] = None,
 ):
-    """Submit a script, notebook, project YAML, or jobs: YAML atomically. Uses the account's compute."""
+    """Submit a script, notebook, project YAML, or jobs: YAML atomically. Uses the account's compute.
+
+    Each job's run folder is fixed now and returned as run_dir; the worker fills it.
+    """
     specs = workload_specs(
         source,
         entrypoint=entrypoint,
@@ -63,6 +70,7 @@ def submit(
         accelerator=accelerator,
         timeout=timeout,
         arg=arg,
+        param=param,
     )
     if dry_run:
         return ctx.obj["client"].agent().preview(specs, account=account)
@@ -115,7 +123,7 @@ def wait(
 @agent_app.command("outputs")
 @response
 def outputs(ctx: typer.Context, job_id: str, limit: int = 100, offset: int = 0):
-    """List downloaded output files (paths relative to root) and the run log path."""
+    """List downloaded files (paths relative to root, the run folder), the run log and job.json."""
     return ctx.obj["client"].agent().outputs(job_id, limit=limit, offset=offset)
 
 
@@ -129,6 +137,18 @@ def retry(
 ):
     """Rerun a job's saved code as a new job when the user wants a rerun. The key makes it safe to replay."""
     return ctx.obj["client"].agent().retry(job_id, request_key=request_key, account=account)
+
+
+@agent_app.command("continue")
+@response
+def continue_run(
+    ctx: typer.Context,
+    job_id: str,
+    request_key: Annotated[str, typer.Option()],
+    account: Annotated[str | None, typer.Option(help="Account ID; default: the job's account")] = None,
+):
+    """Resume a stopped resumable job from its verified checkpoint as the next run of its experiment."""
+    return ctx.obj["client"].agent().continue_run(job_id, request_key=request_key, account=account)
 
 
 @agent_app.command("accounts")
@@ -145,13 +165,17 @@ def move(
     account: Annotated[str, typer.Option(help="Target account ID from agent accounts")],
     job_ids: Annotated[list[str] | None, typer.Argument()] = None,
     batch: str | None = None,
+    transfer: Annotated[
+        bool, typer.Option("--transfer", help="Allow copying datasets the account cannot read (ask the user)")
+    ] = False,
     limit: int = 20,
 ):
     """Move jobs that have not been submitted to another account; submitted ones stay.
 
     Unless the failover policy is auto, move only after the user approves the account.
     """
-    return ctx.obj["client"].agent().move(job_ids, batch_id=batch, account=account, limit=limit)
+    agent = ctx.obj["client"].agent()
+    return agent.move(job_ids, batch_id=batch, account=account, transfer=transfer, limit=limit)
 
 
 @agent_app.command("cancel")

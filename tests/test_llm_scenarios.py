@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace as Obj
 from urllib.parse import urlsplit
 
@@ -20,7 +21,7 @@ from compute_runner.providers import RemoteError
 from compute_runner.providers.downloads import download_outputs
 from compute_runner.providers.kaggle import READ_TIMEOUT, KaggleProvider
 from compute_runner.cli import app
-from compute_runner.worker import source_copies
+from compute_runner.results import JobOutputs
 from conftest import due, staged_launcher
 
 
@@ -108,13 +109,15 @@ def test_llm_submit_monitor_wait_and_read_results(setup, workload, monkeypatch):
     changed = command("changes", "--batch", batch_id, "--after", cursor)
     assert {j["state"] for j in changed["jobs"]} == {"succeeded"}
 
+    # The run folder was fixed at submission, beside the job's code, and the worker filled it.
+    run_dir = Path(batch["jobs"][1]["run_dir"])
+    assert run_dir.parent == workload.parent / "project/results/train" and run_dir.name.startswith("001_")
     outputs = command("outputs", train_id[:10])
     assert outputs["outputs_ready"] and outputs["files"] == [{"path": "outputs/result.json", "bytes": 12}]
-    result = json.loads(
-        (client.config.state_dir / "results" / train_id / "outputs/outputs/result.json").read_text()
-    )
-    assert result == {"ok": True} and outputs["root"].endswith(f"{train_id}/outputs")
-    assert outputs["log_path"].endswith(f"{train_id}/run.log")
+    assert json.loads((run_dir / "outputs/result.json").read_text()) == {"ok": True}
+    assert outputs["root"] == str(run_dir) and outputs["log_path"] == str(run_dir / "run.log")
+    record = json.loads(Path(outputs["record_path"]).read_text())
+    assert record["job_id"] == train_id and record["state"] == "succeeded" and record["downloads"] == "complete"
 
     # A finished job's persisted log replaces the live snapshot once, then serves from cache.
     finished_log = command("logs", train_id)
@@ -257,15 +260,16 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
         def iter_content(self, **kwargs):
             yield self.data
 
-    destination = tmp_path / "result"
     receipts = download_outputs(
         pages,
-        destination,
-        skip=source_copies(job),
+        JobOutputs(client.store, job),
         get=lambda url, **k: Response(urlsplit(url).path.lstrip("/")),
     )
     assert sorted(receipts) == ["outputs/metrics.json", "project/checkpoint.bin"]
-    assert (destination / "outputs/outputs/metrics.json").read_text() == "7"
+    # KGR_OUTPUT_DIR files land in outputs/, anything else the run left behind in working/.
+    assert (job.result_dir / "outputs/metrics.json").read_text() == "7"
+    assert (job.result_dir / "working/project/checkpoint.bin").read_text() == "weights"
+    assert client.store.output_receipts(job.id) == receipts
 
 
 class StreamApi:

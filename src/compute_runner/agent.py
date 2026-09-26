@@ -13,6 +13,7 @@ import yaml
 
 from .models import ACTIVE, JobState
 from .providers import safe_message
+from .results import RUN_RECORD, listed_outputs
 from .store import atomic_write
 from .worker import MOVABLE, occupancy
 
@@ -37,17 +38,20 @@ def summary(job):
         internet=job.spec.internet,
         downloads=job.download_state,
         outputs_ready=job.download_state == "complete",
+        # Fixed at submission; the worker fills it.
+        run_dir=str(job.result_dir),
     )
     for key, item in {
+        "params": job.spec.params,
         "reason": short(job.wait_reason),
         "suggested_account": job.suggested_account,
+        "suggested_transfer": job.suggested_transfer or None,
         "error": short(job.error),
         "download_error": short(job.download_error),
         "url": job.url,
-        "output_dir": str(job.result_dir) if job.download_state == "complete" else None,
         "parent_id": job.parent_id,
     }.items():
-        if item not in (None, ""):
+        if item not in (None, "", {}):
             value[key] = item
     return value
 
@@ -179,6 +183,7 @@ class AgentClient:
             schema_version=1,
             dry_run=True,
             total=len(specs),
+            experiment_dirs=sorted({p["experiment_dir"] for p in plans}),
             files=sum(len(p["files"]) + sum(len(i["files"]) for i in p["inputs"].values()) for p in plans),
             bytes=sum(p["bytes"] + sum(i["bytes"] for i in p["inputs"].values()) for p in plans),
             gpu_jobs=sum(spec.gpu for spec in specs),
@@ -193,10 +198,19 @@ class AgentClient:
         job_id = self.client.store.resolve_id(job_id)
         return self._batch_status(self.client.retry_batch(job_id, request_key=request_key, account=account))
 
-    def move(self, job_ids=None, *, batch_id=None, account, limit=20):
+    def continue_run(self, job_id, *, request_key, account=None):
+        """Resume a stopped resumable job from its downloaded checkpoint as the next run of its experiment."""
+        if request_key is None:
+            raise ValueError("request_key is required for agent continuations")
+        job_id = self.client.store.resolve_id(job_id)
+        batch = self.client.continue_batch(job_id, request_key=request_key, account=account)
+        return self._batch_status(batch)
+
+    def move(self, job_ids=None, *, batch_id=None, account, transfer=False, limit=20):
         """Move the selected jobs that have not been submitted to another account.
 
-        Submitted and finished jobs, and jobs already there, stay; not_moved lists jobs the account rejected.
+        Submitted and finished jobs, and jobs already there, stay; not_moved lists jobs the account
+        rejected. transfer allows copying datasets the account cannot read, also for jobs already there.
         """
         _page_bounds(limit)
         if (job_ids is None) == (batch_id is None):
@@ -206,10 +220,10 @@ class AgentClient:
         _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
         moved, rejected = 0, []
         for job in jobs:
-            if job.state not in MOVABLE or job.account == target:
+            if job.state not in MOVABLE or (job.account == target and (job.transfer or not transfer)):
                 continue
             try:
-                self.client.move(job.id, target)
+                self.client.move(job.id, target, transfer=transfer)
                 moved += 1
             except ValueError as error:
                 rejected.append({"id": job.id, "error": short(error)})
@@ -314,17 +328,12 @@ class AgentClient:
     def outputs(self, job_id, *, limit=100, offset=0):
         """List downloaded output files, relative to root, without reading them.
 
-        Remote names are relative to the run's working directory, so KGR_OUTPUT_DIR files appear as
-        outputs/NAME.
+        KGR_OUTPUT_DIR files appear as outputs/NAME, and other files the run left in its working
+        directory as working/NAME. root is the run folder (older jobs: its outputs folder).
         """
         _page_bounds(limit, offset)
         job = self.client.get(self.client.store.resolve_id(job_id))
-        root = job.result_dir / "outputs"
-        files = sorted(
-            (path.relative_to(root).as_posix(), path.stat().st_size)
-            for path in (root.rglob("*") if root.is_dir() else [])
-            if path.is_file() and not (path.name.startswith(".") and path.name.endswith(".tmp"))
-        )
+        root, files = listed_outputs(job)
         page = files[offset : offset + limit]
         log = job.result_dir / "run.log"
         value = dict(
@@ -342,4 +351,6 @@ class AgentClient:
             value["download_error"] = short(job.download_error)
         if log.is_file():
             value["log_path"] = str(log)
+        if (job.result_dir / RUN_RECORD).is_file():
+            value["record_path"] = str(job.result_dir / RUN_RECORD)
         return value

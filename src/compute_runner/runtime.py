@@ -108,6 +108,15 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
     return candidates[0]
 
 
+def _find_dataset(ref, *, input_root=Path("/kaggle/input")):
+    """Where Kaggle mounted an attached dataset, under either of its mount conventions."""
+    owner, slug = ref.split("/")[:2]
+    for root in (input_root / "datasets" / owner / slug, input_root / slug):
+        if root.is_dir():
+            return root
+    raise FileNotFoundError(f"Dataset {ref} is not attached; this account may not be able to read it")
+
+
 def bootstrap(config):
     # The public API never returns a session ID; the runner reads this line to cancel the run.
     session = re.search(r"-(\d+)-\w+$", os.environ.get("KAGGLE_CONTAINER_NAME", ""))
@@ -133,12 +142,16 @@ def bootstrap(config):
             _verify(project, records)
     inputs = {}
     for alias, bundle in config["inputs"].items():
+        if "dataset" in bundle:
+            inputs[alias] = str(_find_dataset(bundle["dataset"]))
+            continue
         kind, location, _ = _find_bundle(bundle["ref"], bundle["digest"])
         if kind == "archive":
             location = _unpack(location, bundle["digest"], Path(tempfile.mkdtemp(prefix="kgr-input-")))
         inputs[alias] = str(location)
     os.environ.update(config["env"])
     os.environ["KGR_INPUTS_JSON"] = json.dumps(inputs)
+    os.environ["KGR_PARAMS_JSON"] = json.dumps(config.get("params", {}))
     for alias, location in inputs.items():
         os.environ["KGR_INPUT_" + alias.upper()] = location
     output = project.parent / "outputs"

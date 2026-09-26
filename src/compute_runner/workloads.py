@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import JobSpec
+from .models import JobSpec, input_reference
 
 
 def load_specs(path: Path) -> list[JobSpec]:
@@ -22,13 +22,30 @@ def load_specs(path: Path) -> list[JobSpec]:
             spec = JobSpec.model_validate(row)
             # Joining keeps absolute paths as they are.
             spec.source = path.parent / spec.source.expanduser()
-            spec.inputs = {key: path.parent / value.expanduser() for key, value in spec.inputs.items()}
+            spec.inputs = {
+                key: value if input_reference(value) else path.parent / value.expanduser()
+                for key, value in spec.inputs.items()
+            }
+            if spec.results_dir is not None:
+                spec.results_dir = path.parent / spec.results_dir.expanduser()
             result.append(spec)
         return result
     return [JobSpec(source=path, name=path.stem)]
 
 
-def workload_specs(source: Path, *, timeout=None, arg=None, **overrides) -> list[JobSpec]:
+def parse_params(items) -> dict:
+    """NAME=VALUE options; values are read as YAML scalars, so 0.01 is a number and true a flag."""
+    result = {}
+    for item in items or []:
+        name, separator, text = item.partition("=")
+        if not separator:
+            raise ValueError(f"--param takes NAME=VALUE, not {item}")
+        value = yaml.safe_load(text) if text else ""
+        result[name] = value if isinstance(value, (str, int, float, bool)) else text
+    return result
+
+
+def workload_specs(source: Path, *, timeout=None, arg=None, param=None, **overrides) -> list[JobSpec]:
     """Load a workload and apply the submit commands' overrides to every job."""
     overrides |= dict(timeout_seconds=timeout, args=arg)
     values = {key: value for key, value in overrides.items() if value is not None}
@@ -36,4 +53,8 @@ def workload_specs(source: Path, *, timeout=None, arg=None, **overrides) -> list
         if overrides["accelerator"] is not None:
             raise ValueError("--cpu cannot be combined with a GPU accelerator")
         values["accelerator"] = None
-    return [JobSpec.model_validate(spec.model_dump() | values) for spec in load_specs(source)]
+    params = parse_params(param)
+    return [
+        JobSpec.model_validate(spec.model_dump() | values | {"params": spec.params | params})
+        for spec in load_specs(source)
+    ]

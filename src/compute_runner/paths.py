@@ -1,6 +1,8 @@
 """Application paths, including discovery of existing installations."""
 
 import os
+import re
+import time
 from pathlib import Path
 
 APP_NAME = "compute-runner"
@@ -26,3 +28,18 @@ def application_dir(kind: str) -> Path:
     if not (current / marker).exists() and (legacy / marker).exists():
         return legacy
     return current
+
+
+def experiment_folder(name: str) -> str:
+    """A job name as a folder name: readable, portable and never empty or hidden."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:80] or "workload"
+
+
+def run_folder(number: int, created: float) -> str:
+    """NNN_YYYY-MM-DD_HH-MM-SS: sorts by run number and shows when it was submitted (local time)."""
+    return f"{number:03d}_{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime(created))}"
+
+
+def run_number(folder: str) -> int | None:
+    match = re.match(r"(\d+)_", folder)
+    return int(match.group(1)) if match else None

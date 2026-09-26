@@ -2,6 +2,18 @@
 
 One provider instance serves one account. Adapters translate their service's identities,
 states and errors into these shapes; the worker never sees provider-specific values.
+
+Data follows one contract on every provider:
+
+- Local inputs and copied datasets are content-addressed bundles. ensure_bundle() reuses one
+  the account already holds and uploads it otherwise.
+- A provider dataset is attached directly when resolve_dataset() says the account can read it.
+  If it cannot, the worker copies it from an account that can (fetch_dataset, then
+  ensure_bundle) when the user allowed copying.
+- The workload finds every input the same way: KGR_INPUT_<ALIAS> and KGR_INPUTS_JSON, set by
+  the launch package that stage() builds. Workloads never use provider paths.
+- download() hands each output to an OutputSink, which decides what to fetch and where it
+  goes, so every provider fills the same run folder.
 """
 
 from __future__ import annotations
@@ -14,6 +26,7 @@ from ..security import redact_secrets
 
 if TYPE_CHECKING:
     from ..models import Account, Config, JobRecord, JobSpec
+    from ..results import OutputSink
 
 
 class Provider(Protocol):
@@ -23,14 +36,23 @@ class Provider(Protocol):
     def ensure_bundle(self, bundle: dict) -> str | None:
         """Make a content-addressed local bundle available to runs; None while it is still processing."""
 
-    def resolve_dataset(self, ref: str) -> str:
-        """Pin a provider-hosted dataset reference to an immutable version."""
+    def resolve_dataset(self, ref: str) -> str | None:
+        """Pin a dataset this account can read to an immutable version; None if it cannot read it.
+
+        Every call checks access, even for a pinned reference, so the worker can ask any account.
+        Raise RemoteError for failures that say nothing about access.
+        """
+
+    def fetch_dataset(self, ref: str, destination: Path) -> None:
+        """Download a dataset this account can read, as plain files, into an empty folder."""
 
     def stage(self, job: JobRecord, number: int) -> str:
         """Build attempt number's launch package locally and return its remote reference.
 
         No remote calls. The reference is deterministic, so status() can find the run
-        even when submit() is interrupted.
+        even when submit() is interrupted. The package exposes each input alias as
+        KGR_INPUT_<ALIAS>: bundles by job.upload_refs["input:ALIAS"], verified against their
+        digest (from job.snapshot["inputs"] or job.transfers), and datasets attached directly.
         """
 
     def url(self, ref: str) -> str | None: ...
@@ -61,7 +83,12 @@ class Provider(Protocol):
     def live_log(self, ref: str) -> str:
         """A bounded snapshot of an unfinished run's log."""
 
-    def download(self, ref: str, destination: Path, patterns=None, *, skip=None) -> dict: ...
+    def download(self, ref: str, sink: OutputSink) -> None:
+        """Give sink the run's log (sink.log) and its output files.
+
+        For each file, ask sink.target(name) for a path (None: skip it), write the bytes there
+        atomically, then call sink.saved(name, path, sha256).
+        """
 
 
 def connect(account: Account, config: Config) -> Provider:

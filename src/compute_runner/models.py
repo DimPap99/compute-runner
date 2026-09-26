@@ -17,6 +17,17 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+PROVIDERS = ("kaggle",)
+# An input value naming data that is not a local path: another job's outputs, or a provider dataset.
+_REFERENCE = re.compile(rf"^(job|{'|'.join(PROVIDERS)}):([^/].*)$")
+
+
+def input_reference(value) -> tuple[str, str] | None:
+    """("job", "ID[/PATH]") or (provider, dataset reference); None for a local path."""
+    match = _REFERENCE.match(str(value))
+    return (match.group(1), match.group(2)) if match else None
+
+
 class JobSpec(Model):
     source: Path
     name: str = "workload"
@@ -34,6 +45,10 @@ class JobSpec(Model):
     exclude: list[str] = Field(default_factory=list)
     auto_download: bool = True
     output_patterns: list[str] | None = None
+    # Passed to the workload as --NAME VALUE and KGR_PARAMS_JSON, and shown with its results.
+    params: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    # Parent of the experiment folders; None uses the configured folder or results/ beside the code.
+    results_dir: Path | None = None
 
     @model_validator(mode="after")
     def validate_options(self):
@@ -53,7 +68,27 @@ class JobSpec(Model):
         if any(key.startswith("KGR_") for key in self.env):
             raise ValueError("KGR_ environment variables are reserved")
         validate_nonsecret_env(self.env)
+        for name in self.params:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
+                raise ValueError(f"Invalid parameter name: {name}")
+        # Parameters are shown in results folders and on the command line.
+        validate_nonsecret_env({name: str(value) for name, value in self.params.items()}, label="parameter")
         return self
+
+    def command_args(self) -> list[str]:
+        """args, then each parameter as --NAME VALUE; true passes --NAME alone and false omits it."""
+        result = list(self.args)
+        for name, value in self.params.items():
+            if value is True:
+                result.append(f"--{name}")
+            elif value is not False:
+                result += [f"--{name}", str(value)]
+        return result
+
+    def dataset_inputs(self) -> dict[str, tuple[str, str]]:
+        """Inputs that name a provider dataset: {alias: (provider, reference)}."""
+        found = {alias: input_reference(value) for alias, value in self.inputs.items()}
+        return {alias: ref for alias, ref in found.items() if ref and ref[0] != "job"}
 
 
 class Account(Model):
@@ -82,6 +117,10 @@ class Config(Model):
     reconcile_seconds: float = Field(default=300, ge=1)
     # Broad log redaction and locked-down output downloads; see README "Strict mode".
     strict: bool = False
+    # Parent of the experiment folders; None puts results/ beside each workload's code.
+    results_dir: Path | None = None
+    # Copy a dataset the job's account cannot read from an account that can; see README "Datasets".
+    transfer: bool = False
     state_dir: Path = Field(default_factory=lambda: application_dir("STATE"))
 
     @model_validator(mode="before")
@@ -101,6 +140,8 @@ class Config(Model):
         if len({i.casefold() for i in ids}) != len(ids):
             raise ValueError("Accounts must be unique")
         self.state_dir = self.state_dir.expanduser().resolve()
+        if self.results_dir is not None:
+            self.results_dir = self.results_dir.expanduser().absolute()
         return self
 
     def account(self, account_id: str | None = None) -> Account:
@@ -157,6 +198,8 @@ class JobRecord(Model):
     wait_reason: str | None = None
     # Set while the job waits and another account could start it now (failover "ask").
     suggested_account: str | None = None
+    # That account cannot read some of the job's datasets, so moving there copies them.
+    suggested_transfer: bool = False
     error: str | None = None
     next_action_at: float = 0
     last_polled_at: float | None = None
@@ -166,8 +209,15 @@ class JobRecord(Model):
     download_retry_at: float = 0
     download_failures: int = 0
     upload_refs: dict[str, str] = Field(default_factory=dict)
+    # The run folder, fixed at submission: EXPERIMENT/NNN_TIMESTAMP, or results/ID in the state
+    # directory for jobs saved before experiment folders (run is None).
     result_dir: Path
+    run: int | None = None
     parent_id: str | None = None
+    # May copy datasets its account cannot read from an account that can.
+    transfer: bool = False
+    # Datasets copied for this job: {alias: {"source": ..., "digest": ..., "bytes": ...}}.
+    transfers: dict[str, dict] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

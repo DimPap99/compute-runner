@@ -24,6 +24,7 @@ from ..store import atomic_json
 from . import RemoteError, classify, http_code, paginate, remote_error
 from .downloads import download_outputs
 
+DATASET = re.compile(r"[\w-]+/[\w-]+(?:/[1-9]\d*)?")
 # Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
 ACTIVE_HORIZON = timedelta(hours=24)
 MAX_SECONDS = 43200
@@ -140,8 +141,9 @@ class KaggleProvider:
             raise ValueError("Kaggle accepts NVIDIA GPU accelerator IDs only")
         if spec.timeout_seconds > MAX_SECONDS:
             raise ValueError(f"Kaggle runs are limited to {MAX_SECONDS} seconds")
-        for ref in spec.datasets:
-            if not re.fullmatch(r"[\w-]+/[\w-]+(?:/[1-9]\d*)?", ref):
+        inputs = [ref for provider, ref in spec.dataset_inputs().values() if provider == "kaggle"]
+        for ref in [*spec.datasets, *inputs]:
+            if not DATASET.fullmatch(ref):
                 raise ValueError(f"Invalid Kaggle dataset reference: {ref}")
 
     def url(self, ref):
@@ -170,11 +172,20 @@ class KaggleProvider:
         return result
 
     def resolve_dataset(self, ref):
-        if len(ref.split("/")) == 3:
-            return ref
+        owner, slug, *version = ref.split("/")
         try:
-            result = json.loads(self.api.dataset_status(ref, format="json(current_version_number)"))
-            return ref + "/" + str(result["current_version_number"])
+            status = self.api.dataset_status(f"{owner}/{slug}", format="json(current_version_number)")
+            result = json.loads(status)
+        except Exception as error:
+            # Kaggle answers 403 or 404 for a private dataset of another owner.
+            if http_code(error) in {403, 404}:
+                return None
+            raise remote_error(error) from error
+        return ref if version else f"{ref}/{result['current_version_number']}"
+
+    def fetch_dataset(self, ref, destination: Path):
+        try:
+            self.api.dataset_download_files(ref, path=str(destination), quiet=True, unzip=True)
         except Exception as error:
             raise remote_error(error) from error
 
@@ -444,10 +455,8 @@ class KaggleProvider:
 
         return paginate(fetch)
 
-    def download(self, ref, destination: Path, patterns=None, *, skip=None):
-        return download_outputs(
-            self.output_pages(ref), destination, patterns, skip=skip, strict=self.strict, render=render_log
-        )
+    def download(self, ref, sink):
+        download_outputs(self.output_pages(ref), sink, strict=self.strict, render=render_log)
 
 
 def _read_timeout(error):
@@ -473,18 +482,22 @@ def prepare_kernel(job: JobRecord, ref: str, folder: Path, state_dir: Path) -> P
     snapshot = job.snapshot
     source = snapshot["source"]
     payload = state_dir / "bundles" / source["digest"] / "files"
+    inputs = {}
+    for alias, bundle in [*snapshot["inputs"].items(), *job.transfers.items()]:
+        inputs[alias] = dict(ref=job.upload_refs["input:" + alias], digest=bundle["digest"])
+    for alias in job.spec.dataset_inputs():
+        # Attached directly; the runtime finds where Kaggle mounted it.
+        inputs.setdefault(alias, dict(dataset=job.upload_refs["input:" + alias]))
     config = dict(
         job_id=job.id,
         source_digest=source["digest"],
         source_ref=job.upload_refs.get("source"),
         inline=None,
-        inputs={
-            alias: dict(ref=job.upload_refs["input:" + alias], digest=bundle["digest"])
-            for alias, bundle in snapshot["inputs"].items()
-        },
+        inputs=inputs,
         module=snapshot["module"],
         entrypoint=snapshot["entrypoint"],
-        args=job.spec.args,
+        args=job.spec.command_args(),
+        params=job.spec.params,
         env=job.spec.env,
         requirements=job.spec.requirements,
     )

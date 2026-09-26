@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import ipaddress
-import json
 import socket
-from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import requests
 
-from ..runtime import file_digest, safe_relative
-from ..security import redact_secrets
-from ..store import atomic_json, atomic_write
+from ..runtime import safe_relative
+from ..store import atomic_write
 
 
 def _content_length(response):
@@ -93,10 +89,11 @@ def _open_download(url, get, *, strict=False, resolve=False, max_redirects=5):
     raise ValueError("Too many output download redirects")
 
 
-def download_outputs(pages, destination, patterns=None, *, skip=None, get=None, strict=False, render=str):
-    """Download run outputs; names matching the skip predicate are not fetched.
+def download_outputs(pages, sink, *, get=None, strict=False, render=str):
+    """Fetch run outputs into sink (see results.OutputSink), which chooses and places each file.
 
     Each page has a log (converted to text by render) and files with file_name and url.
+    Returns the sink's receipts.
 
     strict ignores proxy, CA and .netrc settings from the environment, and fetches only
     public HTTPS addresses, checking every redirect.
@@ -108,31 +105,14 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=None, 
         session.trust_env = not strict
         get = session.get
     try:
-        destination = Path(destination)
-        root = destination / "outputs"
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        receipt_path = destination / "downloads.json"
-        receipts = json.loads(receipt_path.read_text()) if receipt_path.exists() else {}
         for page in pages:
             if page.log:
                 # Always retrieve logs even when output filtering selects no files.
-                log_data = redact_secrets(render(page.log), strict=strict).encode()
-                atomic_write(
-                    destination / "run.log",
-                    log_data,
-                    check_space=True,
-                    expected_bytes=len(log_data),
-                )
+                sink.log(render(page.log))
             for item in page.files or []:
                 name = safe_relative(item.file_name)
-                target = root / name
-                if not target.resolve().is_relative_to(root.resolve()):
-                    raise ValueError("Output resolves outside the destination")
-                if skip is not None and skip(name):
-                    continue
-                if patterns is not None and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
-                    continue
-                if name in receipts and target.is_file() and file_digest(target) == receipts[name]["sha256"]:
+                target = sink.target(name)
+                if target is None:
                     continue
                 digest = hashlib.sha256()
                 with _open_download(item.url, get, strict=strict, resolve=resolve) as response:
@@ -144,9 +124,8 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=None, 
                         check_space=True,
                         expected_bytes=expected,
                     )
-                receipts[name] = dict(bytes=target.stat().st_size, sha256=digest.hexdigest())
-                atomic_json(receipt_path, receipts)
-        return receipts
+                sink.saved(name, target, digest.hexdigest())
+        return sink.receipts
     finally:
         if session is not None:
             session.close()

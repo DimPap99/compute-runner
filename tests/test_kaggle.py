@@ -8,6 +8,7 @@ from compute_runner import Account
 from compute_runner.providers import RemoteError, remote_error, safe_message
 from compute_runner.providers.downloads import download_outputs
 from compute_runner.providers.kaggle import KaggleProvider, render_log
+from compute_runner.results import OutputSink
 from compute_runner.security import redact_secrets
 from compute_runner.store import atomic_write
 
@@ -51,20 +52,22 @@ def test_download_pages_filters_and_verified_reuse(tmp_path):
         return Response()
 
     pages = [page("one.txt", "skip.png"), page("nested/two.txt")]
-    receipts = download_outputs(pages, tmp_path, ["*.txt"], get=get)
+    sink = OutputSink(tmp_path, patterns=["*.txt"])
+    receipts = download_outputs(pages, sink, get=get)
     assert set(receipts) == {"one.txt", "nested/two.txt"}
+    assert receipts["one.txt"]["path"] == "working/one.txt"
     assert (tmp_path / "run.log").read_text() == "log content"
     assert len(calls) == 2
-    download_outputs(pages, tmp_path, ["*.txt"], get=get)
+    download_outputs(pages, sink, get=get)
     assert len(calls) == 2
 
 
 def test_interrupted_download_never_replaces_existing_output(tmp_path):
-    root = tmp_path / "outputs"
+    root = tmp_path / "working"
     root.mkdir()
     (root / "one.txt").write_text("old version")
     with pytest.raises(requests.ConnectionError):
-        download_outputs([page("one.txt")], tmp_path, get=lambda *a, **k: Response(fail=True))
+        download_outputs([page("one.txt")], OutputSink(tmp_path), get=lambda *a, **k: Response(fail=True))
     assert (root / "one.txt").read_text() == "old version"
     assert not list(root.glob(".*.tmp"))
 
@@ -72,17 +75,17 @@ def test_interrupted_download_never_replaces_existing_output(tmp_path):
 @pytest.mark.parametrize("name", ["../escape", "/tmp/escape", "path/../../escape", "bad\\escape"])
 def test_download_rejects_unsafe_paths(tmp_path, name):
     with pytest.raises(ValueError):
-        download_outputs([page(name)], tmp_path, get=lambda *a, **k: Response())
+        download_outputs([page(name)], OutputSink(tmp_path), get=lambda *a, **k: Response())
 
 
 def test_download_rejects_symlink_escape(tmp_path):
-    root = tmp_path / "result/outputs"
+    root = tmp_path / "result/working"
     root.mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="outside"):
-        download_outputs([page("link/file")], tmp_path / "result", get=lambda *a, **k: Response())
+        download_outputs([page("link/file")], OutputSink(tmp_path / "result"), get=lambda *a, **k: Response())
 
 
 @pytest.mark.parametrize(
@@ -99,7 +102,7 @@ def test_download_rejects_unsafe_urls_before_connecting(tmp_path, url):
     calls = []
     pages = [Obj(files=[Obj(file_name="one.txt", url=url)], log=None)]
     with pytest.raises(ValueError):
-        download_outputs(pages, tmp_path, get=lambda *a, **k: calls.append(a) or Response(), strict=True)
+        download_outputs(pages, OutputSink(tmp_path), get=lambda *a, **k: calls.append(a) or Response(), strict=True)
     assert calls == []
 
 
@@ -111,7 +114,7 @@ def test_default_download_leaves_url_handling_to_requests(tmp_path):
         return Response()
 
     pages = [Obj(files=[Obj(file_name="one.txt", url="http://mirror.internal:8080/one")], log=None)]
-    assert set(download_outputs(pages, tmp_path, get=get)) == {"one.txt"}
+    assert set(download_outputs(pages, OutputSink(tmp_path), get=get)) == {"one.txt"}
     assert "allow_redirects" not in calls[0][1]
 
 
@@ -123,7 +126,7 @@ def test_download_validates_redirect_destination(tmp_path):
         return Response(status_code=302, location="https://127.0.0.1/private")
 
     with pytest.raises(ValueError, match="non-public"):
-        download_outputs([page("one.txt")], tmp_path, get=get, strict=True)
+        download_outputs([page("one.txt")], OutputSink(tmp_path), get=get, strict=True)
     assert len(calls) == 1
     assert calls[0][1]["allow_redirects"] is False
 
@@ -147,7 +150,7 @@ def test_log_redaction_keeps_ordinary_text_unless_strict():
 
 def test_downloaded_log_redacts_credentials(tmp_path):
     token = "KGAT_" + "a" * 24
-    download_outputs([page(log=f"failed with {token}")], tmp_path, get=lambda *a, **k: Response())
+    download_outputs([page(log=f"failed with {token}")], OutputSink(tmp_path), get=lambda *a, **k: Response())
     saved = (tmp_path / "run.log").read_text()
     assert token not in saved and "[redacted]" in saved
 
@@ -180,8 +183,8 @@ def test_known_download_that_cannot_fit_is_rejected_before_writing(tmp_path, mon
     )
     pages = [page("one.txt", log=None)]
     with pytest.raises(OSError, match="Insufficient disk space"):
-        download_outputs(pages, tmp_path, get=lambda *a, **k: Response())
-    assert not (tmp_path / "outputs/one.txt").exists()
+        download_outputs(pages, OutputSink(tmp_path), get=lambda *a, **k: Response())
+    assert not (tmp_path / "working/one.txt").exists()
 
 
 def test_unknown_download_size_is_checked_while_streaming(tmp_path, monkeypatch):
@@ -198,8 +201,8 @@ def test_unknown_download_size_is_checked_while_streaming(tmp_path, monkeypatch)
         return response
 
     with pytest.raises(OSError, match="Insufficient disk space"):
-        download_outputs([page("one.txt", log=None)], tmp_path, get=get)
-    assert not (tmp_path / "outputs/one.txt").exists()
+        download_outputs([page("one.txt", log=None)], OutputSink(tmp_path), get=get)
+    assert not (tmp_path / "working/one.txt").exists()
 
 
 def test_push_error_body_is_not_success(tmp_path):
