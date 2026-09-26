@@ -300,6 +300,22 @@ def test_live_log_snapshot_ends_when_stream_goes_idle(tmp_path):
     assert api.timeouts == [3, 3, 3] and api.closed and READ_TIMEOUT.get() == 90
 
 
+def test_follow_keeps_waiting_through_quiet_periods(tmp_path):
+    connections = []
+
+    class QuietApi:
+        def kernels_logs_stream(self, ref):
+            connections.append(ref)
+            yield {"data": "start\n"}
+            if len(connections) <= 6:  # More quiet windows than the disconnect limit.
+                raise read_timeout()
+            yield {"data": "done\n"}
+
+    backend = backend_with(QuietApi(), tmp_path)
+    backend.status = lambda ref: {"state": "RUNNING"}
+    assert "".join(backend.logs("tester/k", follow=True)) == "start\ndone\n"
+
+
 def test_live_log_before_any_output(tmp_path):
     assert backend_with(StreamApi([], read_timeout()), tmp_path).live_log("tester/k") == ""
     with pytest.raises(RemoteError):

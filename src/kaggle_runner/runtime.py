@@ -14,20 +14,34 @@ import tempfile
 import zipfile
 
 
-def _safe_name(name):
+MANIFEST = "kgr-manifest.json"
+
+
+def safe_relative(name):
     p = PurePosixPath(name)
     if p.is_absolute() or ".." in p.parts or "\\" in name or not p.parts:
-        raise ValueError("Unsafe bundle path: " + name)
+        raise ValueError("Path must stay inside the project: " + name)
     return p.as_posix()
+
+
+def json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _manifest(data, digest):
     records = data["files"]
-    actual = hashlib.sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if actual != digest or data.get("digest") != digest or data.get("schema_version") != 1:
+    if json_digest(records) != digest or data.get("digest") != digest or data.get("schema_version") != 1:
         raise ValueError("Bundle manifest hash mismatch")
     for name in records:
-        _safe_name(name)
+        safe_relative(name)
     return records
 
 
@@ -41,26 +55,22 @@ def _verify(root, records):
             or file.stat().st_size != record["size"]
         ):
             raise ValueError("Bundle file invalid: " + name)
-        digest = hashlib.sha256()
-        with file.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        if digest.hexdigest() != record["sha256"]:
+        if file_digest(file) != record["sha256"]:
             raise ValueError("Bundle checksum mismatch: " + name)
 
 
 def _unpack(archive_path, digest, target):
     with zipfile.ZipFile(archive_path) as archive:
-        manifest = json.loads(archive.read("kgr-manifest.json"))
+        manifest = json.loads(archive.read(MANIFEST))
         records = _manifest(manifest, digest)
         names = archive.namelist()
-        if len(names) != len(set(names)) or set(names) != set(records) | {"kgr-manifest.json"}:
+        if len(names) != len(set(names)) or set(names) != set(records) | {MANIFEST}:
             raise ValueError("Unexpected or duplicate archive members")
         for info in archive.infolist():
-            _safe_name(info.filename)
+            safe_relative(info.filename)
             if stat.S_ISLNK(info.external_attr >> 16):
                 raise ValueError("Symlinks are forbidden in bundles")
-            if info.filename == "kgr-manifest.json":
+            if info.filename == MANIFEST:
                 continue
             if info.file_size != records[info.filename]["size"]:
                 raise ValueError("Archive size differs from manifest")
@@ -79,7 +89,7 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
     for root in roots:
         if not root.is_dir():
             continue
-        for manifest_file in root.rglob("kgr-manifest.json"):
+        for manifest_file in root.rglob(MANIFEST):
             try:
                 records = _manifest(json.loads(manifest_file.read_text()), digest)
             except (KeyError, ValueError):
@@ -89,7 +99,7 @@ def _find_bundle(ref, digest, *, input_root=Path("/kaggle/input")):
         if not candidates:
             for archive_file in root.rglob("payload.zip"):
                 with zipfile.ZipFile(archive_file) as archive:
-                    records = _manifest(json.loads(archive.read("kgr-manifest.json")), digest)
+                    records = _manifest(json.loads(archive.read(MANIFEST)), digest)
                 candidates.append(("archive", archive_file, records))
     # Resolve duplicate paths if two mount conventions alias the same location.
     candidates = list({str(item[1].resolve()): item for item in candidates}.values())
@@ -107,7 +117,7 @@ def bootstrap(config):
     project.mkdir(parents=True, exist_ok=False)
     if config.get("inline"):
         for name, value in config["inline"].items():
-            target = project / _safe_name(name)
+            target = project / safe_relative(name)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(base64.b64decode(value))
         _verify(project, config["source_files"])
@@ -147,7 +157,7 @@ def bootstrap(config):
                 "install",
                 "--disable-pip-version-check",
                 "-r",
-                str(project / _safe_name(config["requirements"])),
+                str(project / safe_relative(config["requirements"])),
             ],
             check=True,
         )

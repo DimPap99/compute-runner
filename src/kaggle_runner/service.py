@@ -1,10 +1,9 @@
 """Linux user service management. No system-wide changes or lingering configuration."""
 
-import os
 import subprocess
 import sys
-from pathlib import Path
 
+from .models import xdg_dir
 from .store import config_path
 
 UNIT_NAME = "kaggle-runner.service"
@@ -46,7 +45,7 @@ def control(action):
 
 
 def install(config, *, start=True):
-    root = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "systemd/user"
+    root = xdg_dir("XDG_CONFIG_HOME", ".config") / "systemd/user"
     root.mkdir(parents=True, exist_ok=True)
     path = root / UNIT_NAME
     text = unit_text(config)

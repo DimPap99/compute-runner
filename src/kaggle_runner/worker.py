@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import re
 import signal
@@ -14,7 +13,7 @@ from .backend import RemoteError, safe_message
 from .launcher import prepare_kernel
 from .models import ACTIVE, TERMINAL, Attempt, Config
 from .security import redacted_env_record
-from .store import Store, atomic_json
+from .store import Store, atomic_json, try_lock
 
 logger = logging.getLogger(__name__)
 PENDING = {"queued", "preparing"}
@@ -26,9 +25,7 @@ def collect_outputs(store, backend, job_id):
         raise ValueError("Outputs may be collected after a submitted run terminates")
     job.result_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (job.result_dir / ".download.lock").open("a+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not try_lock(lock):
             return store.get(job_id)
         try:
             store.update(job_id, download_state="downloading", download_error=None)
@@ -46,11 +43,11 @@ def collect_outputs(store, backend, job_id):
                 job_id,
                 download_state="error",
                 download_error=safe_message(error),
-                download_retry_at=time.time() + 60,
+                download_failures=job.download_failures + 1,
+                # 1, 2, 4 ... minutes, then hourly; a permanent failure should not hammer Kaggle.
+                download_retry_at=time.time() + min(60 * 2**job.download_failures, 3600),
             )
             raise
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def source_copies(job):
@@ -193,7 +190,7 @@ class Worker:
         )
         if state in TERMINAL:
             changes["finished_at"] = now
-            self.inventory.pop(attempt.ref, None)
+            self.inventory.pop(attempt.ref.lower(), None)
         self.store.update(job.id, **changes)
 
     def _refresh_inventory(self):
@@ -204,7 +201,7 @@ class Worker:
             return
         try:
             self.store.heartbeat(state="running", stage="discovering account runs")
-            self.inventory = self.backend.active_runs()
+            self.inventory = {ref.lower(): kind for ref, kind in self.backend.active_runs().items()}
             self.inventory_at = now
             self.inventory_error = None
         except Exception as error:
@@ -212,8 +209,8 @@ class Worker:
             self.discovery_retry_at = now + self.config.retry_seconds
 
     def _counts(self):
-        jobs = [j for j in self.store.list() if outstanding(j)]
-        refs = {j.remote_ref for j in jobs}
+        jobs = [j for j in self.store.list(ACTIVE) if outstanding(j)]
+        refs = {j.remote_ref.lower() for j in jobs}
         counts = {"cpu": sum(not j.spec.gpu for j in jobs), "gpu": sum(j.spec.gpu for j in jobs)}
         for ref, resource in self.inventory.items():
             if ref not in refs:
@@ -227,7 +224,8 @@ class Worker:
 
     def _hold(self, job, reason, **changes):
         """Keep a pending job queued, with a visible reason."""
-        self.store.update(job.id, expected=PENDING, wait_reason=reason, **changes)
+        if changes or job.wait_reason != reason:
+            self.store.update(job.id, expected=PENDING, wait_reason=reason, **changes)
 
     def _gpu_quota_problem(self):
         try:
@@ -254,6 +252,7 @@ class Worker:
                 self._hold(job, "Account discovery unavailable; waiting before new launches")
                 continue
             if pool in blocked_pools or self._full(pool):
+                blocked_pools.add(pool)
                 self._hold(job, f"Waiting for {pool.upper()} capacity")
                 continue
             if job.spec.gpu and (problem := self._gpu_quota_problem()):
@@ -335,7 +334,7 @@ class Worker:
 
     def _push(self, job):
         number = len(job.attempts) + 1
-        name = re.sub(r"[^a-z0-9]+", "-", job.spec.name.lower()).strip("-")[:16] or "workload"
+        name = re.sub(r"[^a-z0-9]+", "-", job.spec.name.lower())[:16].strip("-") or "workload"
         ref = f"{job.owner}/kgr-{name}-{job.id[:12]}-a{number}"
         attempt = Attempt(number=number, ref=ref)
         job.attempts.append(attempt)
@@ -406,14 +405,14 @@ class Worker:
         )
         return True
 
+    def _collect(self, job_id):
+        try:
+            collect_outputs(self.store, self.backend, job_id)
+        except Exception as error:
+            logger.warning("Output collection for %s: %s", job_id, safe_message(error))
+
     def _downloads(self):
-        for job_id, future in list(self.downloads.items()):
-            if future.done():
-                try:
-                    future.result()
-                except Exception as error:
-                    logger.warning("Output collection for %s: %s", job_id, safe_message(error))
-                del self.downloads[job_id]
+        self.downloads = {job_id: future for job_id, future in self.downloads.items() if not future.done()}
         for job in self.store.list(TERMINAL):
             if (
                 job.remote_ref
@@ -424,11 +423,6 @@ class Worker:
                 and job.id not in self.downloads
             ):
                 if self.pool:
-                    self.downloads[job.id] = self.pool.submit(
-                        collect_outputs, self.store, self.backend, job.id
-                    )
+                    self.downloads[job.id] = self.pool.submit(self._collect, job.id)
                 else:
-                    try:
-                        collect_outputs(self.store, self.backend, job.id)
-                    except Exception as error:
-                        logger.warning("Output collection for %s: %s", job.id, safe_message(error))
+                    self._collect(job.id)

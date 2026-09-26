@@ -2,6 +2,7 @@ import json
 
 from typer.testing import CliRunner
 
+from kaggle_runner import Client
 from kaggle_runner.cli import app, load_specs
 from kaggle_runner.service import unit_text
 
@@ -65,6 +66,26 @@ def test_yaml_relative_paths(tmp_path):
     spec = load_specs(config)[0]
     assert spec.source == tmp_path / "project"
     assert spec.inputs["data"] == tmp_path / "input"
+
+
+def test_yaml_expands_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = tmp_path / "workload.yaml"
+    config.write_text("source: ~/project\nmodule: demo.main\n")
+    assert load_specs(config)[0].source == tmp_path / "home/project"
+
+
+def test_init_keeps_configured_limits(tmp_path, monkeypatch):
+    monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--owner", "tester"]).exit_code == 0
+    assert Client().backend.strict is False  # Permissive unless requested.
+    assert runner.invoke(app, ["init", "--owner", "tester", "--cpu-limit", "2", "--strict"]).exit_code == 0
+    assert runner.invoke(app, ["init", "--owner", "tester"]).exit_code == 0
+    saved = json.loads((tmp_path / "config/config.json").read_text())
+    assert saved["cpu_limit"] == 2 and saved["strict"] is True
+    assert Client().backend.strict is True
 
 
 def test_service_escapes_paths_and_uses_venv(setup):

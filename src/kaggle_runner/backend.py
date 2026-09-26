@@ -19,6 +19,7 @@ import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 
+from .runtime import file_digest, safe_relative
 from .security import redact_secrets
 from .store import atomic_json, atomic_write
 
@@ -72,7 +73,7 @@ def safe_message(error):
                 text = f"HTTP {http_code(error)}: {detail}"
         except (ValueError, AttributeError):
             pass
-    return redact_secrets(text)[:2000]
+    return redact_secrets(text, strict=True)[:2000]
 
 
 def remote_error(error, *, mutation=False):
@@ -104,6 +105,13 @@ def paginate(fetch):
 
 # Longer than Kaggle's 12-hour session limit plus queueing; older runs cannot still be active.
 ACTIVE_HORIZON = timedelta(hours=24)
+# Remote session states that still occupy an execution slot.
+RUNNING_STATES = {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}
+
+
+def _utc(value):
+    """The service returns naive UTC timestamps."""
+    return value.replace(tzinfo=value.tzinfo or timezone.utc)
 
 # Read timeout for calls without an explicit timeout; lowered while snapshotting a live log stream.
 READ_TIMEOUT = contextvars.ContextVar("kgr_read_timeout", default=90)
@@ -117,9 +125,10 @@ class TimeoutAdapter(HTTPAdapter):
 
 
 class KaggleBackend:
-    def __init__(self, owner: str, state_dir: Path):
+    def __init__(self, owner: str, state_dir: Path, *, strict=False):
         self.owner = owner
         self.state_dir = state_dir
+        self.strict = strict
         self._api = None
         self._resources = {}
 
@@ -160,13 +169,14 @@ class KaggleBackend:
         # A 403 on GetDatasetStatus can conceal nonexistence. Only a successful
         # authenticated inventory of our own datasets allows creation in that case.
         page = 1
-        while True:
-            rows = self.api.dataset_list(mine=True, page=page)
-            if not rows:
-                return False
-            if any(row is not None and (row.ref or "").lower() == ref.lower() for row in rows):
-                return True
-            page += 1
+        try:
+            while rows := self.api.dataset_list(mine=True, page=page):
+                if any(row is not None and (row.ref or "").lower() == ref.lower() for row in rows):
+                    return True
+                page += 1
+        except Exception as error:
+            raise remote_error(error) from error
+        return False
 
     def ensure_bundle(self, bundle) -> str | None:
         digest = bundle["digest"]
@@ -305,11 +315,7 @@ class KaggleBackend:
                     if kernel is None:
                         continue
                     last_run = kernel.last_run_time
-                    # The service returns naive UTC timestamps.
-                    if (
-                        last_run is not None
-                        and last_run.replace(tzinfo=last_run.tzinfo or timezone.utc) < cutoff
-                    ):
+                    if last_run is not None and _utc(last_run) < cutoff:
                         return result
                     ref = kernel.ref
                     if not ref or ref.split("/")[0].lower() != self.owner.lower():
@@ -320,7 +326,7 @@ class KaggleBackend:
                         if error.kind == "missing":
                             continue
                         raise
-                    if status["state"] in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+                    if status["state"] in RUNNING_STATES:
                         key = (ref, last_run)
                         self._resources[key] = resources.get(key) or self._resource(ref)
                         result[ref] = self._resources[key]
@@ -331,9 +337,8 @@ class KaggleBackend:
     def quota(self):
         try:
             response = self.api.quota_view()
-            result = {
-                "refresh_at": response.quota_refresh_time.timestamp() if response.quota_refresh_time else None
-            }
+            refresh = response.quota_refresh_time
+            result = {"refresh_at": _utc(refresh).timestamp() if refresh else None}
             for name in ("gpu", "tpu"):
                 quota = getattr(response, name + "_quota")
                 if quota is None:
@@ -356,7 +361,7 @@ class KaggleBackend:
     def logs(self, ref, *, follow=False):
         try:
             if not follow:
-                yield redact_secrets(render_log(self.api.kernels_logs(ref)))
+                yield redact_secrets(render_log(self.api.kernels_logs(ref)), strict=self.strict)
                 return
             seen = 0
             failures = 0
@@ -368,9 +373,12 @@ class KaggleBackend:
                             continue
                         seen = index + 1
                         if event.get("data") is not None:
-                            yield redact_secrets(event["data"])
+                            yield redact_secrets(event["data"], strict=self.strict)
                     return
-                except requests.RequestException:
+                except requests.RequestException as error:
+                    # A session that prints nothing for a while is quiet, not disconnected.
+                    if _read_timeout(error) and self.status(ref)["state"] in RUNNING_STATES:
+                        continue
                     failures = failures + 1 if seen == before else 0
                     if failures < 5:
                         time.sleep(min(2**failures, 15))
@@ -407,7 +415,7 @@ class KaggleBackend:
             raise remote_error(error) from error
         finally:
             READ_TIMEOUT.reset(token)
-        return redact_secrets("".join(chunks))
+        return redact_secrets("".join(chunks), strict=self.strict)
 
     def output_pages(self, ref):
         from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
@@ -422,7 +430,7 @@ class KaggleBackend:
         return paginate(fetch)
 
     def download(self, ref, destination: Path, patterns=None, *, skip=None):
-        return download_outputs(self.output_pages(ref), destination, patterns, skip=skip)
+        return download_outputs(self.output_pages(ref), destination, patterns, skip=skip, strict=self.strict)
 
 
 def _read_timeout(error):
@@ -440,14 +448,6 @@ def render_log(raw):
     if isinstance(events, list) and all(isinstance(event, dict) and "data" in event for event in events):
         return "".join(str(event["data"]) for event in events)
     return raw
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _content_length(response):
@@ -510,7 +510,9 @@ def _validated_download_url(url, *, resolve=False):
     return url
 
 
-def _open_download(url, get, *, resolve=False, max_redirects=5):
+def _open_download(url, get, *, strict=False, resolve=False, max_redirects=5):
+    if not strict:
+        return get(url, stream=True, timeout=(15, 90))
     for _ in range(max_redirects + 1):
         _validated_download_url(url, resolve=resolve)
         response = get(url, stream=True, timeout=(15, 90), allow_redirects=False)
@@ -524,15 +526,17 @@ def _open_download(url, get, *, resolve=False, max_redirects=5):
     raise ValueError("Too many output download redirects")
 
 
-def download_outputs(pages, destination, patterns=None, *, skip=None, get=None):
-    """Download session outputs; names matching the skip predicate are not fetched."""
-    from .bundle import safe_relative
+def download_outputs(pages, destination, patterns=None, *, skip=None, get=None, strict=False):
+    """Download session outputs; names matching the skip predicate are not fetched.
 
+    strict ignores proxy, CA and .netrc settings from the environment, and fetches only
+    public HTTPS addresses, checking every redirect.
+    """
     session = None
-    resolve = get is None
+    resolve = strict and get is None
     if get is None:
         session = requests.Session()
-        session.trust_env = False  # Do not attach .netrc or proxy credentials to signed URLs.
+        session.trust_env = not strict
         get = session.get
     try:
         destination = Path(destination)
@@ -543,7 +547,7 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=None):
         for page in pages:
             if page.log:
                 # Always retrieve logs even when output filtering selects no files.
-                log_data = redact_secrets(render_log(page.log)).encode()
+                log_data = redact_secrets(render_log(page.log), strict=strict).encode()
                 atomic_write(
                     destination / "run.log",
                     log_data,
@@ -559,10 +563,10 @@ def download_outputs(pages, destination, patterns=None, *, skip=None, get=None):
                     continue
                 if patterns is not None and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
                     continue
-                if name in receipts and target.is_file() and sha256(target) == receipts[name]["sha256"]:
+                if name in receipts and target.is_file() and file_digest(target) == receipts[name]["sha256"]:
                     continue
                 digest = hashlib.sha256()
-                with _open_download(item.url, get, resolve=resolve) as response:
+                with _open_download(item.url, get, strict=strict, resolve=resolve) as response:
                     response.raise_for_status()
                     expected = _content_length(response)
                     atomic_write(

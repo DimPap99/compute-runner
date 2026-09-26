@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import BatchRecord, Config, JobRecord
+from .models import BatchRecord, Config, JobRecord, xdg_dir
 
 logger = logging.getLogger(__name__)
 LOW_DISK_FRACTION = 0.10
@@ -26,14 +26,18 @@ _LOW_DISK_LOCK = threading.Lock()
 
 def config_path() -> Path:
     return (
-        Path(
-            os.environ.get(
-                "KGR_CONFIG_DIR",
-                str(Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "kaggle-runner"),
-            )
-        )
+        Path(os.environ.get("KGR_CONFIG_DIR") or xdg_dir("XDG_CONFIG_HOME", ".config") / "kaggle-runner")
         / "config.json"
     )
+
+
+def try_lock(stream) -> bool:
+    """Take an exclusive lock without waiting; closing the file releases it."""
+    try:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
 
 
 def load_config() -> Config:
@@ -156,20 +160,11 @@ class Store:
         finally:
             db.close()
 
-    def add(self, job: JobRecord):
-        with self.connection() as db:
-            self._insert_job(db, job)
-        return job
-
     @staticmethod
-    def _insert_job(db, job):
-        db.execute(
-            "INSERT INTO jobs VALUES (?,?,?,?)",
-            (job.id, job.created_at, job.state, job.model_dump_json()),
-        )
+    def _event(db, job, detail):
         db.execute(
             "INSERT INTO events(job_id,timestamp,state,detail) VALUES(?,?,?,?)",
-            (job.id, time.time(), job.state, "submitted locally"),
+            (job.id, time.time(), job.state, detail),
         )
 
     @staticmethod
@@ -218,7 +213,11 @@ class Store:
                 (batch.id, batch.created_at, request_key, fingerprint),
             )
             for position, job in enumerate(batch.jobs):
-                self._insert_job(db, job)
+                db.execute(
+                    "INSERT INTO jobs VALUES (?,?,?,?)",
+                    (job.id, job.created_at, job.state, job.model_dump_json()),
+                )
+                self._event(db, job, "submitted locally")
                 db.execute("INSERT INTO batch_jobs VALUES (?,?,?)", (batch.id, job.id, position))
         return batch
 
@@ -329,10 +328,7 @@ class Store:
                 "UPDATE jobs SET state=?,record=? WHERE id=?", (job.state, job.model_dump_json(), job.id)
             )
             if previous != self._observable(job):
-                db.execute(
-                    "INSERT INTO events(job_id,timestamp,state,detail) VALUES (?,?,?,?)",
-                    (job.id, time.time(), job.state, job.error or job.wait_reason or job.download_state),
-                )
+                self._event(db, job, job.error or job.wait_reason or job.download_state)
             return job
 
     @staticmethod
@@ -351,14 +347,14 @@ class Store:
     @contextmanager
     def worker_lock(self):
         with (self.root / "worker.lock").open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("A worker already owns this state directory") from None
-            try:
-                yield
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+            # Health probes hold this lock for an instant; do not mistake one for a worker.
+            for _ in range(20):
+                if try_lock(lock):
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("A worker already owns this state directory")
+            yield
 
     def heartbeat(self, **extra):
         atomic_json(self.root / "worker.json", dict(pid=os.getpid(), timestamp=time.time(), **extra))

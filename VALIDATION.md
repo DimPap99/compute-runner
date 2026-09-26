@@ -2,7 +2,7 @@
 
 Verified on 2026-09-26 using the installed Python 3.12 environment.
 
-- 78 automated tests passed. These use fake remote services, transactional local queues, and local execution of generated launchers.
+- 134 automated tests passed (rerun after the code review and strict-mode changes below). These use fake remote services, transactional local queues, and local execution of generated launchers.
 - Ruff checks, Python compilation, and `pip check` passed.
 - The systemd user unit passed `systemd-analyze --user verify`; the service is enabled and running.
 - `kgr` is installed at `~/.local/bin/kgr` and points to this project's isolated environment.
@@ -13,12 +13,18 @@ Verified on 2026-09-26 using the installed Python 3.12 environment.
 - Tested atomic batch submission on snapshot and database failures, concurrent same-key submissions, conflicting request keys, explicit retries, restart/completion replay, and replay after source files change or disappear.
 - Tested bounded status pages, deterministic batch order, per-batch cursors, coalesced changes during pagination, download-error events, quiet polling, and v1 queue migration.
 - Tested bounded Unicode log tails, private full-log caching, offline cache reuse, and preserving an existing cache when a refresh fails. CLI tests cover structured operation errors and CPU overrides of GPU workload files.
-- Validated the installed `~/.codex/skills/kaggle-runner` skill; its copy under `skills/kaggle-runner` matches. Command examples were exercised by the CLI integration tests and read-only live checks.
+- Validated the skill installed at `~/.codex/skills/kaggle-runner` at that time. Copies do not follow later skill updates, so install the skill as a symlink (see README). Command examples were exercised by the CLI integration tests and read-only live checks.
 - Backed up the live v1 database to `~/.local/share/kaggle-runner/queue.pre-agent-v1.sqlite3` before upgrading. All seven existing local records were preserved. Four pages of changes returned those seven jobs; a subsequent query returned no changed jobs.
 - On those existing records, the full JSON was 12,057 bytes and compact status was 2,920 bytes (about 76% smaller). This is a response-size measurement on that sample, not a universal token-saving guarantee. A live three-line log query returned 187 bytes from a 528-byte log, retaining the full private cache.
 - The systemd user service was restored and remains enabled. No additional Kaggle workloads were launched for this interface update; submission/worker integration was exercised with the fake backend, and remote log retrieval was checked against an existing successful run.
 
-The agent interface is a CLI/Python API plus a Codex skill. It does not provide an MCP server, timed/recurring jobs, or automatic conversation wakeups.
+The agent interface is a CLI/Python API plus a model-agnostic agent skill. It does not provide an MCP server, timed/recurring jobs, or automatic conversation wakeups.
+
+## Code review and strict mode
+
+- A review of the whole codebase fixed notebook slugs ending in `-`, case-sensitive capacity accounting, worker-lock races with health probes, `kgr init` resetting saved limits, `~` in workload YAML, rejected attempts reported as remote runs, retryable dataset-inventory failures, and quota refresh times read as local time. Each fix has a regression test that fails on the previous code.
+- Dispatch with 600 queued jobs dropped from about 50 seconds per worker cycle to under 1 second, measured with the fake backend.
+- Tests cover strict mode on and off for log redaction and downloads, `kgr logs --follow` through quiet periods, non-Python supporting notebooks, input folders that `.gitignore` their data, and download retry backoff.
 
 ## Live Kaggle checks
 
@@ -41,4 +47,4 @@ Results and source/provenance records are under `~/.local/share/kaggle-runner/re
 
 ## Boundaries
 
-Live validation used small workloads; multi-gigabyte transfers, platform-wide outages, and twelve-hour executions were not exercised. Crash recovery, pagination, partial downloads, quota/capacity failures, and concurrent submissions are covered by deterministic tests. Active remote cancellation still requires Kaggle's web UI. Scheduling depends on the local user service being online.
+Live validation used small workloads; multi-gigabyte transfers, platform-wide outages, and twelve-hour executions were not exercised. Crash recovery, pagination, partial downloads, quota/capacity failures, and concurrent submissions are covered by deterministic tests. Remote cancellation of running jobs and strict-mode downloads are covered by tests with a fake backend but were not exercised against live Kaggle runs. Scheduling depends on the local user service being online.

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
-import hashlib
 import json
 import re
 import time
@@ -13,7 +11,8 @@ from pathlib import Path
 from .backend import KaggleBackend
 from .bundle import describe, snapshot
 from .models import BatchRecord, Config, JobRecord, JobSpec
-from .store import Store, load_config
+from .runtime import json_digest
+from .store import Store, load_config, try_lock
 from .worker import Worker, collect_outputs, outstanding, settled
 
 
@@ -35,7 +34,7 @@ class Client:
     @property
     def backend(self):
         if self._backend is None:
-            self._backend = KaggleBackend(self.config.owner, self.config.state_dir)
+            self._backend = KaggleBackend(self.config.owner, self.config.state_dir, strict=self.config.strict)
         return self._backend
 
     def preview(self, spec: JobSpec):
@@ -58,7 +57,7 @@ class Client:
             raise ValueError(
                 "Request key must be 1–128 letters, digits, dots, underscores, colons, slashes or hyphens"
             )
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return json_digest(value)
 
     def submit_batch(self, specs: list[JobSpec], *, request_key: str | None = None) -> BatchRecord:
         """Atomically queue a batch; a repeated key returns its original immutable snapshots.
@@ -240,12 +239,7 @@ class Client:
         except (ValueError, OSError):
             info = {}
         with (self.config.state_dir / "worker.lock").open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                running = False
-                fcntl.flock(lock, fcntl.LOCK_UN)
-            except BlockingIOError:
-                running = True
+            running = not try_lock(lock)
         return info | {
             "running": running,
             "heartbeat_age_seconds": time.time() - info["timestamp"] if "timestamp" in info else None,

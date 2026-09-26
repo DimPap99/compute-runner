@@ -77,22 +77,22 @@ def test_batch_snapshot_failure_is_atomic_and_key_remains_usable(setup, tmp_path
 
 def test_batch_database_failure_rolls_back_receipt_jobs_and_events(setup, monkeypatch):
     client, _, spec = setup
-    original = client.store._insert_job
+    original = client.store._event
     calls = 0
 
-    def failing(db, job):
+    def failing(db, job, detail):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("disk full")
-        original(db, job)
+        original(db, job, detail)
 
-    monkeypatch.setattr(client.store, "_insert_job", failing)
+    monkeypatch.setattr(client.store, "_event", failing)
     with pytest.raises(OSError, match="disk full"):
         client.submit_batch([spec] * 2, request_key="atomic")
     assert client.list() == []
     assert client.agent().changes()["cursor"] == 0
-    monkeypatch.setattr(client.store, "_insert_job", original)
+    monkeypatch.setattr(client.store, "_event", original)
     batch = client.submit_batch([spec] * 2, request_key="atomic")
     assert not batch.replayed and len(batch.jobs) == 2
 

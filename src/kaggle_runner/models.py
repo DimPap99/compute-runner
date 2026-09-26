@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .security import validate_nonsecret_env
 
 
+def xdg_dir(variable: str, default: str) -> Path:
+    return Path(os.environ.get(variable) or Path.home() / default)
+
+
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -69,14 +73,11 @@ class Config(Model):
     discovery_seconds: float = Field(default=300, ge=1)
     retry_seconds: float = Field(default=60, ge=1)
     reconcile_seconds: float = Field(default=300, ge=1)
+    # Broad log redaction and locked-down output downloads; see README "Strict mode".
+    strict: bool = False
     state_dir: Path = Field(
         default_factory=lambda: Path(
-            os.environ.get(
-                "KGR_STATE_DIR",
-                str(
-                    Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "kaggle-runner"
-                ),
-            )
+            os.environ.get("KGR_STATE_DIR") or xdg_dir("XDG_DATA_HOME", ".local/share") / "kaggle-runner"
         )
     )
 
@@ -131,13 +132,15 @@ class JobRecord(Model):
     download_state: Literal["pending", "downloading", "complete", "error", "disabled"] = "pending"
     download_error: str | None = None
     download_retry_at: float = 0
+    download_failures: int = 0
     upload_refs: dict[str, str] = Field(default_factory=dict)
     result_dir: Path
     parent_id: str | None = None
 
     @property
     def remote_ref(self) -> str | None:
-        return self.attempts[-1].ref if self.attempts else None
+        """The latest attempt's notebook, unless Kaggle definitively rejected it."""
+        return self.attempts[-1].ref if self.attempts and self.attempts[-1].state != "rejected" else None
 
     @property
     def url(self) -> str | None:

@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import tempfile
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import nbformat
 import pathspec
 
 from .models import JobSpec
+from .runtime import MANIFEST, json_digest, safe_relative
 from .security import detected_secret, secret_filename
 from .store import atomic_json
 
-MANIFEST = "kgr-manifest.json"
 PROTECTED = {
     ".git",
     ".hg",
@@ -40,21 +39,16 @@ PROTECTED = {
 }
 
 
-def safe_relative(value: str) -> str:
-    path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts or "\\" in value:
-        raise ValueError(f"Path must stay inside the project: {value}")
-    return path.as_posix()
-
-
-def inventory(source: Path, exclude: list[str]) -> tuple[Path, list[Path]]:
+def inventory(
+    source: Path, exclude: list[str], ignore_files=(".gitignore", ".kgrignore")
+) -> tuple[Path, list[Path]]:
     source = source.expanduser().absolute()
     if source.is_symlink():
         raise ValueError(f"Symlink source is not supported: {source}")
     source = source.resolve(strict=True)
     root = source if source.is_dir() else source.parent
     patterns = list(exclude)
-    for name in (".gitignore", ".kgrignore"):
+    for name in ignore_files:
         file = root / name
         if file.is_file() and not file.is_symlink():
             patterns.extend(file.read_text().splitlines())
@@ -99,12 +93,12 @@ def inventory(source: Path, exclude: list[str]) -> tuple[Path, list[Path]]:
     return root, selected
 
 
-def clean_notebook(path: Path) -> bytes:
+def clean_notebook(path: Path, *, python=False) -> bytes:
     # nbformat raises jsonschema's ValidationError, not a ValueError, while reading and validating.
     try:
         notebook = nbformat.read(path, as_version=4)
         language = notebook.metadata.get("kernelspec", {}).get("language", "python")
-        if language.lower() != "python":
+        if python and language.lower() != "python":
             raise ValueError("Only Python notebooks are supported")
         for cell in notebook.cells:
             if cell.cell_type == "code":
@@ -138,15 +132,17 @@ def describe(spec: JobSpec) -> dict:
             raise ValueError("Entrypoint must be a .py or .ipynb file")
         kind = "notebook" if entrypoint.endswith(".ipynb") else "script"
         if kind == "notebook":
-            clean_notebook(root / entrypoint)
+            clean_notebook(root / entrypoint, python=True)
     else:
         raise ValueError("Folder sources require entrypoint or module")
     if spec.requirements and Path(safe_relative(spec.requirements)) not in files:
         raise ValueError("requirements must identify an included project file")
     inputs = {}
     for alias, source_path in spec.inputs.items():
-        data_root, data_files = inventory(source_path, [])
+        # Data folders often .gitignore exactly the files they exist to carry; only .kgrignore applies.
+        data_root, data_files = inventory(source_path, [], ignore_files=(".kgrignore",))
         inputs[alias] = dict(
+            root=str(data_root),
             files=[p.as_posix() for p in data_files],
             bytes=sum((data_root / p).stat().st_size for p in data_files),
         )
@@ -169,23 +165,28 @@ def describe(spec: JobSpec) -> dict:
     )
 
 
-def snapshot_bundle(source: Path, exclude: list[str], bundle_root: Path, *, notebooks=False) -> dict:
-    root, files = inventory(source, exclude)
+def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=False) -> dict:
+    """Copy an inventory of files into an immutable, content-addressed bundle."""
     bundle_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix=".building-", dir=bundle_root) as temporary:
         stage = Path(temporary)
         payload = stage / "files"
         records = {}
-        for relative in files:
+        for relative in map(Path, files):
             original = root / relative
             before = original.stat()
             destination = payload / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha256()
             size = 0
-            with destination.open("wb") as output:
-                if notebooks and original.suffix == ".ipynb":
+            data = None
+            if notebooks and original.suffix == ".ipynb":
+                try:
                     data = clean_notebook(original)
+                except ValueError:
+                    pass  # Only the entrypoint runs, and describe() validated it; copy others unchanged.
+            with destination.open("wb") as output:
+                if data is not None:
                     if kind := detected_secret(data):
                         raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
                     output.write(data)
@@ -213,8 +214,7 @@ def snapshot_bundle(source: Path, exclude: list[str], bundle_root: Path, *, note
             ):
                 raise ValueError(f"File changed during snapshot; submit again: {original}")
             records[relative.as_posix()] = {"sha256": digest.hexdigest(), "size": size}
-        serialized = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
-        fingerprint = hashlib.sha256(serialized).hexdigest()
+        fingerprint = json_digest(records)
         manifest = dict(schema_version=1, digest=fingerprint, files=records)
         atomic_json(payload / MANIFEST, manifest)
         with zipfile.ZipFile(stage / "payload.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -236,16 +236,14 @@ def snapshot_bundle(source: Path, exclude: list[str], bundle_root: Path, *, note
 
 def snapshot(spec: JobSpec, state_dir: Path) -> dict:
     plan = describe(spec)
-    root = spec.source.expanduser().resolve()
-    if root.is_dir() and state_dir.is_relative_to(root):
-        raise ValueError("The state directory must not be inside a source folder")
-    source = snapshot_bundle(spec.source, spec.exclude, state_dir / "bundles", notebooks=True)
-    inputs = {}
-    for alias, path in spec.inputs.items():
-        if path.expanduser().resolve().is_dir() and state_dir.is_relative_to(path.expanduser().resolve()):
-            raise ValueError("The state directory must not be inside an input folder")
-        inputs[alias] = snapshot_bundle(path, [], state_dir / "bundles")
+    parts = [plan, *plan["inputs"].values()]
+    if any((Path(part["root"]) / name).is_relative_to(state_dir) for part in parts for name in part["files"]):
+        raise ValueError("The state directory must not be inside a source or input folder")
+
+    def save(part, **options):
+        return snapshot_bundle(Path(part["root"]), part["files"], state_dir / "bundles", **options)
+
     return {key: plan[key] for key in ("kind", "single_file", "entrypoint", "module")} | {
-        "source": source,
-        "inputs": inputs,
+        "source": save(plan, notebooks=True),
+        "inputs": {alias: save(part) for alias, part in plan["inputs"].items()},
     }

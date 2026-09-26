@@ -5,6 +5,7 @@ import requests
 
 from kaggle_runner import store as store_module
 from kaggle_runner.backend import KaggleBackend, RemoteError, download_outputs, remote_error, safe_message
+from kaggle_runner.security import redact_secrets
 from kaggle_runner.store import atomic_write
 
 
@@ -62,7 +63,7 @@ def test_interrupted_download_never_replaces_existing_output(tmp_path):
     with pytest.raises(requests.ConnectionError):
         download_outputs([page("one.txt")], tmp_path, get=lambda *a, **k: Response(fail=True))
     assert (root / "one.txt").read_text() == "old version"
-    assert not list(root.glob(".kgr-*"))
+    assert not list(root.glob(".*.tmp"))
 
 
 @pytest.mark.parametrize("name", ["../escape", "/tmp/escape", "path/../../escape", "bad\\escape"])
@@ -95,8 +96,20 @@ def test_download_rejects_unsafe_urls_before_connecting(tmp_path, url):
     calls = []
     pages = [Obj(files=[Obj(file_name="one.txt", url=url)], log=None)]
     with pytest.raises(ValueError):
-        download_outputs(pages, tmp_path, get=lambda *a, **k: calls.append(a) or Response())
+        download_outputs(pages, tmp_path, get=lambda *a, **k: calls.append(a) or Response(), strict=True)
     assert calls == []
+
+
+def test_default_download_leaves_url_handling_to_requests(tmp_path):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    pages = [Obj(files=[Obj(file_name="one.txt", url="http://mirror.internal:8080/one")], log=None)]
+    assert set(download_outputs(pages, tmp_path, get=get)) == {"one.txt"}
+    assert "allow_redirects" not in calls[0][1]
 
 
 def test_download_validates_redirect_destination(tmp_path):
@@ -107,7 +120,7 @@ def test_download_validates_redirect_destination(tmp_path):
         return Response(status_code=302, location="https://127.0.0.1/private")
 
     with pytest.raises(ValueError, match="non-public"):
-        download_outputs([page("one.txt")], tmp_path, get=get)
+        download_outputs([page("one.txt")], tmp_path, get=get, strict=True)
     assert len(calls) == 1
     assert calls[0][1]["allow_redirects"] is False
 
@@ -118,6 +131,15 @@ def test_safe_message_redacts_credentials():
         "failed https://name:" + f"pass{'word'}@example.test/file?signature=value KAGGLE_KEY={key}"
     )
     assert "password" not in message and key not in message and "signature" not in message
+
+
+def test_log_redaction_keeps_ordinary_text_unless_strict():
+    key_block = "-----BEGIN PRIVATE KEY-----\nMIIsecretbody\n-----END PRIVATE KEY-----"
+    text = f"Running basic sanity checks; num_tokens=524288; KGAT_{'a' * 24}\n{key_block}"
+    relaxed = redact_secrets(text)
+    assert "basic sanity checks" in relaxed and "num_tokens=524288" in relaxed
+    assert "KGAT_" not in relaxed and "MIIsecretbody" not in relaxed
+    assert "num_tokens=[redacted]" in redact_secrets(text, strict=True)
 
 
 def test_downloaded_log_redacts_credentials(tmp_path):
@@ -196,12 +218,12 @@ def test_server_failure_is_uncertain_for_mutations():
 
 
 def test_quota_accounts_for_reservations(tmp_path):
-    from datetime import timedelta
+    from datetime import datetime, timedelta, timezone
 
     backend = KaggleBackend("tester", tmp_path)
     backend._api = Obj(
         quota_view=lambda: Obj(
-            quota_refresh_time=None,
+            quota_refresh_time=datetime(2026, 1, 1),  # The SDK returns naive UTC.
             tpu_quota=None,
             gpu_quota=Obj(
                 time_used=timedelta(hours=2),
@@ -210,7 +232,9 @@ def test_quota_accounts_for_reservations(tmp_path):
             ),
         )
     )
-    assert backend.quota()["gpu"]["available_seconds"] == 5 * 3600
+    quota = backend.quota()
+    assert quota["gpu"]["available_seconds"] == 5 * 3600
+    assert quota["refresh_at"] == datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
 
 
 def test_push_normalizes_versioned_reference(tmp_path):
@@ -267,6 +291,24 @@ def test_existing_dataset_403_does_not_trigger_creation(tmp_path):
     with pytest.raises(RemoteError) as error:
         backend.ensure_bundle({"digest": digest})
     assert error.value.kind == "auth"
+
+
+def test_dataset_inventory_failure_after_403_stays_retryable(tmp_path):
+    response = requests.Response()
+    response.status_code = 403
+    response._content = b"{}"
+
+    def forbidden(*args, **kwargs):
+        raise requests.HTTPError("Permission denied", response=response)
+
+    def offline(**kwargs):
+        raise requests.ConnectionError("network down")
+
+    backend = KaggleBackend("tester", tmp_path)
+    backend._api = Obj(dataset_status=forbidden, dataset_list=offline)
+    with pytest.raises(RemoteError) as error:
+        backend.ensure_bundle({"digest": "c" * 64})
+    assert error.value.kind == "transient"
 
 
 def test_push_accepts_bare_slug_and_saves_receipt(tmp_path):

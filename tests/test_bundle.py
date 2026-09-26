@@ -7,7 +7,7 @@ import nbformat
 import pytest
 
 from kaggle_runner import JobSpec
-from kaggle_runner.bundle import describe, inventory, snapshot_bundle
+from kaggle_runner.bundle import describe, inventory, snapshot, snapshot_bundle
 from kaggle_runner.launcher import prepare_kernel
 from kaggle_runner.models import Attempt
 from kaggle_runner.runtime import _find_bundle, _unpack
@@ -53,7 +53,7 @@ def test_snapshot_rejects_detected_credential_without_echoing_it(tmp_path):
     credential = "KAGGLE_KEY=" + "a" * 32
     source.write_text("print('before')\n" + credential + "\n")
     with pytest.raises(ValueError, match="Detected Kaggle API key") as error:
-        snapshot_bundle(source, [], tmp_path / "bundles")
+        snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
     assert credential not in str(error.value)
 
 
@@ -75,6 +75,32 @@ def test_rejects_symlink_and_missing_entrypoint(tmp_path):
         describe(JobSpec(source=tmp_path, entrypoint="missing.py", exclude=["link.py"]))
 
 
+def test_supporting_notebooks_need_not_be_python(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("pass")
+    kernelspec = {"language": "R", "name": "ir", "display_name": "R"}
+    nbformat.write(nbformat.v4.new_notebook(metadata={"kernelspec": kernelspec}), project / "analysis.ipynb")
+    (project / "broken.ipynb").write_text("not json")
+    saved = snapshot(JobSpec(source=project, entrypoint="main.py"), tmp_path / "state")
+    assert {"analysis.ipynb", "broken.ipynb"} <= set(saved["source"]["files"])
+    with pytest.raises(ValueError, match="Only Python"):
+        describe(JobSpec(source=project, entrypoint="analysis.ipynb"))
+
+
+def test_input_folders_skip_gitignore_but_honor_kgrignore(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".gitignore").write_text("train.csv\n")
+    (data / ".kgrignore").write_text("scratch.tmp\n")
+    for name in ("train.csv", "scratch.tmp"):
+        (data / name).write_text("example")
+    script = tmp_path / "main.py"
+    script.write_text("pass")
+    files = describe(JobSpec(source=script, inputs={"data": data}))["inputs"]["data"]["files"]
+    assert "train.csv" in files and "scratch.tmp" not in files
+
+
 def test_notebook_outputs_cleared_without_editing_original(tmp_path):
     source = tmp_path / "test.ipynb"
     notebook = nbformat.v4.new_notebook(
@@ -87,7 +113,7 @@ def test_notebook_outputs_cleared_without_editing_original(tmp_path):
         ]
     )
     nbformat.write(notebook, source)
-    bundle = snapshot_bundle(source, [], tmp_path / "bundles", notebooks=True)
+    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles", notebooks=True)
     saved = nbformat.read(tmp_path / "bundles" / bundle["digest"] / "files" / source.name, as_version=4)
     assert saved.cells[0].outputs == []
     assert nbformat.read(source, as_version=4).cells[0].outputs
@@ -148,7 +174,7 @@ Path(os.environ['KGR_OUTPUT_DIR'], 'result.txt').write_text(str(VALUE))
 def test_archive_and_expanded_lookup(tmp_path):
     source = tmp_path / "hello.py"
     source.write_text("print(42)")
-    bundle = snapshot_bundle(source, [], tmp_path / "bundles")
+    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
     mount = tmp_path / "input/test-bundle"
     mount.mkdir(parents=True)
     archive = tmp_path / "bundles" / bundle["digest"] / "payload.zip"
@@ -171,7 +197,7 @@ def test_archive_and_expanded_lookup(tmp_path):
 def test_rejects_tampered_archive(tmp_path):
     source = tmp_path / "hello.py"
     source.write_text("original")
-    bundle = snapshot_bundle(source, [], tmp_path / "bundles")
+    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
     malicious = tmp_path / "bad.zip"
     saved = tmp_path / "bundles" / bundle["digest"] / "files"
     with zipfile.ZipFile(malicious, "w") as z:

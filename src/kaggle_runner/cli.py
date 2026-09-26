@@ -16,6 +16,7 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
+from .backend import safe_message
 from .client import Client
 from .models import Config, JobSpec
 from .security import redacted_env_record
@@ -76,12 +77,9 @@ def load_specs(path: Path):
         result = []
         for row in rows:
             spec = JobSpec.model_validate(row)
-            if not spec.source.is_absolute():
-                spec.source = path.parent / spec.source
-            spec.inputs = {
-                key: value if value.is_absolute() else path.parent / value
-                for key, value in spec.inputs.items()
-            }
+            # Joining keeps absolute paths as they are.
+            spec.source = path.parent / spec.source.expanduser()
+            spec.inputs = {key: path.parent / value.expanduser() for key, value in spec.inputs.items()}
             result.append(spec)
         return result
     return [JobSpec(source=path, name=path.stem)]
@@ -102,16 +100,25 @@ def workload_specs(source: Path, *, timeout=None, arg=None, **overrides):
 def initialize(
     ctx: typer.Context,
     owner: Annotated[str, typer.Option()],
-    cpu_limit: int = 5,
-    gpu_limit: int = 1,
-    poll_seconds: float = 30,
+    cpu_limit: Annotated[int | None, typer.Option(help="Default 5; unchanged when omitted")] = None,
+    gpu_limit: Annotated[int | None, typer.Option(help="Default 1; unchanged when omitted")] = None,
+    poll_seconds: Annotated[float | None, typer.Option(help="Default 30; unchanged when omitted")] = None,
+    strict: Annotated[
+        bool | None,
+        typer.Option(
+            "--strict/--no-strict",
+            help="Broad log redaction and locked-down downloads. Default off; unchanged when omitted",
+        ),
+    ] = None,
 ):
-    values = _client(ctx).config.model_dump()
-    values.update(owner=owner, cpu_limit=cpu_limit, gpu_limit=gpu_limit, poll_seconds=poll_seconds)
+    changes = dict(
+        owner=owner, cpu_limit=cpu_limit, gpu_limit=gpu_limit, poll_seconds=poll_seconds, strict=strict
+    )
+    values = _client(ctx).config.model_dump() | {k: v for k, v in changes.items() if v is not None}
     config = Config.model_validate(values)
     Client(config=config)  # Validate the account binding before saving configuration.
     atomic_json(config_path(), config.model_dump(mode="json"))
-    _emit(ctx, dict(config=str(config_path()), owner=owner, state_dir=str(config.state_dir)))
+    _emit(ctx, dict(config=str(config_path()), owner=owner, state_dir=str(config.state_dir), strict=strict))
 
 
 @app.command()
@@ -262,6 +269,7 @@ def doctor(ctx: typer.Context, offline: bool = False):
     info = dict(
         owner=client.config.owner,
         state_dir=str(client.config.state_dir),
+        strict=client.config.strict,
         free_disk_bytes=shutil.disk_usage(client.config.state_dir).free,
         worker=client.worker_health(),
         python=sys.version.split()[0],
@@ -320,14 +328,12 @@ def service_status(ctx: typer.Context):
 def main():
     try:
         app()
-    except (ValueError, KeyError, RuntimeError, OSError) as error:
-        from .backend import safe_message
-
+    except ERRORS as error:
         typer.echo("Error: " + safe_message(error), err=True)
         raise SystemExit(1) from None
 
 
 # Import after load_specs is defined; the agent CLI reuses workload-file parsing.
-from .agent_cli import agent_app  # noqa: E402
+from .agent_cli import ERRORS, agent_app  # noqa: E402
 
 app.add_typer(agent_app, name="agent")

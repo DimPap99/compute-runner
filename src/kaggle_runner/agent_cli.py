@@ -10,13 +10,14 @@ from typing import Annotated
 
 import typer
 import yaml
-from pydantic import ValidationError
 
 from .agent import short
 
 agent_app = typer.Typer(
     no_args_is_help=True, help="Bounded JSON API for agents. Scheduling stays in the worker."
 )
+# Operation failures reported as a message; anything else is a bug and keeps its traceback.
+ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
 
 
 def response(function):
@@ -24,15 +25,9 @@ def response(function):
     def wrapped(*args, **kwargs):
         try:
             result = function(*args, **kwargs)
-        except (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError) as error:
-            if isinstance(error, ValidationError):
-                detail = error.errors(include_input=False, include_url=False)[0]
-                message = f"Invalid {'.'.join(map(str, detail['loc']))}: {detail['msg']}"
-            elif isinstance(error, KeyError) and error.args:
-                message = str(error.args[0])  # str(KeyError) would add repr quotes
-            else:
-                message = str(error)
-            typer.echo(json.dumps({"schema_version": 1, "error": short(message)}, ensure_ascii=False))
+        except ERRORS as error:
+            detail = error.args[0] if isinstance(error, KeyError) and error.args else error  # no repr quotes
+            typer.echo(json.dumps({"schema_version": 1, "error": short(detail)}, ensure_ascii=False))
             raise typer.Exit(1) from None
         typer.echo(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 

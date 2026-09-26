@@ -21,7 +21,6 @@ def prepare_kernel(job: JobRecord, state_dir: Path) -> Path:
     config = dict(
         job_id=job.id,
         source_digest=source["digest"],
-        source_files=source["files"],
         source_ref=job.upload_refs.get("source"),
         inline=None,
         inputs={
@@ -35,6 +34,8 @@ def prepare_kernel(job: JobRecord, state_dir: Path) -> Path:
         requirements=job.spec.requirements,
     )
     if snapshot["single_file"]:
+        # Directory bundles carry their own manifest; only embedded files need their checksums here.
+        config["source_files"] = source["files"]
         config["inline"] = {
             name: base64.b64encode((payload / name).read_bytes()).decode() for name in source["files"]
         }

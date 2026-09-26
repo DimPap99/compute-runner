@@ -38,7 +38,13 @@ _REDACT_FIELD = re.compile(
     re.I,
 )
 _SECRET_PATTERNS = (
-    ("private key", re.compile(rb"-----BEGIN (?:ENCRYPTED |RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    (
+        "private key",
+        re.compile(
+            rb"-----BEGIN (?:ENCRYPTED |RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+            rb"(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)?"
+        ),
+    ),
     ("Kaggle token", re.compile(rb"(?i)(?<![A-Za-z0-9])KGAT_[A-Za-z0-9._~+/=-]{12,}")),
     ("Kaggle API key", re.compile(rb"(?i)KAGGLE_KEY\s*[:=]\s*['\"]?[0-9a-f]{32}")),
     ("AWS access key", re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")),
@@ -106,16 +112,24 @@ def redacted_env_record(value: dict) -> dict:
     return value
 
 
-def redact_secrets(value) -> str:
-    """Remove common credential forms from exception text before persistence or display."""
-    text = str(value)
-    text = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", text, flags=re.I)
-    text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text, flags=re.I)
-    text = re.sub(r"(?i)(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[redacted]", text)
-    text = re.sub(r"(?i)KGAT_[A-Za-z0-9._~+/=-]+", "[redacted]", text)
-    if any(
-        marker in text.casefold()
-        for marker in ("key", "token", "secret", "password", "passwd", "credential")
-    ):
-        text = _REDACT_FIELD.sub(r"\1[redacted]", text)
+def redact_secrets(value, *, strict=False) -> str:
+    """Remove credentials from text before persistence or display.
+
+    URL passwords and known credential formats are always removed. strict also removes
+    anything credential-shaped (URL query strings, words after Bearer/Basic, values of
+    token/key/secret/password fields), which can hide ordinary text such as num_tokens=512.
+    """
+    text = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", str(value), flags=re.I)
+    raw = text.encode("utf-8", "surrogatepass")
+    for _, pattern in _SECRET_PATTERNS:
+        raw = pattern.sub(b"[redacted]", raw)
+    text = raw.decode("utf-8", "surrogatepass")
+    if strict:
+        text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text, flags=re.I)
+        text = re.sub(r"(?i)(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[redacted]", text)
+        if any(
+            marker in text.casefold()
+            for marker in ("key", "token", "secret", "password", "passwd", "credential")
+        ):
+            text = _REDACT_FIELD.sub(r"\1[redacted]", text)
     return text

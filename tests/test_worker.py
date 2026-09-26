@@ -31,6 +31,25 @@ def test_existing_account_runs_reduce_capacity(setup):
     assert len(backend.pushes) == 1
 
 
+def test_account_inventory_matches_own_runs_ignoring_case(setup):
+    client, backend, spec = setup
+    client.submit_many([spec] * 2)
+    worker = client.worker()
+    worker.tick()
+    backend.external = {ref.upper(): "cpu" for ref in backend.remote}
+    worker.inventory_at = None
+    client.submit_many([spec] * 3)
+    worker.tick()
+    assert len(backend.pushes) == 5
+
+
+def test_notebook_slug_never_ends_with_a_hyphen(setup):
+    client, backend, spec = setup
+    client.submit(spec.model_copy(update={"name": "my experiment 1 v2"}))
+    client.worker().tick()
+    assert "--" not in backend.pushes[0]["id"]
+
+
 def test_gpu_block_does_not_block_cpu_and_recovers(setup):
     client, backend, spec = setup
     backend.gpu_seconds = 0
@@ -98,6 +117,7 @@ def test_capacity_rejection_backoff_and_fresh_slug(setup):
     worker = client.worker()
     worker.tick()
     assert client.get(job.id).state == "queued"
+    assert client.get(job.id).remote_ref is None  # A rejected attempt created no notebook.
     worker.tick()
     assert len(backend.pushes) == 1
     backend.push_error = None
@@ -141,6 +161,22 @@ def test_download_failure_does_not_rerun_job(setup):
     worker.tick()
     assert client.get(job.id).download_state == "complete"
     assert len(backend.pushes) == 1
+
+
+def test_download_retries_back_off(setup):
+    client, backend, spec = setup
+    job = client.submit(spec)
+    worker = client.worker()
+    worker.tick()
+    backend.remote[client.get(job.id).remote_ref] = dict(state="COMPLETE", error=None)
+    backend.download_error = OSError("storage unavailable")
+    delays = []
+    for _ in range(3):
+        due(client, job.id)
+        worker.tick()
+        failed = client.get(job.id)
+        delays.append(round(failed.download_retry_at - failed.updated_at))
+    assert delays == [60, 120, 240] and failed.download_failures == 3
 
 
 def test_dataset_processing_precedes_submission(setup, tmp_path):
