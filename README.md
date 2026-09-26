@@ -622,7 +622,7 @@ The queue talks to providers only through the `Provider` protocol in `src/comput
 | --- | --- |
 | `check(spec)` | Raise `ValueError` for a specification the provider cannot run, including its dataset references |
 | `ensure_bundle(bundle)` | Reuse a content-addressed bundle the account already holds, or upload it; `None` while it is still processing |
-| `resolve_dataset(ref)` | Pin a dataset the account can read; `None` if it cannot. Every call checks access |
+| `resolve_dataset(ref)` | Pin a dataset the account can read; `None` if it cannot, or if the dataset or pinned version does not exist. Every call checks access |
 | `fetch_dataset(ref, destination)` | Download a readable dataset as plain files, so it can be copied to another account |
 | `stage(job, number)` | Build the attempt's launch package locally and return its deterministic remote reference. It must expose every input as `KGR_INPUT_<ALIAS>` |
 | `submit(job)` | Launch the staged attempt; raise `RemoteError` with `definitive=True` only when nothing was launched |

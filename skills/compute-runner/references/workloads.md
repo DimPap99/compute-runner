@@ -36,7 +36,7 @@ Put the settings that distinguish runs in `params`, not in `args`. Each paramete
 Every input has an alias, and the workload reads it from `os.environ["KGR_INPUT_<ALIAS>"]` (for `data`, `KGR_INPUT_DATA`), or all of them from `KGR_INPUTS_JSON`. Never hardcode provider paths such as `/kaggle/input`. An input is one of:
 
 - A local file or folder. It becomes a private dataset of the job's account; identical snapshots reuse uploads.
-- `"kaggle:OWNER/SLUG[/VERSION]"`: an existing dataset, attached directly when the job's account can read it. If it cannot, and another connected account can, the queue copies it only when the user allowed copies (see the skill's Accounts section).
+- `"kaggle:OWNER/SLUG[/VERSION]"`: an existing dataset, attached directly when the job's account can read it. If it cannot, and another connected account can, the queue copies it only when the user allowed copies (see the skill's Accounts section). If no connected account can find it, the job is blocked before it runs.
 - `"job:JOB_ID[/PATH]"`: files a finished job wrote to `KGR_OUTPUT_DIR`, after its downloads completed. Use this to chain runs, instead of writing a results path.
 
 Quote references in YAML. The older `datasets: [OWNER/SLUG/VERSION]` list still attaches datasets without an alias; they cannot be copied to another account, so prefer aliased inputs.
