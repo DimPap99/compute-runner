@@ -142,9 +142,15 @@ def safe_message(error):
     # Signed download URLs and bearer credentials must not enter state or logs.
     text = str(error)
     try:
-        detail = error.errors(include_input=False, include_url=False)[0]
-        text = f"Invalid {'.'.join(map(str, detail['loc']))}: {detail['msg']}"
-    except (AttributeError, IndexError, KeyError, TypeError):
+        # Validation errors: every problem up to three, so an unknown field is not hidden behind
+        # the missing one it was meant to be.
+        problems = []
+        for detail in error.errors(include_input=False, include_url=False)[:3]:
+            message = detail["msg"].removeprefix("Value error, ")
+            field = ".".join(map(str, detail["loc"]))
+            problems.append(f"Invalid {field}: {message}" if field else message)
+        text = "; ".join(problems) or text
+    except (AttributeError, KeyError, TypeError):
         pass
     response = getattr(error, "response", None)
     if response is not None:

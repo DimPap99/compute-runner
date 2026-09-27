@@ -18,7 +18,7 @@ Run Python scripts, notebooks and projects on remote CPUs and GPUs from one loca
 From the project directory:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv          # any Python 3.12 or newer; plain python3 may be older
 .venv/bin/pip install -r requirements.lock
 .venv/bin/pip install -e . --no-deps
 source .venv/bin/activate

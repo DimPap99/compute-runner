@@ -396,3 +396,20 @@ def test_a_definitive_transient_launch_failure_is_retried_not_blocked(setup):
     due(client, job.id)
     client.worker().tick()
     assert client.get(job.id).state == "remote_queued"
+
+
+def test_following_a_job_before_its_launch_waits_for_it(setup, monkeypatch):
+    # submit, then logs --follow at once: the job is still queued locally.
+    import threading
+
+    client, backend, spec = setup
+    monkeypatch.setattr(client, "worker_health", lambda: {"running": True})
+    job = client.submit(spec)
+    launch = threading.Timer(0.5, client.worker().tick)
+    launch.start()
+    assert "".join(client.logs(job.id, follow=True)) == "example log\n"
+    launch.join()
+    cancelled = client.submit(spec)
+    client.cancel(cancelled.id)
+    with pytest.raises(ValueError, match=r"not been submitted yet \(cancelled\)"):
+        list(client.logs(cancelled.id, follow=True))

@@ -424,3 +424,15 @@ def test_importing_and_authenticating_kaggle_prints_nothing_to_stdout(tmp_path):
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
+
+
+def test_validation_errors_name_every_problem_plainly(tmp_path):
+    from compute_runner import JobSpec
+
+    with pytest.raises(Exception) as typo:
+        JobSpec.model_validate({"sorce": "x.py"})
+    message = safe_message(typo.value)
+    assert "Invalid source: Field required" in message and "Invalid sorce: Extra inputs are not permitted" in message
+    with pytest.raises(Exception) as secret:
+        JobSpec(source=tmp_path, params={"api_key": "abc"})
+    assert safe_message(secret.value) == "parameter api_key looks secret; only nonsecret values are accepted"

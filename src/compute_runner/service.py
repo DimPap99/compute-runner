@@ -41,6 +41,17 @@ WantedBy=default.target
 """
 
 
+def _systemctl(*arguments, check=True):
+    """Run systemctl --user; without a user service manager, say how to run the worker instead."""
+    try:
+        return subprocess.run(["systemctl", "--user", *arguments], check=check)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            f"systemd user services are unavailable here (systemctl --user {' '.join(arguments)} failed: "
+            f"{error}). Run the worker in a terminal instead: compute-runner worker run"
+        ) from error
+
+
 def control(action):
     if action not in {"start", "stop", "restart", "status"}:
         raise ValueError("Invalid service action")
@@ -52,7 +63,7 @@ def control(action):
         if action in {"start", "restart"}:
             raise ValueError("The installed service predates the rename; run: compute-runner service install")
         unit = LEGACY_UNIT_NAME
-    return subprocess.run(["systemctl", "--user", action, unit, "--no-pager"], check=action != "status")
+    return _systemctl(action, unit, "--no-pager", check=action != "status")
 
 
 def install(config, *, start=True):
@@ -65,10 +76,7 @@ def install(config, *, start=True):
     path.write_text(text)
     legacy = root / LEGACY_UNIT_NAME
     if legacy.is_file() and LEGACY_DESCRIPTION in legacy.read_text():
-        subprocess.run(["systemctl", "--user", "disable", "--now", LEGACY_UNIT_NAME], check=True)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    command = ["systemctl", "--user", "enable"]
-    if start:
-        command.append("--now")
-    subprocess.run([*command, UNIT_NAME], check=True)
+        _systemctl("disable", "--now", LEGACY_UNIT_NAME)
+    _systemctl("daemon-reload")
+    _systemctl("enable", *(["--now"] if start else []), UNIT_NAME)
     return path

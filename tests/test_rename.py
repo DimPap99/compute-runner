@@ -124,3 +124,18 @@ def test_service_install_leaves_unrelated_units_alone(isolated_paths, monkeypatc
     (root / service.UNIT_NAME).write_text("Description=Something else")
     with pytest.raises(ValueError, match="unrelated service"):
         service.install(Config(state_dir=isolated_paths / "state"))
+
+
+@pytest.mark.parametrize(
+    "failure", [FileNotFoundError("systemctl"), service.subprocess.CalledProcessError(1, "systemctl")]
+)
+def test_service_commands_explain_a_missing_user_service_manager(isolated_paths, monkeypatch, failure):
+    # WSL, containers and servers without a user session have no systemctl --user.
+    def run(command, **_):
+        raise failure
+
+    monkeypatch.setattr(service.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="Run the worker in a terminal instead: compute-runner worker run"):
+        service.install(Config(state_dir=isolated_paths / "state"))
+    with pytest.raises(RuntimeError, match="compute-runner worker run"):
+        service.control("start")

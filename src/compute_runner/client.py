@@ -372,7 +372,7 @@ class Client:
         Tolerates a worker restart, but fails once no worker has run for 30 seconds.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        stopped_since = None
+        watch = self._worker_watch()
         while True:
             _, jobs = self.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
             now = time.monotonic()
@@ -380,19 +380,38 @@ class Client:
                 return jobs, True
             if deadline is not None and now >= deadline:
                 return jobs, False
+            watch()
+            time.sleep(min(2, self.config.poll_seconds, deadline - now if deadline else 2))
+
+    def _worker_watch(self):
+        """A check to call while waiting on the worker: it raises once no worker has run for 30 seconds."""
+        stopped_since = None
+
+        def check():
+            nonlocal stopped_since
+            now = time.monotonic()
             if self.worker_health()["running"]:
                 stopped_since = None
             elif now - (stopped_since := stopped_since or now) >= 30:
                 raise RuntimeError(
                     "No worker is running. Start compute-runner service start or compute-runner worker run"
                 )
-            time.sleep(min(2, self.config.poll_seconds, deadline - now if deadline else 2))
+
+        return check
 
     def logs(self, job_id, *, follow=False):
-        """Persisted logs of a finished run, a bounded snapshot of an unfinished one, or a stream."""
+        """Persisted logs of a finished run, a bounded snapshot of an unfinished one, or a stream.
+
+        Following a job that has not been launched yet waits for its launch, as long as a worker runs.
+        """
         job = self.get(job_id)
+        watch = self._worker_watch()
+        while follow and not job.remote_ref and job.state in {"queued", "preparing", "submitting"}:
+            watch()
+            time.sleep(min(2, self.config.poll_seconds))
+            job = self.get(job_id)
         if not job.remote_ref:
-            raise ValueError("This job has not been submitted yet")
+            raise ValueError(f"This job has not been submitted yet ({job.state})")
         provider = self.provider(job.attempts[-1].account)
         if not follow and not job.terminal:
             # Providers may persist logs only after a run ends.
