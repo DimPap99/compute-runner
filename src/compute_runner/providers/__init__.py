@@ -156,9 +156,13 @@ def safe_message(error):
     if response is not None:
         try:
             body = response.json()
-            detail = body.get("message") or body.get("error")
+            detail = body.get("message") or body.get("error") or body.get("detail") or body.get("title")
             if isinstance(detail, str):
                 text = f"HTTP {http_code(error)}: {detail}"
+            elif body:
+                # Validation endpoints also return field-keyed errors. Keep their
+                # diagnostic detail, subject to the redaction and bound below.
+                text = f"HTTP {http_code(error)}: {body}"
         except (ValueError, AttributeError):
             pass
     return redact_secrets(text, strict=True)[:2000]

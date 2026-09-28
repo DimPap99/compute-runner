@@ -459,7 +459,10 @@ class Worker:
         refs = dict(job.upload_refs)
         try:
             bundles = {"input:" + alias: bundle for alias, bundle in job.snapshot["inputs"].items()}
-            if not job.snapshot["single_file"]:
+            from .providers.launch import inline_project
+            embedded = (job.account.startswith("kaggle:")
+                        and inline_project(job.snapshot, self.config.state_dir) is not None)
+            if not job.snapshot["single_file"] and not embedded:
                 bundles["source"] = job.snapshot["source"]
             for key, bundle in bundles.items():
                 if key in refs:

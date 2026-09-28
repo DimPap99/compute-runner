@@ -5,6 +5,7 @@ to the directory it starts in.
 """
 
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -138,11 +139,13 @@ def bootstrap(config):
         print(f"KGR workload {config['job_id']} session {session.group(1)}", flush=True)
     project = Path(os.path.abspath(config.get("working_root", "/kaggle/working"))) / "project"
     project.mkdir(parents=True, exist_ok=False)
-    if config.get("inline"):
-        for name, value in config["inline"].items():
+    if config.get("inline") or config.get("inline_gzip"):
+        embedded = config.get("inline") or config["inline_gzip"]
+        for name, value in embedded.items():
             target = project / safe_relative(name)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(base64.b64decode(value))
+            content = base64.b64decode(value)
+            target.write_bytes(gzip.decompress(content) if config.get("inline_gzip") else content)
         _verify(project, config["source_files"])
     else:
         if config.get("source_local"):

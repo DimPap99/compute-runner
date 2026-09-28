@@ -112,6 +112,13 @@ def changes(ctx: typer.Context, after: int = 0, batch: str | None = None, limit:
     return ctx.obj["client"].agent().changes(after=after, batch_id=batch, limit=limit)
 
 
+@agent_app.command("inputs")
+@response
+def inputs(ctx: typer.Context, job_id: str):
+    """Read the exact pending inputs' provider status without uploading or launching."""
+    return ctx.obj["client"].agent().inputs(job_id)
+
+
 @agent_app.command("logs")
 @response
 def logs(ctx: typer.Context, job_id: str, tail: int = 50, max_bytes: int = 8192, refresh: bool = False):

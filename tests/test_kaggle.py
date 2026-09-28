@@ -135,6 +135,16 @@ def test_download_validates_redirect_destination(tmp_path):
     assert calls[0][1]["allow_redirects"] is False
 
 
+def test_safe_message_preserves_nested_api_validation_error():
+    response = requests.Response()
+    response.status_code = 400
+    response._content = (
+        b'{"error": {"code": 400, "message": "The kernel source must be less than 1 megabytes in size."}}'
+    )
+    message = safe_message(requests.HTTPError("Bad Request", response=response))
+    assert "kernel source must be less than 1 megabytes" in message
+
+
 def test_safe_message_redacts_credentials():
     key = "a" * 32
     message = safe_message(
@@ -283,6 +293,91 @@ def test_dataset_missing_403_reconciles_owned_inventory(tmp_path):
     )
     assert backend.ensure_bundle({"digest": digest}) is None
     assert len(creates) == 1 and creates[0]["public"] is False
+
+
+@pytest.mark.parametrize("first_code", [403, 404])
+@pytest.mark.parametrize("final_status", ["ready", "processing"])
+def test_dataset_create_conflict_reconciles_exact_ref(tmp_path, first_code, final_status):
+    digest = "d" * 64
+    archive = tmp_path / "bundles" / digest / "payload.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"example")
+    response = requests.Response()
+    response.status_code = first_code
+    calls = []
+
+    def status(ref):
+        calls.append(ref)
+        if len(calls) == 1:
+            raise requests.HTTPError("Not yet visible", response=response)
+        return final_status
+
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
+    backend._api = Obj(
+        dataset_status=status,
+        dataset_list=lambda **kwargs: [],
+        dataset_create_new=lambda *args, **kwargs: Obj(
+            error='The requested title "kgr b digest" is already in use by a dataset. '
+            'Please choose another title.'
+        ),
+    )
+    ref = f"tester/kgr-b-{digest[:40]}"
+    assert backend.ensure_bundle({"digest": digest}) == (ref + "/1" if final_status == "ready" else None)
+    assert calls == [ref, ref]
+
+
+def test_dataset_create_conflict_with_invisible_ref_remains_retryable(tmp_path):
+    digest = "e" * 64
+    archive = tmp_path / "bundles" / digest / "payload.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"example")
+    response = requests.Response()
+    response.status_code = 404
+
+    def status(ref):
+        raise requests.HTTPError("Not yet visible", response=response)
+
+    backend = KaggleProvider(Account(user="tester"), tmp_path)
+    backend._api = Obj(
+        dataset_status=status,
+        dataset_create_new=lambda *args, **kwargs: Obj(error="Title already in use by a dataset"),
+    )
+    with pytest.raises(RemoteError) as error:
+        backend.ensure_bundle({"digest": digest})
+    assert error.value.kind == "transient"
+
+
+@pytest.mark.parametrize("code", [403, 404])
+def test_accepted_dataset_waits_for_visibility_without_reuploading(tmp_path, code):
+    digest = "f" * 64
+    archive = tmp_path / "bundles" / digest / "payload.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"example")
+    response = requests.Response()
+    response.status_code = code
+    ready, creates = [False], []
+
+    def status(ref):
+        if ready[0]:
+            return "ready"
+        raise requests.HTTPError("Not yet visible", response=response)
+
+    def backend(owner):
+        provider = KaggleProvider(Account(user=owner), tmp_path)
+        provider._api = Obj(dataset_status=status, dataset_list=lambda **kwargs: [],
+            dataset_create_new=lambda *args, **kwargs: creates.append(owner)
+            or Obj(status="Ok", error=None, url=f"https://www.kaggle.com/datasets/{owner}/data"))
+        return provider
+
+    first, second = backend("tester"), backend("second")
+    assert first.ensure_bundle({"digest": digest}) is None
+    assert first.ensure_bundle({"digest": digest}) is None
+    assert creates == ["tester"]
+    assert second.ensure_bundle({"digest": digest}) is None
+    assert first.ensure_bundle({"digest": digest}) is None
+    assert creates == ["tester", "second"]
+    ready[0] = True
+    assert first.ensure_bundle({"digest": digest}) == f"tester/kgr-b-{digest[:40]}/1"
 
 
 def test_existing_dataset_403_waits_without_creating_another(tmp_path):

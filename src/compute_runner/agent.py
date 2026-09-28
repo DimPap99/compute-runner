@@ -104,6 +104,9 @@ class AgentClient:
             "running": health["running"],
             "heartbeat_age_seconds": round(age) if age is not None else None,
         }
+        for key in ("stage", "job_id"):
+            if health.get(key):
+                value[key] = short(health[key])
         if health.get("error"):
             value["error"] = short(health["error"])
         return value
@@ -175,6 +178,62 @@ class AgentClient:
             accounts=accounts,
             worker=self.health(),
         )
+
+    def inputs(self, job_id):
+        """Read provider status for a pending job's exact input identities; never upload."""
+        job = self.client.get(job_id)
+        provider = self.client.provider(job.account)
+        if not job.account.startswith("kaggle:"):
+            raise ValueError("Input status diagnostics currently support Kaggle jobs")
+        refs = {}
+        if not job.snapshot["single_file"]:
+            refs["source"] = f"{provider.owner}/kgr-b-{job.snapshot['source']['digest'][:40]}"
+        for alias, bundle in job.snapshot["inputs"].items():
+            refs[alias] = f"{provider.owner}/kgr-b-{bundle['digest'][:40]}"
+        for alias, value in job.spec.inputs.items():
+            if str(value).startswith("kaggle:"):
+                refs[alias] = str(value)[7:]
+        for alias, bundle in job.transfers.items():
+            refs[alias] = f"{provider.owner}/kgr-b-{bundle['digest'][:40]}"
+        for alias, ref in job.upload_refs.items():
+            refs[alias.removeprefix("input:")] = ref
+        rows = []
+        for alias, ref in list(refs.items())[:10]:
+            row = {"alias": alias, "ref": ref}
+            bundle = (job.snapshot["source"] if alias == "source" else
+                      job.transfers.get(alias) or job.snapshot["inputs"].get(alias))
+            if bundle:
+                row["bundle_bytes"] = bundle.get("bytes")
+                receipt = self.client.config.state_dir / "uploads" / bundle["digest"] / "create-receipt.json"
+                if receipt.exists():
+                    data = json.loads(receipt.read_text())
+                    if data.get("ref", "").lower() == "/".join(ref.split("/")[:2]).lower():
+                        row["create_receipt"] = data
+            for key, fmt in (("status", None), ("version", "json(current_version_number)")):
+                try:
+                    value = provider.api.dataset_status("/".join(ref.split("/")[:2]), format=fmt)
+                    row[key] = value if fmt is None else json.loads(value)
+                except Exception as error:
+                    row[key + "_error"] = short(error)
+            if "status_error" in row:
+                try:
+                    page = 1
+                    while page <= 10:
+                        datasets = provider.api.dataset_list(mine=True, page=page)
+                        if not datasets:
+                            break
+                        matches = [d for d in datasets if d and (d.ref or "").lower() == ref.lower()]
+                        if matches:
+                            d = matches[0]
+                            row["inventory"] = {k: short(getattr(d, k, None)) for k in
+                                                ("ref", "id", "title", "last_updated", "is_private",
+                                                 "total_bytes", "current_version_number")}
+                            break
+                        page += 1
+                except Exception as error:
+                    row["inventory_error"] = short(error)
+            rows.append(row)
+        return {"schema_version": 1, "job_id": job.id, "inputs": rows}
 
     def submit(self, specs, *, request_key, account=None):
         """One key per logical request. Reuse it only to replay that exact submission."""

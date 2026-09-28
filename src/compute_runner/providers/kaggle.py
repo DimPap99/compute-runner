@@ -227,10 +227,27 @@ class KaggleProvider:
     def ensure_bundle(self, bundle) -> str | None:
         digest = bundle["digest"]
         ref = f"{self.owner}/kgr-b-{digest[:40]}"
+        folder = self.state_dir / "uploads" / digest
+        accepted_path = folder / f"accepted-create-{self.owner.lower()}.json"
         try:
             status = self.api.dataset_status(ref).lower()
         except Exception as error:
             converted = remote_error(error)
+            if http_code(error) in {403, 404}:
+                # Kaggle can accept creation before either status or the owned
+                # inventory exposes it. Reuploading then blocks the whole queue
+                # and cannot improve visibility. Receipts are account-specific.
+                for receipt in (accepted_path, folder / "create-receipt.json"):
+                    if not receipt.exists():
+                        continue
+                    try:
+                        accepted = json.loads(receipt.read_text())
+                    except (OSError, ValueError):
+                        continue
+                    if (accepted.get("ref", "").lower() == ref.lower()
+                            and str(accepted.get("status", "")).lower() == "ok"
+                            and not accepted.get("error")):
+                        return None
             if converted.kind == "auth":
                 if http_code(error) != 403:
                     raise converted from error
@@ -239,7 +256,6 @@ class KaggleProvider:
                     return None
             elif converted.kind != "missing":
                 raise converted from error
-            folder = self.state_dir / "uploads" / digest
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             archive = folder / "payload.zip"
             if not archive.exists():
@@ -258,7 +274,35 @@ class KaggleProvider:
                 response = self.api.dataset_create_new(
                     str(folder), public=False, quiet=True, convert_to_csv=False, dir_mode="skip"
                 )
+                receipt = {
+                    "ref": ref, "created_at": time.time(),
+                    **{key: getattr(response, key, None) for key in ("status", "error", "url")},
+                }
+                atomic_json(folder / "create-receipt.json", receipt)
+                if str(receipt["status"]).lower() == "ok" and not receipt["error"]:
+                    atomic_json(accepted_path, receipt)
+                if str(getattr(response, "status", "")).lower() == "error" and not response.error:
+                    raise RemoteError("Kaggle rejected dataset creation without a message", "invalid", definitive=True)
                 if response.error:
+                    if "already in use by a dataset" in response.error.lower():
+                        # The client checks this exact ref again inside create. A newly
+                        # uploaded dataset can become visible between our check and its
+                        # check; reconcile it instead of blocking every job using it.
+                        try:
+                            status = self.api.dataset_status(ref).lower()
+                        except Exception as status_error:
+                            if http_code(status_error) in {403, 404}:
+                                raise RemoteError(
+                                    f"Waiting for dataset {ref} visibility after a create conflict",
+                                    "transient",
+                                    definitive=True,
+                                ) from status_error
+                            raise
+                        if status == "ready":
+                            return ref + "/1"
+                        if any(word in status for word in ("error", "fail", "deleted")):
+                            raise RemoteError(f"Dataset {ref}: {status}", "invalid", definitive=True)
+                        return None
                     raise RemoteError(response.error, classify(response.error), definitive=True)
             except Exception as create_error:
                 # Deterministic dataset identity is reconciled on the next tick, never versioned here.
