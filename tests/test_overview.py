@@ -3,7 +3,6 @@
 import json
 import time
 
-from rich.console import Console
 from typer.testing import CliRunner
 
 from compute_runner.cli import app
@@ -13,7 +12,7 @@ from compute_runner.worker import DISCOVERY
 
 def cli(client, monkeypatch, *args):
     monkeypatch.setattr("compute_runner.cli.Client", lambda **_: client)
-    monkeypatch.setattr("compute_runner.cli.console", Console(width=200))
+    monkeypatch.setenv("COLUMNS", "200")
     result = CliRunner().invoke(app, list(args))
     assert result.exit_code == 0, (result.output, result.exception)
     return result.output

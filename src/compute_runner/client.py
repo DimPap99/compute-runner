@@ -285,7 +285,6 @@ class Client:
         """
         from .cleanup import Cleanup
 
-        accounts = None if accounts is None else [self.config.account(account).id for account in accounts]
         cleanup = Cleanup(
             self,
             older_than_days=older_than_days,

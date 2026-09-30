@@ -88,7 +88,10 @@ class Cleanup:
         self.older_than_days = older_than_days
         self.cutoff = time.time() - older_than_days * 86400
         self.include_snapshots = include_snapshots
-        self.accounts = [a.id for a in client.config.accounts] if accounts is None else accounts
+        config = client.config
+        self.accounts = (
+            [a.id for a in config.accounts] if accounts is None else [config.account(a).id for a in accounts]
+        )
         self.local = local
         self.index = JobIndex(client.store.list())
         self.errors: dict[str, str] = {}

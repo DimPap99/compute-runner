@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import get_args
 
 import yaml
 
 from .logcache import LogCache
-from .models import JobState
+from .models import checked_states
 from .providers import short
 from .results import RUN_RECORD, listed_outputs
 from .views import CapacityView
@@ -91,14 +90,6 @@ class AgentClient:
         return [job.id for job in jobs]
 
     @staticmethod
-    def _states(states):
-        if states is None:
-            return None
-        if isinstance(states, str) or not states or not set(states) <= set(get_args(JobState)):
-            raise ValueError("states must be a nonempty list or set of valid job states")
-        return sorted(set(states))
-
-    @staticmethod
     def _resource(resource):
         if resource not in (None, "cpu", "gpu"):
             raise ValueError("resource must be cpu or gpu")
@@ -135,7 +126,7 @@ class AgentClient:
         counts, jobs = self.client.store.page(
             job_ids=self._job_ids(job_ids),
             batch_id=batch_id,
-            states=self._states(states),
+            states=checked_states(states),
             account=account and self.client.config.account(account).id,
             pool=self._resource(resource),
             limit=limit,
@@ -216,17 +207,19 @@ class AgentClient:
             attention=dict(total=waiting, jobs=self._jobs(jobs)),
         )
 
-    def cleanup(self, *, older_than_days=7, include_snapshots=False, account=None, local=True, limit=20):
+    def cleanup(
+        self, *, older_than_days=7, include_snapshots=False, account=None, local=True, remote=True, limit=20
+    ):
         """What this runner left behind and what could be deleted; reports only, deleting is the user's call.
 
-        Asks the providers for their listings, so it is not local; account limits that to one
-        account (local=False leaves the state directory out).
+        Asks the providers for their listings unless remote=False; account limits that to one
+        account, and local=False leaves the state directory out.
         """
         _page_bounds(limit)
         return self.client.cleanup(
             older_than_days=older_than_days,
             include_snapshots=include_snapshots,
-            accounts=None if account is None else [account],
+            accounts=[] if not remote else None if account is None else [account],
             local=local,
             limit=limit,
         )
@@ -284,7 +277,7 @@ class AgentClient:
         """
         if request_key is None:
             raise ValueError("request_key is required for agent retries")
-        job_ids = self._selected(job_ids, batch_id, states=self._states(states))
+        job_ids = self._selected(job_ids, batch_id, states=checked_states(states))
         if not job_ids:
             raise ValueError("No job in the selection to rerun")
         batch = self.client.retry_jobs(job_ids, request_key=request_key, account=account)

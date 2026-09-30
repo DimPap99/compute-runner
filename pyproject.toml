@@ -27,8 +27,11 @@ testpaths = ["tests"]
 line-length = 110
 
 [tool.ruff.lint]
-# pycodestyle, pyflakes, bugbear and import order.
-select = ["E", "W", "F", "B", "I"]
+# pycodestyle, pyflakes, bugbear, import order, and McCabe complexity to keep functions small.
+select = ["E", "W", "F", "B", "I", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.ruff.lint.isort]
 known-first-party = ["compute_runner"]

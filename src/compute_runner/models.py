@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -249,6 +249,16 @@ PENDING = {"queued", "preparing"}
 MOVABLE = {"queued", "preparing", "blocked"}
 # Settled without operator action, apart from download retries.
 HALTED = {"blocked", "needs_attention"}
+
+
+def checked_states(states) -> list[str] | None:
+    """Job states named by a caller, sorted and without repeats; None stays None (every state)."""
+    if states is None:
+        return None
+    known = get_args(JobState)
+    if isinstance(states, str) or not states or not set(states) <= set(known):
+        raise ValueError(f"States must be a nonempty list of: {', '.join(known)}")
+    return sorted(set(states))
 
 
 class Attempt(Model):
