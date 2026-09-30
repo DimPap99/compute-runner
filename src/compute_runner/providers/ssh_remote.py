@@ -372,6 +372,50 @@ def version(path):
     return {"exists": True, "version": digest.hexdigest()[:16]}
 
 
+# The work directory's folders a cleanup may list and remove, by artifact kind.
+ARTIFACT_FOLDERS = {"run": "runs", "bundle": "bundles"}
+
+
+def artifacts(root):
+    """Run folders and bundles in the work directory, with their size and latest change."""
+    found = {}
+    for folder in ARTIFACT_FOLDERS.values():
+        parent = Path(root) / folder
+        entries = sorted(parent.iterdir()) if parent.is_dir() else []
+        found[folder] = [
+            _measure(path) for path in entries if path.is_dir() and not path.name.startswith(".")
+        ]
+    return found
+
+
+def _measure(path):
+    size, latest = 0, path.stat().st_mtime
+    for current, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                found = os.lstat(os.path.join(current, name))
+            except OSError:  # Gone meanwhile.
+                continue
+            size += found.st_size
+            latest = max(latest, found.st_mtime)
+    return {"name": path.name, "bytes": size, "modified_at": latest}
+
+
+def remove(root, kind, name):
+    """Delete one run folder or bundle, and nothing else; a run still running is refused."""
+    if not name or name.startswith(".") or "/" in name or kind not in ARTIFACT_FOLDERS:
+        raise ValueError(f"Not a {kind} of this runner: {name}")
+    target = Path(root) / ARTIFACT_FOLDERS[kind] / name
+    if target.is_symlink() or not target.is_dir():
+        return {"removed": False}
+    record = _read_json(target / "state.json") if kind == "run" else None
+    if record and record["state"] == "running" and _alive(record["pid"]):
+        raise ValueError(f"Run {name} is still running")
+    _make_writable(target)  # Unpacked bundles are read-only.
+    shutil.rmtree(target)
+    return {"removed": True}
+
+
 def info():
     """Facts the adapter and doctor report: Python version, home folder and GPUs."""
     gpus = []
@@ -399,6 +443,8 @@ COMMANDS = {
     "files": files,
     "version": version,
     "info": info,
+    "artifacts": artifacts,
+    "remove": remove,
 }
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from compute_runner.bundle import snapshot_bundle
 from compute_runner.cli import app
 from compute_runner.credentials import account_secrets, credentials_path
 from compute_runner.models import SshSettings, input_reference
-from compute_runner.providers import RemoteError, ssh_remote
+from compute_runner.providers import Artifact, RemoteError, ssh_remote
 from compute_runner.providers.ssh import HELPER, SshProvider
 from compute_runner.runtime import __file__ as RUNTIME
 
@@ -744,3 +744,30 @@ def test_real_ssh_server(tmp_path, monkeypatch):
         assert settings.workdir.startswith(".compute-runner-test-")
         folder = shlex.quote(machine.workdir)
         machine._exec(f"chmod -R u+w {folder} && rm -rf {folder}")
+
+
+def test_doctor_warns_when_the_machine_has_fewer_gpus_than_its_slots(lab):
+    # The test machine has no nvidia-smi, so its two GPU slots are more than it has.
+    found = lab.machine.diagnose()
+    assert found["machine"]["gpus"] == []
+    assert found["warning"] == "gpu_limit is 2, but nvidia-smi lists 0 GPUs"
+    assert lab.machine.inventory().devices == []
+
+
+def test_run_folders_and_bundles_are_listed_and_removed_but_never_while_running(lab):
+    (lab.project / "wait.py").write_text("import time\ntime.sleep(3)\n")
+    job = lab.client.submit(JobSpec(source=lab.project, entrypoint="wait.py", internet=True))
+    running(lab.client, job.id)
+    ref = lab.client.get(job.id).remote_ref
+    found = {(item.kind, item.name): item for item in lab.machine.artifacts()}
+    digest = job.snapshot["source"]["digest"]
+    assert found[("run", ref)].attempt == ref and found[("bundle", digest)].digest == digest
+    assert found[("bundle", digest)].bytes > 0
+    with pytest.raises(RemoteError, match="still running"):
+        lab.machine.delete_artifact(found[("run", ref)])
+    settle(lab.client, job.id)
+    for artifact in (found[("run", ref)], found[("bundle", digest)]):
+        lab.machine.delete_artifact(artifact)
+    assert lab.machine.artifacts() == []
+    with pytest.raises(RemoteError, match="Not a run"):
+        lab.machine.delete_artifact(Artifact("run", "../bundles"))

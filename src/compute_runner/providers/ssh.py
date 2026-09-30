@@ -8,6 +8,7 @@ bundles, start runs detached from the connection, and report their state. Downlo
 from __future__ import annotations
 
 import codecs
+import contextlib
 import hashlib
 import json
 import posixpath
@@ -25,6 +26,7 @@ from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets
 from ..store import atomic_json, atomic_write, config_path
 from . import RemoteError
+from .base import Artifact, Inventory, Provider
 from .launch import launch_config, write_launcher
 from .ssh_remote import TRANSIENT_EXIT
 
@@ -40,7 +42,7 @@ HELPER = Path(__file__).with_name("ssh_remote.py")
 LOG_TAIL_BYTES = 256 * 1024
 COMMAND_SECONDS = 600
 LONG_COMMAND_SECONDS = 6 * 3600
-LONG = {"unpack", "files", "version"}
+LONG = {"unpack", "files", "version", "artifacts", "remove"}
 STATES = {"queued", "running", "succeeded", "failed", "cancelled"}
 
 
@@ -65,17 +67,15 @@ def _path(ref: str) -> str:
     return _location(ref)[1]
 
 
-class SshProvider:
+class SshProvider(Provider):
     # How long a stopped workload may take to exit after SIGTERM before it is killed.
     stop_grace_seconds = 20
 
     def __init__(self, account: Account, state_dir: Path, *, strict=False):
         if paramiko is None:
             raise RemoteError("SSH accounts need the ssh extra: pip install 'compute-runner[ssh]'", "invalid")
-        self.account = account
+        super().__init__(account, state_dir, strict=strict)
         self.settings = account.ssh
-        self.state_dir = state_dir
-        self.strict = strict
         self._client = None
         self._lock = threading.Lock()
         self._workdir = None
@@ -225,21 +225,25 @@ class SshProvider:
         except (paramiko.SSHException, OSError, EOFError) as error:
             raise RemoteError(f"SFTP to {self._host_key_name} failed: {error}") from error
 
+    @contextlib.contextmanager
+    def _sftp_session(self, action):
+        """An SFTP session, closed afterwards; a transport failure becomes "ACTION failed: ..."."""
+        sftp = self._sftp()
+        try:
+            yield sftp
+        except TRANSPORT_ERRORS as error:
+            raise RemoteError(f"{action} failed: {error}") from error
+        finally:
+            sftp.close()
+
     # Remote helper ----------------------------------------------------------------------------
 
     @property
     def workdir(self) -> str:
         """The absolute work directory on the machine."""
         if self._workdir is None:
-            sftp = self._sftp()
-            try:
+            with self._sftp_session(f"Finding the home folder on {self._host_key_name}") as sftp:
                 home = sftp.normalize(".")
-            except TRANSPORT_ERRORS as error:
-                raise RemoteError(
-                    f"Finding the home folder on {self._host_key_name} failed: {error}"
-                ) from error
-            finally:
-                sftp.close()
             self._workdir = posixpath.join(home, self.settings.workdir)
         return self._workdir
 
@@ -255,17 +259,12 @@ class SshProvider:
             code = Path(runtime.__file__).read_text() + "\n" + HELPER.read_text()
             name = f"kgr_helper_{hashlib.sha256(code.encode()).hexdigest()[:16]}.py"
             path = posixpath.join(self.workdir, "lib", name)
-            sftp = self._sftp()
-            try:
+            with self._sftp_session(f"Uploading the helper to {self._host_key_name}") as sftp:
                 self._mkdirs(sftp, posixpath.dirname(path))
                 try:
                     sftp.stat(path)
                 except FileNotFoundError:
                     self._put_bytes(sftp, code.encode(), path)
-            except TRANSPORT_ERRORS as error:
-                raise RemoteError(f"Uploading the helper to {self._host_key_name} failed: {error}") from error
-            finally:
-                sftp.close()
             self._helper = path
         return self._helper
 
@@ -331,16 +330,11 @@ class SshProvider:
             return digest
         archive = posixpath.join(target, "payload.zip")
         local = self.state_dir / "bundles" / digest / "payload.zip"
-        sftp = self._sftp()
-        try:
+        with self._sftp_session(f"Uploading bundle {digest[:12]}") as sftp:
             self._mkdirs(sftp, target)
             temporary = f"{archive}.{time.time_ns()}.part"
             sftp.put(str(local), temporary, confirm=True)
             sftp.posix_rename(temporary, archive)
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Uploading bundle {digest[:12]} failed: {error}") from error
-        finally:
-            sftp.close()
         self._call("unpack", archive=archive, digest=digest, target=posixpath.join(target, "files"))
         return digest
 
@@ -357,13 +351,8 @@ class SshProvider:
 
     def fetch_dataset(self, ref, destination: Path):
         """Copy a file or folder from this machine, as plain files."""
-        sftp = self._sftp()
-        try:
+        with self._sftp_session(f"Copying {ref} from {self._host_key_name}") as sftp:
             self._get_tree(sftp, _path(ref), destination)
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Copying {ref} from {self._host_key_name} failed: {error}") from error
-        finally:
-            sftp.close()
 
     def _get_tree(self, sftp, path, destination):
         """Copy path as the job on this machine sees it: links to files count as the files.
@@ -392,19 +381,16 @@ class SshProvider:
             else:
                 raise ValueError(f"Only files and folders can be copied: {child}")
 
-    def _folder(self, job, number):
-        return self.state_dir / "jobs" / job.id / f"attempt-{number}"
-
     def stage(self, job: JobRecord, number: int) -> str:
         """Build the launch package locally; paths in it are relative to the run's folder."""
-        name = re.sub(r"[^a-z0-9]+", "-", job.spec.name.lower())[:16].strip("-") or "workload"
-        ref = f"kgr-{name}-{job.id[:12]}-a{number}"
-        folder = self._folder(job, number)
+        ref = self.launch_name(job, number)
+        folder = self.attempt_folder(job, number)
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         snapshot = job.snapshot
-        inputs = {}
-        for alias, bundle in [*snapshot["inputs"].items(), *job.transfers.items()]:
-            inputs[alias] = dict(local=f"../../bundles/{bundle['digest']}/files", digest=bundle["digest"])
+        inputs = {
+            alias: dict(local=f"../../bundles/{bundle['digest']}/files", digest=bundle["digest"])
+            for alias, bundle in self.bundled_inputs(job)
+        }
         for alias in job.spec.dataset_inputs():
             if alias not in inputs:  # Not copied, so a path on this machine.
                 inputs[alias] = dict(path=_path(job.upload_refs["input:" + alias]))
@@ -427,22 +413,17 @@ class SshProvider:
     def submit(self, job: JobRecord) -> dict:
         attempt = job.attempts[-1]
         run = self._run_dir(attempt.ref)
-        folder = self._folder(job, attempt.number)
+        folder = self.attempt_folder(job, attempt.number)
         # Until the start command runs, nothing can have launched: failures are definitive.
         try:
             env = {"CUDA_VISIBLE_DEVICES": self._free_gpu() if job.spec.gpu else ""}
-            sftp = self._sftp()
-            try:
+            with self._sftp_session("Uploading the launch package") as sftp:
                 self._mkdirs(sftp, posixpath.join(run, "working"))
                 for path in sorted(folder.iterdir()):
                     if path.is_file():
                         self._put_bytes(sftp, path.read_bytes(), posixpath.join(run, path.name))
-            finally:
-                sftp.close()
         except RemoteError as error:
             raise RemoteError(str(error), error.kind, definitive=True) from error
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Uploading the launch package failed: {error}", definitive=True) from error
         self._call("start", run=run, env=env)
         return {}
 
@@ -477,23 +458,59 @@ class SshProvider:
         return {"gpu": {"available_seconds": None} if self.account.gpu_limit else None, "refresh_at": None}
 
     def info(self) -> dict:
-        """Python version, home folder and GPUs on the machine, for doctor."""
+        """Python version, home folder and GPUs on the machine."""
         return self._call("info")
 
+    def inventory(self) -> Inventory:
+        found = super().inventory()
+        found.devices = self.info()["gpus"]
+        return found
+
+    def diagnose(self) -> dict:
+        found = super().diagnose()
+        found["machine"] = machine = self.info()
+        if warning := self._setup_warning(machine):
+            found["warning"] = warning
+        return found
+
+    def _setup_warning(self, machine) -> str | None:
+        if tuple(map(int, machine["python"].split(".")[:2])) < (3, 9):
+            return f"Python {machine['python']} on the machine; runs need 3.9 or newer"
+        if self.account.gpu_limit > len(machine["gpus"]):
+            return f"gpu_limit is {self.account.gpu_limit}, but nvidia-smi lists {len(machine['gpus'])} GPUs"
+        return None
+
+    def artifacts(self) -> list[Artifact]:
+        """Run folders and unpacked bundles in the work directory."""
+        found = self._call("artifacts", root=self.workdir)
+        return [
+            Artifact(
+                kind,
+                item["name"],
+                item["bytes"],
+                item["modified_at"],
+                attempt=item["name"] if kind == "run" else None,
+                digest=item["name"] if kind == "bundle" else None,
+            )
+            for kind, items in (("run", found["runs"]), ("bundle", found["bundles"]))
+            for item in items
+        ]
+
+    def delete_artifact(self, artifact: Artifact) -> None:
+        if artifact.kind not in {"run", "bundle"}:
+            return super().delete_artifact(artifact)
+        self._call("remove", root=self.workdir, kind=artifact.kind, name=artifact.name)
+
     def _read(self, ref, *, tail=None):
-        sftp = self._sftp()
-        try:
-            with sftp.open(posixpath.join(self._run_dir(ref), "run.log"), "rb") as stream:
-                if tail is not None:
-                    size = stream.stat().st_size
-                    stream.seek(max(0, size - tail))
-                return stream.read().decode(errors="replace")
-        except FileNotFoundError:
-            return ""
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Reading the log of {ref} failed: {error}") from error
-        finally:
-            sftp.close()
+        with self._sftp_session(f"Reading the log of {ref}") as sftp:
+            try:
+                with sftp.open(posixpath.join(self._run_dir(ref), "run.log"), "rb") as stream:
+                    if tail is not None:
+                        size = stream.stat().st_size
+                        stream.seek(max(0, size - tail))
+                    return stream.read().decode(errors="replace")
+            except FileNotFoundError:
+                return ""
 
     def live_log(self, ref):
         return redact_secrets(self._read(ref, tail=LOG_TAIL_BYTES), strict=self.strict)
@@ -505,33 +522,31 @@ class SshProvider:
         # Read only what was appended, and never split a UTF-8 character between reads.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         offset = 0
-        sftp = self._sftp()
-        try:
+        with self._sftp_session(f"Following the log of {ref}") as sftp:
             while True:
                 finished = self.status(ref)["state"] not in {"queued", "running"}
-                try:
-                    with sftp.open(posixpath.join(self._run_dir(ref), "run.log"), "rb") as stream:
-                        stream.seek(offset)
-                        data = stream.read()
-                except FileNotFoundError:
-                    data = b""
+                data = self._appended(sftp, ref, offset)
                 offset += len(data)
                 if text := decoder.decode(data, final=finished):
                     yield redact_secrets(text, strict=self.strict)
                 if finished:
                     return
                 time.sleep(2)
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Following the log of {ref} failed: {error}") from error
-        finally:
-            sftp.close()
+
+    def _appended(self, sftp, ref, offset) -> bytes:
+        """What a run's log gained after offset; nothing before the log exists."""
+        try:
+            with sftp.open(posixpath.join(self._run_dir(ref), "run.log"), "rb") as stream:
+                stream.seek(offset)
+                return stream.read()
+        except FileNotFoundError:
+            return b""
 
     def download(self, ref, sink):
         run = self._run_dir(ref)
         sink.log(self._read(ref))
         listed = self._call("files", root=posixpath.join(run, "working"))["files"]
-        sftp = self._sftp()
-        try:
+        with self._sftp_session(f"Downloading outputs of {ref}") as sftp:
             for item in listed:
                 target = sink.target(item["name"])
                 if target is None:
@@ -542,10 +557,6 @@ class SshProvider:
                         target, _checked(stream, item), check_space=True, expected_bytes=item["bytes"]
                     )
                 sink.saved(item["name"], target, item["sha256"])
-        except TRANSPORT_ERRORS as error:
-            raise RemoteError(f"Downloading outputs of {ref} failed: {error}") from error
-        finally:
-            sftp.close()
 
 
 def _checked(stream, item):

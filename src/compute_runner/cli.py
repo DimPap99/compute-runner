@@ -687,20 +687,7 @@ def doctor(ctx: typer.Context, offline: bool = False):
         info["remote"] = {}
         for account in client.config.accounts:
             try:
-                provider = client.provider(account.id)
-                found = dict(quota=provider.quota(), active_runs=provider.active_runs())
-                if account.provider == "ssh":
-                    found["machine"] = machine = provider.info()
-                    if tuple(map(int, machine["python"].split(".")[:2])) < (3, 9):
-                        found["warning"] = (
-                            f"Python {machine['python']} on the machine; runs need 3.9 or newer"
-                        )
-                    elif account.gpu_limit > len(machine["gpus"]):
-                        found["warning"] = (
-                            f"gpu_limit is {account.gpu_limit}, but nvidia-smi lists "
-                            f"{len(machine['gpus'])} GPUs"
-                        )
-                info["remote"][account.id] = found
+                info["remote"][account.id] = client.provider(account.id).diagnose()
             except ERRORS as error:
                 info["remote"][account.id] = dict(error=safe_message(error))
     _emit(ctx, info)

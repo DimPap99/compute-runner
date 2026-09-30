@@ -87,16 +87,6 @@ def occupancy(jobs, account, runs):
     return counts
 
 
-def inventory(provider):
-    """(runs holding the account's slots by lowercase reference, available GPU seconds).
-
-    GPU seconds are None when GPU time is not limited, and 0 when the account has none.
-    """
-    runs = {ref.lower(): kind for ref, kind in provider.active_runs().items()}
-    gpu = provider.quota().get("gpu")
-    return runs, gpu["available_seconds"] if gpu else 0
-
-
 def last_discovery(state_dir) -> dict:
     """The worker's last Discovery of each account, as JSON by account ID; {} before it saved one."""
     try:
@@ -123,6 +113,8 @@ class Discovery:
     error: str | None = None
     retry_at: float = 0
     gpu_seconds: float | None = None
+    gpu_refresh_at: float | None = None
+    devices: list = field(default_factory=list)
 
 
 class Worker:
@@ -254,7 +246,9 @@ class Worker:
         try:
             self.store.heartbeat(state="running", stage=f"discovering runs on {account}")
             # Quota is checked with the runs, not per launch: failover weighs every account each cycle.
-            found.runs, found.gpu_seconds = inventory(self.provider(account))
+            current = self.provider(account).inventory()
+            found.runs, found.gpu_seconds = current.runs, current.gpu_seconds
+            found.gpu_refresh_at, found.devices = current.gpu_refresh_at, current.devices
             found.checked_at = now
             found.error = None
         except Exception as error:
@@ -437,16 +431,7 @@ class Worker:
         provider = self.provider(job.account)
         refs = dict(job.upload_refs)
         try:
-            bundles = {"input:" + alias: bundle for alias, bundle in job.snapshot["inputs"].items()}
-            from .providers.launch import inline_project
-
-            embedded = (
-                job.account.startswith("kaggle:")
-                and inline_project(job.snapshot, self.config.state_dir) is not None
-            )
-            if not job.snapshot["single_file"] and not embedded:
-                bundles["source"] = job.snapshot["source"]
-            for key, bundle in bundles.items():
+            for key, bundle in provider.bundles_for(job).items():
                 if key in refs:
                     continue
                 if self.store.get(job.id).state != "preparing":

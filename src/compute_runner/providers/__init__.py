@@ -1,108 +1,41 @@
-"""The contract between the queue and a compute provider, plus shared remote-error handling.
+"""Compute providers: the adapter for each kind of account, and shared remote-error handling.
 
-One provider instance serves one account. Adapters translate their service's identities,
-states and errors into these shapes; the worker never sees provider-specific values.
-
-Data follows one contract on every provider:
-
-- Local inputs and copied datasets are content-addressed bundles. ensure_bundle() reuses one
-  the account already holds and uploads it otherwise.
-- A provider dataset is attached directly when resolve_dataset() says the account can read it.
-  If it cannot, the worker copies it from an account that can (fetch_dataset, then
-  ensure_bundle) when the user allowed copying.
-- The workload finds every input the same way: KGR_INPUT_<ALIAS> and KGR_INPUTS_JSON, set by
-  the launch package that stage() builds. Workloads never use provider paths.
-- download() hands each output to an OutputSink, which decides what to fetch and where it
-  goes, so every provider fills the same run folder.
+See base.Provider for the contract every adapter fulfils.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+import importlib
+from typing import TYPE_CHECKING
 
 from ..security import redact_secrets
+from .base import Artifact, Inventory, Provider
 
 if TYPE_CHECKING:
-    from ..models import Account, Config, JobRecord, JobSpec
-    from ..results import OutputSink
+    from ..models import Account, Config
 
+__all__ = [
+    "Artifact",
+    "Inventory",
+    "Provider",
+    "RemoteError",
+    "connect",
+    "remote_error",
+    "safe_message",
+    "short",
+]
 
-class Provider(Protocol):
-    def check(self, spec: JobSpec) -> None:
-        """Raise ValueError if this provider cannot run the specification."""
-
-    def ensure_bundle(self, bundle: dict) -> str | None:
-        """Make a content-addressed local bundle available to runs; None while it is still processing."""
-
-    def resolve_dataset(self, ref: str) -> str | None:
-        """Pin a dataset this account can read to an immutable version; None if it cannot read it.
-
-        None also covers a dataset or pinned version that does not exist. Every call checks
-        access, even for a pinned reference, so the worker can ask any account.
-        Raise RemoteError for failures that say nothing about access.
-        """
-
-    def fetch_dataset(self, ref: str, destination: Path) -> None:
-        """Download a dataset this account can read, as plain files, into an empty folder."""
-
-    def stage(self, job: JobRecord, number: int) -> str:
-        """Build attempt number's launch package locally and return its remote reference.
-
-        No remote calls. The reference is deterministic, so status() can find the run
-        even when submit() is interrupted. The package exposes each input alias as
-        KGR_INPUT_<ALIAS>: bundles by job.upload_refs["input:ALIAS"], verified against their
-        digest (from job.snapshot["inputs"] or job.transfers), and datasets attached directly.
-        """
-
-    def url(self, ref: str) -> str | None: ...
-
-    def submit(self, job: JobRecord) -> dict:
-        """Launch the staged job.attempts[-1]; may return {"version": n}.
-
-        Raise RemoteError. definitive=True asserts that nothing was launched.
-        """
-
-    def status(self, ref: str) -> dict:
-        """{"state": ..., "detail": raw provider state, "error": str | None}.
-
-        state is queued, running, cancelling, succeeded, failed or cancelled; None if unrecognized.
-        """
-
-    def cancel(self, ref: str, job_id: str) -> bool:
-        """Stop a run. True when it was removed before it started, so it is cancelled now;
-        False when a stop was requested and polling reports the outcome."""
-
-    def active_runs(self) -> dict[str, str]:
-        """Runs holding this account's capacity, including ones started elsewhere: {ref: cpu|gpu|unknown}."""
-
-    def quota(self) -> dict:
-        """{"gpu": {"available_seconds": ...} or None, ...}
-
-        gpu None means no GPU time is available; available_seconds None means GPU time is not limited.
-        """
-
-    def logs(self, ref: str, *, follow: bool = False) -> Iterator[str]:
-        """The stored log of a finished run, or a stream with follow=True."""
-
-    def live_log(self, ref: str) -> str:
-        """A bounded snapshot of an unfinished run's log."""
-
-    def download(self, ref: str, sink: OutputSink) -> None:
-        """Give sink the run's log (sink.log) and its output files.
-
-        For each file, ask sink.target(name) for a path (None: skip it), write the bytes there
-        atomically, then call sink.saved(name, path, sha256).
-        """
+# Adapters by account provider, imported on first use: they load their SDKs lazily and must not
+# burden model imports. A new provider is one entry here and one Provider subclass.
+ADAPTERS = {
+    "kaggle": (".kaggle", "KaggleProvider"),
+    "ssh": (".ssh", "SshProvider"),
+}
 
 
 def connect(account: Account, config: Config) -> Provider:
-    # Imported here: adapters load their SDKs lazily and must not burden model imports.
-    if account.provider == "ssh":
-        from .ssh import SshProvider as adapter
-    else:
-        from .kaggle import KaggleProvider as adapter
+    module, name = ADAPTERS[account.provider]
+    adapter = getattr(importlib.import_module(module, __name__), name)
     return adapter(account, config.state_dir, strict=config.strict)
 
 
@@ -166,6 +99,14 @@ def safe_message(error):
         except (ValueError, AttributeError):
             pass
     return redact_secrets(text, strict=True)[:2000]
+
+
+def short(value, limit=400):
+    """A safe message on one line, at most limit characters; None stays None."""
+    if value is None:
+        return None
+    text = " ".join(safe_message(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def remote_error(error, *, mutation=False):

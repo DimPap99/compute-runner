@@ -10,7 +10,7 @@ from compute_runner import Account, Config
 from compute_runner.cli import app
 from compute_runner.credentials import account_secrets, credentials_path, kaggle_secrets
 from compute_runner.providers import RemoteError
-from compute_runner.providers.kaggle import KaggleProvider, _api_class
+from compute_runner.providers.kaggle import KaggleProvider, api_class
 
 from conftest import due
 
@@ -233,7 +233,7 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
 def credentials_api(path, monkeypatch, **env):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    api = _api_class(kaggle_secrets(path.read_text()))()
+    api = api_class(kaggle_secrets(path.read_text()))()
     api.authenticate()
     return api
 

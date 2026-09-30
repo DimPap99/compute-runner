@@ -2,31 +2,24 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sqlite3
 import time
 from collections import Counter
+from dataclasses import asdict
 from typing import get_args
 
 import yaml
 
 from .models import ACTIVE, JobState
-from .providers import safe_message
+from .providers import safe_message, short
 from .results import RUN_RECORD, listed_outputs
 from .store import atomic_write
-from .worker import inventory, last_discovery, occupancy
+from .worker import last_discovery, occupancy
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
 ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
-
-
-def short(value, limit=400):
-    if value is None:
-        return None
-    text = " ".join(safe_message(value).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def summary(job):
@@ -166,8 +159,8 @@ class AgentClient:
         found = {}
         for account_id in accounts:
             try:
-                runs, gpu_seconds = inventory(self.client.provider(account_id))
-                found[account_id] = dict(runs=runs, gpu_seconds=gpu_seconds, checked_at=time.time())
+                current = self.client.provider(account_id).inventory()
+                found[account_id] = asdict(current) | {"checked_at": time.time()}
             except ERRORS as error:  # One broken account must not hide the others.
                 found[account_id] = dict(error=safe_message(error))
         return found
@@ -269,96 +262,27 @@ class AgentClient:
         )
 
     def runtime(self, job_id):
-        """Read Kaggle's saved accelerator metadata, separately from our request."""
-        from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
-
-        job = self.client.get(job_id)
-        if not job.account.startswith("kaggle:") or not job.remote_ref:
-            raise ValueError("Runtime diagnostics require a submitted Kaggle job")
-        provider = self.client.provider(job.account)
-        metadata = provider._kernels("get_kernel", ApiGetKernelRequest(), job.remote_ref).metadata
-        return {
-            "schema_version": 1,
-            "job_id": job.id,
-            "account": job.account,
-            "ref": job.remote_ref,
-            "url": provider.url(job.remote_ref),
-            "requested": {"gpu": job.spec.gpu, "accelerator": job.spec.accelerator},
-            "provider": {
-                "enable_gpu": getattr(metadata, "enable_gpu", None),
-                "machine_shape": getattr(metadata, "machine_shape", None),
-            },
-            "session": provider.status(job.remote_ref),
-            "note": "Saved provider metadata; CUDA must also be confirmed inside the workload.",
-        }
+        """The resources the provider saved for a submitted job's run, beside what the job asked for."""
+        job = self.client.get(self.client.store.resolve_id(job_id))
+        if not job.remote_ref:
+            raise ValueError("Runtime diagnostics require a submitted job")
+        saved = self.client.provider(job.attempts[-1].account).runtime(job.remote_ref)
+        return dict(
+            schema_version=1,
+            job_id=job.id,
+            account=job.account,
+            ref=job.remote_ref,
+            requested=dict(gpu=job.spec.gpu, accelerator=job.spec.accelerator),
+            **saved,
+            note="Saved provider metadata; CUDA must also be confirmed inside the workload.",
+        )
 
     def inputs(self, job_id):
-        """Read provider status for a pending job's exact input identities; never upload."""
-        job = self.client.get(job_id)
-        provider = self.client.provider(job.account)
-        if not job.account.startswith("kaggle:"):
-            raise ValueError("Input status diagnostics currently support Kaggle jobs")
-        refs = {}
-        if not job.snapshot["single_file"]:
-            refs["source"] = f"{provider.owner}/kgr-b-{job.snapshot['source']['digest'][:40]}"
-        for alias, bundle in job.snapshot["inputs"].items():
-            refs[alias] = f"{provider.owner}/kgr-b-{bundle['digest'][:40]}"
-        for alias, value in job.spec.inputs.items():
-            if str(value).startswith("kaggle:"):
-                refs[alias] = str(value)[7:]
-        for alias, bundle in job.transfers.items():
-            refs[alias] = f"{provider.owner}/kgr-b-{bundle['digest'][:40]}"
-        for alias, ref in job.upload_refs.items():
-            refs[alias.removeprefix("input:")] = ref
-        rows = []
-        for alias, ref in list(refs.items())[:10]:
-            row = {"alias": alias, "ref": ref}
-            bundle = (
-                job.snapshot["source"]
-                if alias == "source"
-                else job.transfers.get(alias) or job.snapshot["inputs"].get(alias)
-            )
-            if bundle:
-                row["bundle_bytes"] = bundle.get("bytes")
-                receipt = self.client.config.state_dir / "uploads" / bundle["digest"] / "create-receipt.json"
-                if receipt.exists():
-                    data = json.loads(receipt.read_text())
-                    if data.get("ref", "").lower() == "/".join(ref.split("/")[:2]).lower():
-                        row["create_receipt"] = data
-            for key, fmt in (("status", None), ("version", "json(current_version_number)")):
-                try:
-                    value = provider.api.dataset_status("/".join(ref.split("/")[:2]), format=fmt)
-                    row[key] = value if fmt is None else json.loads(value)
-                except Exception as error:
-                    row[key + "_error"] = short(error)
-            if "status_error" in row:
-                try:
-                    page = 1
-                    while page <= 10:
-                        datasets = provider.api.dataset_list(mine=True, page=page)
-                        if not datasets:
-                            break
-                        matches = [d for d in datasets if d and (d.ref or "").lower() == ref.lower()]
-                        if matches:
-                            d = matches[0]
-                            row["inventory"] = {
-                                k: short(getattr(d, k, None))
-                                for k in (
-                                    "ref",
-                                    "id",
-                                    "title",
-                                    "last_updated",
-                                    "is_private",
-                                    "total_bytes",
-                                    "current_version_number",
-                                )
-                            }
-                            break
-                        page += 1
-                except Exception as error:
-                    row["inventory_error"] = short(error)
-            rows.append(row)
-        return {"schema_version": 1, "job_id": job.id, "inputs": rows}
+        """What the provider reports for each input a job attaches; never uploads."""
+        job = self.client.get(self.client.store.resolve_id(job_id))
+        return dict(
+            schema_version=1, job_id=job.id, inputs=self.client.provider(job.account).input_status(job)
+        )
 
     def submit(self, specs, *, request_key, account=None):
         """One key per logical request. Reuse it only to replay that exact submission."""
