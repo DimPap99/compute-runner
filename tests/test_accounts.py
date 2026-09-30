@@ -186,7 +186,7 @@ def test_agent_accounts_report_policy_slots_and_last_quota(two_accounts):
     assert result["failover"] == "ask" and result["default"] == "kaggle:tester"
     first, second = result["accounts"]
     assert first["id"] == "kaggle:tester" and first["provider"] == "kaggle"
-    assert first["gpu"] == {"used": 1, "limit": 1} and first["cpu"] == {"used": 0, "limit": 5}
+    assert first["gpu"] == {"used": 1, "limit": 1, "free": 0} and first["cpu"] == {"used": 0, "limit": 5, "free": 5}
     assert first["gpu_quota_seconds"] == 100000 and first["checked_age_seconds"] == 0
     assert second["gpu"]["used"] == 0 and second["checked_age_seconds"] is None
 

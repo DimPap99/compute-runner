@@ -693,6 +693,14 @@ def test_agent_accounts_tell_an_unlimited_gpu_quota_from_an_unchecked_one(lab):
     assert accounts["kaggle:tester"]["gpu_quota_limited"] is True
 
 
+def test_gpus_count_a_machines_slots_without_a_time_limit(lab, monkeypatch):
+    monkeypatch.setattr("compute_runner.cli.Client", lambda **_: lab.client)
+    result = json.loads(CliRunner().invoke(app, ["--json", "gpus", "--live"]).output)
+    machine = {account["id"]: account for account in result["accounts"]}["ssh:lab"]
+    assert machine["gpu"] == {"used": 0, "limit": 2, "free": 2} and machine["gpu_quota_seconds"] is None
+    assert result["gpu_total"] == {"used": 0, "limit": 3, "free": 3, "quota_seconds": 100000, "complete": True}
+
+
 @pytest.mark.skipif(
     not os.environ.get("KGR_TEST_SSH"), reason="set KGR_TEST_SSH=user@host:port and KGR_TEST_SSH_KEY"
 )

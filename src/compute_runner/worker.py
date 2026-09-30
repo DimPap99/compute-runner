@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import tempfile
@@ -30,6 +31,8 @@ BLOCKED_REASONS = {
     "access": "Move the job or allow copying its dataset; see error",
     "dataset": "Check the dataset reference or its access with the user; see error",
 }
+# Each account's last Discovery, written by the worker for local readers.
+DISCOVERY = "accounts.json"
 REMOTE_STATES = {
     "queued": "remote_queued",
     "running": "running",
@@ -90,6 +93,25 @@ def occupancy(jobs, account, runs):
                 if resource in {kind, "unknown"}:
                     counts[kind] += 1
     return counts
+
+
+def inventory(provider):
+    """(runs holding the account's slots by lowercase reference, available GPU seconds).
+
+    GPU seconds are None when GPU time is not limited, and 0 when the account has none.
+    """
+    runs = {ref.lower(): kind for ref, kind in provider.active_runs().items()}
+    gpu = provider.quota().get("gpu")
+    return runs, gpu["available_seconds"] if gpu else 0
+
+
+def last_discovery(state_dir) -> dict:
+    """The worker's last Discovery of each account, as JSON by account ID; {} before it saved one."""
+    try:
+        saved = json.loads((state_dir / DISCOVERY).read_text())
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
 
 
 def waiting_for_capacity(account, pool):
@@ -199,7 +221,7 @@ class Worker:
         self._downloads()
         publish(self.store)
         atomic_json(
-            self.config.state_dir / "accounts.json",
+            self.config.state_dir / DISCOVERY,
             {account: asdict(found) for account, found in self.discovery.items()},
         )
         self.store.heartbeat(state="running", stage="idle")
@@ -270,11 +292,8 @@ class Worker:
             return
         try:
             self.store.heartbeat(state="running", stage=f"discovering runs on {account}")
-            provider = self.provider(account)
-            found.runs = {ref.lower(): kind for ref, kind in provider.active_runs().items()}
-            # Checked with the runs, not per launch: failover weighs every account each cycle.
-            gpu = provider.quota().get("gpu")
-            found.gpu_seconds = gpu["available_seconds"] if gpu else 0
+            # Quota is checked with the runs, not per launch: failover weighs every account each cycle.
+            found.runs, found.gpu_seconds = inventory(self.provider(account))
             found.checked_at = now
             found.error = None
         except Exception as error:
@@ -597,7 +616,9 @@ class Worker:
             with tempfile.TemporaryDirectory(prefix=".dataset-", dir=self.config.state_dir) as folder:
                 self.provider(account).fetch_dataset(ref, Path(folder))
                 # Copied as published: the owner's files are already on the provider, so not screened.
-                bundle = snapshot_bundle(Path(folder), plain_files(Path(folder)), bundles, screen=False)
+                bundle = snapshot_bundle(Path(folder),
+                                         plain_files(Path(folder), allow_bundle_manifest=True),
+                                         bundles, screen=False)
             saved = dict(digest=bundle["digest"], bytes=bundle["bytes"])
             self.store.save_dataset_copy(source, **saved)
         return dict(source=source, **saved)

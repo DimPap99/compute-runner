@@ -9,11 +9,12 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .agent import ERRORS
 from .agent_cli import agent_app
@@ -390,6 +391,82 @@ def list_jobs(ctx: typer.Context, state: str | None = None):
     console.print(table)
 
 
+def _duration(seconds: int) -> str:
+    """Compact time such as 45s, 12m, 3h 05m or 2d 4h."""
+    seconds = max(0, seconds)
+    if seconds < 3600:
+        return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m"
+    hours = seconds // 3600
+    return f"{hours}h {seconds // 60 % 60:02d}m" if hours < 48 else f"{hours // 24}d {hours % 24}h"
+
+
+def _discovery_notes(ctx, checks: dict, live: bool):
+    """Below a table: accounts whose runs started elsewhere are unknown, or were last read long ago."""
+    notes = [
+        f"{account}: last check failed: {check['error']}"
+        if "error" in check
+        else f"{account}: not checked yet"
+        for account, check in checks.items()
+        if "error" in check or check["checked_age_seconds"] is None
+    ]
+    ages = [
+        check["checked_age_seconds"] for check in checks.values() if check["checked_age_seconds"] is not None
+    ]
+    # The worker checks accounts only while it has jobs to place, so an idle queue's check ages.
+    if ages and max(ages) > _client(ctx).config.discovery_seconds:
+        notes.append(f"Accounts last checked up to {_duration(max(ages))} ago")
+    if notes and not live:
+        notes.append("--live asks the providers now")
+    for note in notes:
+        console.print(note, style="dim", markup=False, highlight=False)
+
+
+RESOURCES = {"cpu": "CPU", "gpu": "GPU", "unknown": "?"}
+LIVE = typer.Option("--live", help="Ask every provider now instead of reading the worker's last check")
+
+
+@app.command()
+def running(
+    ctx: typer.Context,
+    resource: Annotated[
+        Literal["all", "cpu", "gpu"], typer.Argument(help="Runs holding these slots")
+    ] = "all",
+    account: Annotated[str | None, typer.Option(help="Only this account")] = None,
+    live: Annotated[bool, LIVE] = False,
+):
+    """Runs holding each account's slots: this queue's jobs and runs started elsewhere."""
+    result = _client(ctx).agent().running(None if resource == "all" else resource, account=account, live=live)
+    if ctx.obj["json"]:
+        _emit(ctx, result)
+        return
+    if result["runs"]:
+        table = Table("Account", "Location", "Notebook / run", "Name", "Type", "State", "Elapsed", "Job")
+        # Only the reference and the name give way on a narrow terminal.
+        for column in table.columns:
+            column.no_wrap = column.header not in ("Notebook / run", "Name")
+        for run in result["runs"]:
+            ours = "job_id" in run
+            cells = [
+                run["account"],
+                run["provider"],
+                run["ref"],
+                run["name"] if ours else "(external)",
+                run.get("accelerator") or RESOURCES[run["resource"]],
+                run.get("state", ""),
+                _duration(run["elapsed_seconds"]) if ours else "",
+                run["job_id"][:12] if ours else "",
+            ]
+            table.add_row(*map(Text, cells))
+        console.print(table)
+    counts = [
+        f"{result['counts'][kind]} {RESOURCES[kind]}" for kind in ("gpu", "cpu") if result["counts"][kind]
+    ]
+    if result["counts"]["unknown"]:
+        counts.append(f"{result['counts']['unknown']} of unknown type, counted as both")
+    console.print(f"{result['total']} running" + (": " + ", ".join(counts) if counts else ""))
+    _discovery_notes(ctx, result["discovery"], live)
+
+
 @app.command()
 def status(ctx: typer.Context, job_id: str):
     """Print a job's full record."""
@@ -502,6 +579,74 @@ def resolve(
 def quota(ctx: typer.Context, account: str | None = None):
     """Query accelerator quota for one account, or every account."""
     _emit(ctx, _client(ctx).quota(account))
+
+
+def _gpu_total(accounts: list[dict]) -> dict:
+    """GPU slots and time over every account.
+
+    free and quota_seconds add up the accounts checked successfully (None when there are none);
+    complete says whether that is every account.
+    """
+    known = [account for account in accounts if account["gpu"]["free"] is not None]
+    quotas = [account["gpu_quota_seconds"] for account in known if account["gpu_quota_limited"]]
+    return dict(
+        used=sum(account["gpu"]["used"] for account in accounts),
+        limit=sum(account["gpu"]["limit"] for account in accounts),
+        free=sum(account["gpu"]["free"] for account in known) if known else None,
+        quota_seconds=sum(quotas) if quotas else None,
+        complete=len(known) == len(accounts),
+    )
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h"
+
+
+def _gpu_quota(account: dict) -> str:
+    if not account["gpu_quota_limited"]:
+        return "no limit" if account["gpu"]["limit"] else "-"
+    seconds = account["gpu_quota_seconds"]
+    return "?" if seconds is None else _hours(seconds)
+
+
+@app.command()
+def gpus(ctx: typer.Context, live: Annotated[bool, LIVE] = False):
+    """GPU slots in use and free on each account, the GPU time left, and their totals."""
+    result = _client(ctx).agent().accounts(live=live)
+    accounts, total = result["accounts"], _gpu_total(result["accounts"])
+    if ctx.obj["json"]:
+        _emit(ctx, result | {"gpu_total": total})
+        return
+    table = Table("Account", "Location", "In use", "Free", "Quota left", "Checked")
+    for account in accounts:
+        gpu, age = account["gpu"], account["checked_age_seconds"]
+        cells = [
+            account["id"],
+            account["provider"],
+            f"{gpu['used']}/{gpu['limit']}",
+            "?" if gpu["free"] is None else str(gpu["free"]),
+            _gpu_quota(account),
+            "never" if age is None else f"{_duration(age)} ago",
+        ]
+        table.add_row(*map(Text, cells))
+    # Lower bounds while some account is unknown.
+    bound = "" if total["complete"] else ">="
+    if total["quota_seconds"] is not None:
+        quota = bound + _hours(total["quota_seconds"])
+    else:
+        quota = "?" if any(account["gpu_quota_limited"] for account in accounts) else "no limit"
+    table.add_section()
+    table.add_row(
+        "Total",
+        "",
+        f"{total['used']}/{total['limit']}",
+        "?" if total["free"] is None else f"{bound}{total['free']}",
+        quota,
+        "",
+        style="bold",
+    )
+    console.print(table)
+    _discovery_notes(ctx, {account["id"]: account for account in accounts}, live)
 
 
 def _credentials_source(account) -> str:

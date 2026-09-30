@@ -1,6 +1,7 @@
 """Datasets across accounts: attached where readable, copied only when allowed, found by alias."""
 
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,37 @@ def test_unreadable_dataset_is_copied_only_when_allowed(two_accounts):
     second = client.submit(spec.model_copy(update={"name": "b", "inputs": {"data": Path("kaggle:other/private")}}))
     client.worker().tick()
     assert other.fetched == ["other/private/7"] and client.get(second.id).state == "remote_queued"
+
+
+@pytest.mark.parametrize("damage", [None, "checksum", "extra_file", "invalid_manifest"])
+def test_copying_an_existing_runner_bundle_verifies_and_reuses_payload(two_accounts, damage):
+    from compute_runner.runtime import MANIFEST, json_digest
+
+    client, home, other, spec = two_accounts
+    home.unreadable = {"other/private"}
+    client.config.transfer = True
+    records = {name: {"sha256": hashlib.sha256(text.encode()).hexdigest(), "size": len(text.encode())}
+               for name, text in other.dataset_files.items()}
+    digest = json_digest(records)
+    other.dataset_files[MANIFEST] = json.dumps(dict(schema_version=1, digest=digest, files=records))
+    if damage == "checksum":
+        other.dataset_files["train.csv"] = "x,y\n3,4\n"
+    elif damage == "extra_file":
+        other.dataset_files["unlisted.txt"] = "must not disappear silently"
+    elif damage == "invalid_manifest":
+        other.dataset_files[MANIFEST] = "{}"
+    job = client.submit(spec.model_copy(update={"inputs": {"data": Path("kaggle:other/private")}}))
+    client.worker().tick()
+    job = client.get(job.id)
+    if damage:
+        assert job.state == "blocked" and home.pushes == []
+        assert any(word in job.error.lower() for word in ("checksum", "inventory", "manifest"))
+        return
+    assert job.state == "remote_queued"
+    assert job.transfers["data"]["digest"] == digest
+    copied = client.config.state_dir / "bundles" / digest / "files"
+    assert (copied / "train.csv").read_text() == other.dataset_files["train.csv"]
+    assert json.loads((copied / MANIFEST).read_text())["files"] == records
 
 
 @pytest.mark.parametrize("update", [{"inputs": {"data": Path("kaggle:nobody/data")}}, {"datasets": ["nobody/data/2"]}])

@@ -13,6 +13,27 @@ from compute_runner.store import Store
 from conftest import due
 
 
+@pytest.mark.parametrize("shape,enabled", [("NvidiaTeslaT4", True), ("", False)])
+def test_runtime_distinguishes_provider_accelerator_from_requested_gpu(setup, monkeypatch, shape, enabled):
+    from types import SimpleNamespace
+
+    client, backend, spec = setup
+    job = client.submit(spec.model_copy(update={"gpu": True}))
+    client.worker().tick()
+    seen = []
+
+    def read_metadata(method, request, ref):
+        seen.append((method, ref))
+        return SimpleNamespace(metadata=SimpleNamespace(enable_gpu=enabled, machine_shape=shape))
+
+    monkeypatch.setattr(backend, "_kernels", read_metadata)
+    result = client.agent().runtime(job.id)
+    assert result["requested"] == {"gpu": True, "accelerator": None}
+    assert result["provider"] == {"enable_gpu": enabled, "machine_shape": shape}
+    assert seen == [("get_kernel", client.get(job.id).remote_ref)]
+    assert len(backend.pushes) == 1
+
+
 def test_request_replay_survives_restart_missing_source_and_completion(setup):
     client, backend, spec = setup
     agent = AgentClient(client)

@@ -112,6 +112,13 @@ def changes(ctx: typer.Context, after: int = 0, batch: str | None = None, limit:
     return ctx.obj["client"].agent().changes(after=after, batch_id=batch, limit=limit)
 
 
+@agent_app.command("runtime")
+@response
+def runtime(ctx: typer.Context, job_id: str):
+    """Read provider accelerator metadata and session status, without changes."""
+    return ctx.obj["client"].agent().runtime(job_id)
+
+
 @agent_app.command("inputs")
 @response
 def inputs(ctx: typer.Context, job_id: str):

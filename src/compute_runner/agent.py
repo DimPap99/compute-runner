@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from typing import get_args
 
 import yaml
@@ -15,7 +16,7 @@ from .models import ACTIVE, JobState
 from .providers import safe_message
 from .results import RUN_RECORD, listed_outputs
 from .store import atomic_write
-from .worker import MOVABLE, occupancy
+from .worker import MOVABLE, inventory, last_discovery, occupancy, outstanding
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
 ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
@@ -53,6 +54,15 @@ def summary(job):
     }.items():
         if item not in (None, "", {}):
             value[key] = item
+    return value
+
+
+def _checked(found, now):
+    """How old an account's last discovery is (None: never made), and why the latest one failed."""
+    checked = found.get("checked_at")
+    value = dict(checked_age_seconds=None if checked is None else max(0, round(now - checked)))
+    if found.get("error"):
+        value["error"] = short(found["error"])
     return value
 
 
@@ -142,35 +152,59 @@ class AgentClient:
             worker=self.health(),
         )
 
-    def accounts(self):
-        """Configured accounts in preference order, with slots in use and the worker's last remote check.
+    def _discovery(self, live=False, account=None):
+        """Configured accounts' runs, GPU seconds, check time and error, as the worker saves them.
 
-        Local only: counts combine this queue's runs with other runs the worker last discovered.
+        From the worker's last check, or asked of each provider now when live (on Kaggle, a
+        request per notebook run in the last 24 hours). account keeps that account only.
+        """
+        accounts = [item.id for item in self.client.config.accounts if account in (None, item.id)]
+        if not live:
+            saved = last_discovery(self.client.config.state_dir)
+            return {account_id: saved.get(account_id) or {} for account_id in accounts}
+        # One at a time: Kaggle's client setup silences output by swapping the process's stdout.
+        found = {}
+        for account_id in accounts:
+            try:
+                runs, gpu_seconds = inventory(self.client.provider(account_id))
+                found[account_id] = dict(runs=runs, gpu_seconds=gpu_seconds, checked_at=time.time())
+            except ERRORS as error:  # One broken account must not hide the others.
+                found[account_id] = dict(error=safe_message(error))
+        return found
+
+    def accounts(self, *, live=False):
+        """Configured accounts in preference order, with slots in use and free, and GPU quota left.
+
+        used counts this queue's runs and other runs discovered on the account; free is what a new
+        job could take now, or None while the account's runs are unknown. Local only unless live,
+        which asks every provider now instead of reading the worker's last check.
         """
         config = self.client.config
-        try:
-            seen = json.loads((config.state_dir / "accounts.json").read_text())
-        except (OSError, ValueError):
-            seen = {}
+        found, now = self._discovery(live), time.time()
         jobs = self.client.store.list(ACTIVE)
         accounts = []
         for account in config.accounts:
-            found = seen.get(account.id, {})
-            used = occupancy(jobs, account.id, found.get("runs", {}))
-            checked, quota = found.get("checked_at"), found.get("gpu_seconds")
-            value = dict(
-                id=account.id,
-                provider=account.provider,
-                cpu=dict(used=used["cpu"], limit=account.cpu_limit),
-                gpu=dict(used=used["gpu"], limit=account.gpu_limit),
-                # SSH machines have no GPU time limit; null elsewhere means not checked yet.
-                gpu_quota_limited=account.provider != "ssh",
-                gpu_quota_seconds=None if quota is None else round(quota),
-                checked_age_seconds=round(time.time() - checked) if checked else None,
+            seen = found[account.id]
+            checked = _checked(seen, now)
+            known = checked["checked_age_seconds"] is not None and "error" not in checked
+            used = occupancy(jobs, account.id, seen.get("runs", {}))
+            quota = seen.get("gpu_seconds")
+            value = dict(id=account.id, provider=account.provider)
+            for pool in ("cpu", "gpu"):
+                limit = getattr(account, pool + "_limit")
+                # As the worker admits jobs: no GPU job starts once the GPU time is spent.
+                spent = pool == "gpu" and quota is not None and quota <= 0
+                free = None if not known else (0 if spent else max(0, limit - used[pool]))
+                value[pool] = dict(used=used[pool], limit=limit, free=free)
+            accounts.append(
+                value
+                | dict(
+                    # SSH machines have no GPU time limit; null elsewhere means not checked yet.
+                    gpu_quota_limited=account.provider != "ssh",
+                    gpu_quota_seconds=None if quota is None else round(quota),
+                )
+                | checked
             )
-            if found.get("error"):
-                value["error"] = short(found["error"])
-            accounts.append(value)
         return dict(
             schema_version=1,
             failover=config.failover,
@@ -178,6 +212,78 @@ class AgentClient:
             accounts=accounts,
             worker=self.health(),
         )
+
+    def running(self, resource=None, *, account=None, live=False):
+        """Runs holding account slots, in account preference order; local only unless live.
+
+        This queue's submitted jobs come first on each account, then runs started elsewhere
+        (without job_id) as the worker last discovered them, or as each provider reports them now
+        when live; discovery gives each account's check age. resource "cpu" or "gpu" keeps runs
+        holding that pool. A discovered run of unknown resource holds both, as the worker counts it.
+        """
+        if resource not in (None, "cpu", "gpu"):
+            raise ValueError("resource must be cpu or gpu")
+        selected = self.client.config.account(account).id if account else None
+        found, now = self._discovery(live, selected), time.time()
+        runs, ours = [], set()
+        for job in self.client.store.list(ACTIVE):
+            if not outstanding(job) or selected not in (None, job.attempts[-1].account):
+                continue
+            attempt = job.attempts[-1]
+            ours.add((attempt.account, attempt.ref.lower()))
+            run = dict(
+                account=attempt.account,
+                ref=attempt.ref,
+                resource="gpu" if job.spec.gpu else "cpu",
+                job_id=job.id,
+                name=short(job.spec.name, 100),
+                state=job.state,
+                elapsed_seconds=max(0, round(now - attempt.started_at)),
+            )
+            extra = dict(accelerator=short(job.spec.accelerator, 100), url=job.url)
+            runs.append(run | {key: item for key, item in extra.items() if item})
+        for account_id, seen in found.items():
+            runs += [
+                dict(account=account_id, ref=ref, resource=kind if kind in ("cpu", "gpu") else "unknown")
+                for ref, kind in seen.get("runs", {}).items()
+                if (account_id, ref) not in ours
+            ]
+        runs = [
+            dict(run, provider=run["account"].partition(":")[0])
+            for run in runs
+            if resource is None or run["resource"] in (resource, "unknown")
+        ]
+        # Stable: this queue's runs stay oldest first. Accounts no longer configured go last.
+        order = {account_id: index for index, account_id in enumerate(found)}
+        runs.sort(key=lambda run: (order.get(run["account"], len(order)), "job_id" not in run))
+        counts = Counter(run["resource"] for run in runs)
+        return dict(
+            schema_version=1,
+            resource=resource,
+            account=selected,
+            total=len(runs),
+            counts={kind: counts[kind] for kind in ("cpu", "gpu", "unknown")},
+            runs=runs,
+            discovery={account_id: _checked(seen, now) for account_id, seen in found.items()},
+            worker=self.health(),
+        )
+
+    def runtime(self, job_id):
+        """Read Kaggle's saved accelerator metadata, separately from our request."""
+        from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
+
+        job = self.client.get(job_id)
+        if not job.account.startswith("kaggle:") or not job.remote_ref:
+            raise ValueError("Runtime diagnostics require a submitted Kaggle job")
+        provider = self.client.provider(job.account)
+        metadata = provider._kernels("get_kernel", ApiGetKernelRequest(), job.remote_ref).metadata
+        return {"schema_version": 1, "job_id": job.id, "account": job.account,
+                "ref": job.remote_ref, "url": provider.url(job.remote_ref),
+                "requested": {"gpu": job.spec.gpu, "accelerator": job.spec.accelerator},
+                "provider": {"enable_gpu": getattr(metadata, "enable_gpu", None),
+                             "machine_shape": getattr(metadata, "machine_shape", None)},
+                "session": provider.status(job.remote_ref),
+                "note": "Saved provider metadata; CUDA must also be confirmed inside the workload."}
 
     def inputs(self, job_id):
         """Read provider status for a pending job's exact input identities; never upload."""

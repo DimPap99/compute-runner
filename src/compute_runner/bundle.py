@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -13,7 +14,7 @@ import nbformat
 import pathspec
 
 from .models import JobSpec
-from .runtime import MANIFEST, json_digest, safe_relative
+from .runtime import MANIFEST, _manifest, _verify, json_digest, safe_relative
 from .security import detected_secret, secret_filename
 from .store import atomic_json
 
@@ -168,8 +169,13 @@ def describe(spec: JobSpec, *, skip=()) -> dict:
     )
 
 
-def plain_files(root: Path) -> list[str]:
-    """Every regular file below root, for copying data verbatim; symlinks are refused."""
+def plain_files(root: Path, *, allow_bundle_manifest=False) -> list[str]:
+    """Files for a dataset copy, optionally unwrapping a verified runner bundle.
+
+    A runner-created dataset already contains our manifest. Verify its complete
+    inventory and hashes before regenerating that metadata in the new snapshot.
+    Arbitrary user inputs still reject the reserved name by default.
+    """
     files = []
     for current, dirs, names in os.walk(root):
         for name in [*dirs, *names]:
@@ -177,7 +183,17 @@ def plain_files(root: Path) -> list[str]:
                 raise ValueError(f"Symlinks are not supported: {name}")
         files += [(Path(current) / name).relative_to(root).as_posix() for name in names]
     if MANIFEST in files:
-        raise ValueError(f"{MANIFEST} is reserved")
+        if not allow_bundle_manifest:
+            raise ValueError(f"{MANIFEST} is reserved")
+        try:
+            metadata = json.loads((root / MANIFEST).read_text())
+            records = _manifest(metadata, metadata["digest"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Invalid existing bundle manifest") from error
+        if set(files) != set(records) | {MANIFEST} or MANIFEST in records:
+            raise ValueError("Existing bundle inventory differs from manifest")
+        _verify(root, records)
+        files = list(records)
     if not files:
         raise ValueError("The dataset has no files")
     return sorted(files)

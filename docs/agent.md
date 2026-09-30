@@ -38,7 +38,7 @@ compute-runner agent retry JOB_ID --request-key experiment-retry-v1
 
 ## Accounts
 
-`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used` and `limit`), `gpu_quota_limited` (false on SSH machines, which have no GPU time limit), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check (null when not checked yet), and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
+`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used`, `limit`, and `free`: slots a new job could take now, null while the account's runs are unknown), `gpu_quota_limited` (false on SSH machines, which have no GPU time limit), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check (null when not checked yet), and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
 
 `agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it.
 
@@ -151,7 +151,8 @@ cursor = page["cursor"]
 | `logs(job_id, tail=50, max_bytes=8192, refresh=False)` | Bounded text and cache metadata |
 | `wait(job_ids=None, batch_id=None, timeout=300, downloads=True, limit=20)` | Status once the selection settles or the timeout passes |
 | `outputs(job_id, limit=100, offset=0)` | Downloaded file listing |
-| `accounts()` | Accounts, failover policy, slots in use, and last known GPU quota |
+| `accounts(live=False)` | Accounts, failover policy, slots in use and free, and last known GPU quota |
+| `running(resource=None, account=None, live=False)` | Runs holding each account's slots, including runs started elsewhere (no `job_id`), and each account's discovery age |
 | `move(job_ids=None, batch_id=None, account=..., transfer=False, limit=20)` | Status of the selection and the number moved |
 | `retry(job_id, request_key=..., account=None)` | Retry batch status and replay flag |
 | `continue_run(job_id, request_key=..., account=None)` | Continuation batch status and replay flag |

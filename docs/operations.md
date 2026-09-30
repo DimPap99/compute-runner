@@ -4,6 +4,16 @@
 
 `compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](accounts.md). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, results folder, dataset copies and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration, where each account's login comes from and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
 
+Two tables show what every account is doing:
+
+```bash
+compute-runner running              # runs holding CPU and GPU slots on every account
+compute-runner running gpu --account kaggle:alice
+compute-runner gpus                 # GPU slots in use and free, GPU time left, and totals
+```
+
+`running` lists this queue's submitted jobs with their notebook or run folder, type, state and time since launch, followed by runs started outside this queue (such as a notebook run on Kaggle's website), marked `(external)`. A run whose type discovery could not tell holds both CPU and GPU slots, so both filters show it. `gpus` shows, for each account, the GPU slots in use, how many a new job could take now (none once the account's GPU time is spent), the GPU time left, and when the worker last checked. Totals read `>=` while an account is unknown. Both commands read the worker's last [discovery](#worker-configuration), which it refreshes only while it has jobs to place, and say when that is old or failed. `--live` asks every provider now instead; on Kaggle this costs a request per notebook run in the last 24 hours.
+
 The worker runs as a `systemd --user` service, or in a terminal without systemd; local process locking uses `fcntl`. The service must be able to authenticate without an interactive shell, so keep credentials in the [credentials file](accounts.md#credentials) or Kaggle's standard locations. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
 
 Submission writes to the local queue; a running worker is required to upload and launch jobs. CLI job IDs may be unambiguous prefixes; batch IDs must be complete. The standard CLI prints full records as JSON with the global `--json` option (`compute-runner --json status JOB_ID`); use `compute-runner agent` for bounded responses intended for automation.

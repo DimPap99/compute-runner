@@ -53,6 +53,8 @@ compute-runner list
 compute-runner status JOB_ID
 compute-runner logs JOB_ID --follow
 compute-runner wait JOB_ID
+compute-runner running gpu     # what holds each account's GPU slots, including runs started elsewhere
+compute-runner gpus            # GPU slots and time left on each account, and in total
 ```
 
 Submission writes to the local queue; the worker uploads and launches jobs. Add `--json` before a command for machine-readable output.
