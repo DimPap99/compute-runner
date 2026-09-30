@@ -113,51 +113,56 @@ class Store:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = root / "queue.sqlite3"
         with self.connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT OR IGNORE INTO meta VALUES ('schema_version', '1');
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY, created REAL NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS job_state ON jobs(state, created);
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
-                    timestamp REAL NOT NULL, state TEXT NOT NULL, detail TEXT
-                );
-            """)
-            version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            # 3: job records name an account; 4: run folders, output receipts and dataset copies.
-            # Older versions must not open newer queues.
-            if version not in {"1", "2", "3", "4"}:
-                raise RuntimeError(f"Unsupported state schema {version}; do not open with this version")
-            db.executescript("""
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS batches (
-                    id TEXT PRIMARY KEY, created REAL NOT NULL,
-                    request_key TEXT UNIQUE, fingerprint TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS batch_jobs (
-                    batch_id TEXT NOT NULL, job_id TEXT NOT NULL UNIQUE, position INTEGER NOT NULL,
-                    PRIMARY KEY (batch_id, position)
-                );
-                CREATE INDEX IF NOT EXISTS event_job ON events(job_id, id);
-                CREATE TABLE IF NOT EXISTS runs (
-                    experiment TEXT NOT NULL, number INTEGER NOT NULL, job_id TEXT NOT NULL UNIQUE,
-                    PRIMARY KEY (experiment, number)
-                );
-                CREATE TABLE IF NOT EXISTS outputs (
-                    job_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
-                    bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (job_id, name)
-                );
-                CREATE TABLE IF NOT EXISTS dataset_copies (
-                    source TEXT PRIMARY KEY, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
-                    created REAL NOT NULL
-                );
-                UPDATE meta SET value='4' WHERE key='schema_version';
-                COMMIT;
-            """)
+            self._migrate(db)
         os.chmod(self.db, 0o600)
+
+    @staticmethod
+    def _migrate(db):
+        """Create the schema, or upgrade an older one; a newer schema is refused."""
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT OR IGNORE INTO meta VALUES ('schema_version', '1');
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY, created REAL NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS job_state ON jobs(state, created);
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                timestamp REAL NOT NULL, state TEXT NOT NULL, detail TEXT
+            );
+        """)
+        version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        # 3: job records name an account; 4: run folders, output receipts and dataset copies.
+        # Older versions must not open newer queues.
+        if version not in {"1", "2", "3", "4"}:
+            raise RuntimeError(f"Unsupported state schema {version}; do not open with this version")
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS batches (
+                id TEXT PRIMARY KEY, created REAL NOT NULL,
+                request_key TEXT UNIQUE, fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS batch_jobs (
+                batch_id TEXT NOT NULL, job_id TEXT NOT NULL UNIQUE, position INTEGER NOT NULL,
+                PRIMARY KEY (batch_id, position)
+            );
+            CREATE INDEX IF NOT EXISTS event_job ON events(job_id, id);
+            CREATE TABLE IF NOT EXISTS runs (
+                experiment TEXT NOT NULL, number INTEGER NOT NULL, job_id TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (experiment, number)
+            );
+            CREATE TABLE IF NOT EXISTS outputs (
+                job_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (job_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS dataset_copies (
+                source TEXT PRIMARY KEY, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
+                created REAL NOT NULL
+            );
+            UPDATE meta SET value='4' WHERE key='schema_version';
+            COMMIT;
+        """)
 
     @contextmanager
     def connection(self):
@@ -347,8 +352,14 @@ class Store:
         return result
 
     @staticmethod
-    def _filters(db, batch_id=None, job_ids=None, states=None):
+    def _filters(db, batch_id=None, job_ids=None, states=None, account=None, pool=None):
         clauses, args = [], []
+        if account is not None:
+            clauses.append("lower(json_extract(j.record,'$.account'))=lower(?)")
+            args.append(account)
+        if pool is not None:
+            clauses.append("json_extract(j.record,'$.spec.gpu')=?")
+            args.append(int(pool == "gpu"))
         if batch_id is not None:
             if not db.execute("SELECT 1 FROM batches WHERE id=?", (batch_id,)).fetchone():
                 raise KeyError(f"No batch {batch_id}")
@@ -365,11 +376,26 @@ class Store:
             args.extend(states)
         return " AND ".join(clauses) or "1", args
 
-    def page(self, *, batch_id=None, job_ids=None, states=None, limit=20, offset=0, newest_first=False):
-        """A batch in submission order; otherwise by creation time, oldest first unless newest_first."""
+    def page(
+        self,
+        *,
+        batch_id=None,
+        job_ids=None,
+        states=None,
+        account=None,
+        pool=None,
+        limit=20,
+        offset=0,
+        newest_first=False,
+    ):
+        """Counts by state over the selection, and one page of it; limit=-1 reads every job.
+
+        A batch lists in submission order; otherwise by creation time, oldest first unless
+        newest_first. account and pool ("cpu" or "gpu") narrow the selection.
+        """
         with self.connection() as db:
             db.execute("BEGIN")
-            where, args = self._filters(db, batch_id, job_ids, states)
+            where, args = self._filters(db, batch_id, job_ids, states, account, pool)
             counts = dict(
                 db.execute(
                     f"SELECT j.state,COUNT(*) FROM jobs j WHERE {where} GROUP BY j.state", args
@@ -412,8 +438,48 @@ class Store:
             raise KeyError(f"No job {job_id}")
         return JobRecord.model_validate_json(row[0])
 
-    def list(self, states=None) -> list[JobRecord]:
-        return self.page(states=states, limit=-1)[1]
+    def list(self, states=None, *, account=None, pool=None) -> list[JobRecord]:
+        return self.page(states=states, account=account, pool=pool, limit=-1)[1]
+
+    def counts_by_account(self) -> dict[str, dict[str, int]]:
+        """How many jobs each account has in each state: {account: {state: count}}."""
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT json_extract(record,'$.account'),state,COUNT(*) FROM jobs GROUP BY 1,2"
+            ).fetchall()
+        found = {}
+        for account, state, count in rows:
+            found.setdefault(account, {})[state] = count
+        return found
+
+    def attention(self, limit: int) -> tuple[int, list[JobRecord]]:
+        """Jobs waiting on someone, newest first: (how many, at most limit of them).
+
+        Blocked jobs, jobs needing attention, failed downloads, and pending jobs another account
+        could start (the failover policy asks first).
+        """
+        where = (
+            "state IN ('blocked','needs_attention') OR json_extract(record,'$.download_state')='error' "
+            "OR (state IN ('queued','preparing') AND json_extract(record,'$.suggested_account') IS NOT NULL)"
+        )
+        with self.connection() as db:
+            db.execute("BEGIN")
+            total = db.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}").fetchone()[0]
+            rows = db.execute(
+                f"SELECT record FROM jobs WHERE {where} ORDER BY created DESC,id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return total, [JobRecord.model_validate_json(row[0]) for row in rows]
+
+    def batch_positions(self, job_ids) -> dict[str, tuple[str, int]]:
+        """Each listed job's batch and its place there: {job ID: (batch ID, position)}."""
+        if not job_ids:
+            return {}
+        marks = ",".join("?" for _ in job_ids)
+        with self.connection() as db:
+            rows = db.execute(
+                f"SELECT job_id,batch_id,position FROM batch_jobs WHERE job_id IN ({marks})", list(job_ids)
+            ).fetchall()
+        return {job_id: (batch_id, position) for job_id, batch_id, position in rows}
 
     def update(self, job_id: str, *, expected=None, **changes) -> JobRecord | None:
         with self.connection() as db:

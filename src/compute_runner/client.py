@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .bundle import describe, snapshot, snapshot_bundle
 from .models import SSH_PATH, BatchRecord, Config, JobRecord, JobSpec, input_reference
-from .providers import Provider, connect
+from .providers import Provider, connect, safe_message
 from .results import experiment_dir, outputs_dir, verified_checkpoint
 from .runtime import json_digest, safe_relative
 from .store import Store, load_config, try_lock
@@ -253,27 +253,91 @@ class Client:
             raise ValueError("Job changed state during cancellation; inspect its current status")
         return updated
 
+    def cancel_many(self, job_ids) -> dict:
+        """Cancel each job; one that cannot be cancelled is reported without stopping the others.
+
+        {"cancelled": [job IDs], "failed": {job ID: message}}; jobs already cancelled are left alone.
+        """
+        cancelled, failed = [], {}
+        for job_id in job_ids:
+            try:
+                if self.get(job_id).state != "cancelled":
+                    self.cancel(job_id)
+                    cancelled.append(job_id)
+            except (ValueError, RuntimeError, OSError) as error:
+                failed[job_id] = safe_message(error)
+        return dict(cancelled=cancelled, failed=failed)
+
+    def cleanup(
+        self,
+        *,
+        older_than_days: float = 7,
+        include_snapshots: bool = False,
+        accounts: list[str] | None = None,
+        local: bool = True,
+        delete: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """What this runner left behind, what may go and why (see cleanup.Cleanup); delete removes it.
+
+        accounts limits the remote search to those accounts ([] for none); local includes the
+        state directory. The report lists at most limit reclaimable items, and totals for all.
+        """
+        from .cleanup import Cleanup
+
+        accounts = None if accounts is None else [self.config.account(account).id for account in accounts]
+        cleanup = Cleanup(
+            self,
+            older_than_days=older_than_days,
+            include_snapshots=include_snapshots,
+            accounts=accounts,
+            local=local,
+        )
+        items = cleanup.items()
+        report = cleanup.report(items, limit=limit)
+        if delete:
+            report["deleted"] = cleanup.delete(items)
+        return report
+
     def retry(self, job_id, *, request_key: str | None = None, account: str | None = None):
         return self.retry_batch(job_id, request_key=request_key, account=account).jobs[0]
 
     def retry_batch(self, job_id, *, request_key: str | None = None, account: str | None = None):
         """Rerun a job's saved snapshot, on its account unless another is given."""
+        return self.retry_jobs([job_id], request_key=request_key, account=account)
+
+    def retry_jobs(
+        self, job_ids, *, request_key: str | None = None, account: str | None = None
+    ) -> BatchRecord:
+        """Rerun several jobs' saved snapshots as one batch, each on its account unless one is given.
+
+        Atomic: when one of them cannot be rerun, none is queued.
+        """
+        if not job_ids:
+            raise ValueError("Select at least one job to rerun")
         explicit = account and self.config.account(account).id
-        fingerprint = self._fingerprint({"retry": job_id}, request_key, explicit)
+        # One job keeps the fingerprint single retries always had, so their keys still replay.
+        intent = {"retry": job_ids[0] if len(job_ids) == 1 else list(job_ids)}
+        fingerprint = self._fingerprint(intent, request_key, explicit)
         previous = self.store.request(request_key, fingerprint)
         if previous is not None:
             return previous
-        job = self.get(job_id)
+        jobs = [self._rerun(self.get(job_id), explicit) for job_id in job_ids]
+        return self._add(jobs, request_key, fingerprint)
+
+    def _rerun(self, job: JobRecord, account: str | None) -> JobRecord:
+        """A new job running a finished or blocked job's saved snapshot again."""
         if job.outstanding:
-            raise ValueError(f"An execution may still exist; resolve it before rerunning: {job.url}")
+            raise ValueError(
+                f"An execution of {job.id} may still exist; resolve it before rerunning: {job.url}"
+            )
         if not job.terminal and job.state != "blocked":
-            raise ValueError("Retry accepts a terminal or blocked job only")
+            raise ValueError(f"Retry accepts a terminal or blocked job only; {job.id} is {job.state}")
         self._check_saved(job)
-        target = explicit or self.config.account(job.account).id
+        target = account or self.config.account(job.account).id
         self.provider(target).check(job.spec)
         spec = job.spec.model_copy(deep=True)
-        new = self._new_job(spec, job.snapshot, target, self._same_experiment(job), job.id)
-        return self._add([new], request_key, fingerprint)
+        return self._new_job(spec, job.snapshot, target, self._same_experiment(job), job.id)
 
     def _check_saved(self, job):
         for bundle in [job.snapshot["source"], *job.snapshot["inputs"].values()]:

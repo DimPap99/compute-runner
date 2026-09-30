@@ -25,7 +25,7 @@ from pathlib import Path
 
 # Imported on its own, as in tests; on the machine this file follows runtime.py.
 if "unpack_bundle" not in globals():
-    from compute_runner.runtime import MANIFEST, file_digest, unpack_bundle
+    from compute_runner.runtime import MANIFEST, file_digest, tree_size, unpack_bundle
 
 STOP_GRACE_SECONDS = 20
 # How long start may take between marking a run started and recording its supervisor.
@@ -389,15 +389,7 @@ def artifacts(root):
 
 
 def _measure(path):
-    size, latest = 0, path.stat().st_mtime
-    for current, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                found = os.lstat(os.path.join(current, name))
-            except OSError:  # Gone meanwhile.
-                continue
-            size += found.st_size
-            latest = max(latest, found.st_mtime)
+    size, latest = tree_size(path)
     return {"name": path.name, "bytes": size, "modified_at": latest}
 
 

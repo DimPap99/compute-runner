@@ -40,6 +40,22 @@ def file_digest(path):
     return digest.hexdigest()
 
 
+def tree_size(path):
+    """(bytes, latest change) of a file, or of every file below a folder; links are not followed."""
+    stat = os.lstat(path)
+    size, latest = (0 if os.path.isdir(path) else stat.st_size), stat.st_mtime
+    if os.path.isdir(path) and not os.path.islink(path):
+        for current, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    found = os.lstat(os.path.join(current, name))
+                except OSError:  # Gone meanwhile.
+                    continue
+                size += found.st_size
+                latest = max(latest, found.st_mtime)
+    return size, latest
+
+
 def manifest_records(data, digest):
     """The file records of a bundle manifest, after checking them against the bundle's digest."""
     records = data["files"]

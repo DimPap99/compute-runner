@@ -7,7 +7,7 @@ import nbformat
 import pytest
 
 from compute_runner import JobSpec
-from compute_runner.bundle import describe, inventory, snapshot, snapshot_bundle
+from compute_runner.bundle import describe, scan, snapshot, snapshot_bundle
 from compute_runner.runtime import _find_bundle, unpack_bundle
 
 from conftest import staged_launcher
@@ -44,7 +44,7 @@ def test_credential_cache_and_ignore_exclusions(tmp_path):
     (project / ".kgrignore").write_text("keep.txt\n")
     (project / ".venv").mkdir()
     (project / ".venv" / "secret").write_text("example")
-    _, files = inventory(project, [])
+    _, files = scan(project, [])
     assert {p.name for p in files} == {"main.py", ".gitignore", ".kgrignore"}
 
 
@@ -53,7 +53,7 @@ def test_snapshot_rejects_detected_credential_without_echoing_it(tmp_path):
     credential = "KAGGLE_KEY=" + "a" * 32
     source.write_text("print('before')\n" + credential + "\n")
     with pytest.raises(ValueError, match="Detected Kaggle API key") as error:
-        snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
+        snapshot_bundle(*scan(source, []), tmp_path / "bundles")
     assert credential not in str(error.value)
 
 
@@ -70,7 +70,7 @@ def test_rejects_symlink_and_missing_entrypoint(tmp_path):
     (tmp_path / "main.py").write_text("pass")
     (tmp_path / "link.py").symlink_to(tmp_path / "main.py")
     with pytest.raises(ValueError, match="Symlink"):
-        inventory(tmp_path, [])
+        scan(tmp_path, [])
     with pytest.raises(ValueError, match="absent"):
         describe(JobSpec(source=tmp_path, entrypoint="missing.py", exclude=["link.py"]))
 
@@ -113,7 +113,7 @@ def test_notebook_outputs_cleared_without_editing_original(tmp_path):
         ]
     )
     nbformat.write(notebook, source)
-    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles", notebooks=True)
+    bundle = snapshot_bundle(*scan(source, []), tmp_path / "bundles", notebooks=True)
     saved = nbformat.read(tmp_path / "bundles" / bundle["digest"] / "files" / source.name, as_version=4)
     assert saved.cells[0].outputs == []
     assert nbformat.read(source, as_version=4).cells[0].outputs
@@ -171,7 +171,7 @@ Path(os.environ['KGR_OUTPUT_DIR'], 'result.txt').write_text(str(VALUE))
 def test_archive_and_expanded_lookup(tmp_path):
     source = tmp_path / "hello.py"
     source.write_text("print(42)")
-    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
+    bundle = snapshot_bundle(*scan(source, []), tmp_path / "bundles")
     mount = tmp_path / "input/test-bundle"
     mount.mkdir(parents=True)
     archive = tmp_path / "bundles" / bundle["digest"] / "payload.zip"
@@ -194,7 +194,7 @@ def test_archive_and_expanded_lookup(tmp_path):
 def test_rejects_tampered_archive(tmp_path):
     source = tmp_path / "hello.py"
     source.write_text("original")
-    bundle = snapshot_bundle(*inventory(source, []), tmp_path / "bundles")
+    bundle = snapshot_bundle(*scan(source, []), tmp_path / "bundles")
     malicious = tmp_path / "bad.zip"
     saved = tmp_path / "bundles" / bundle["digest"] / "files"
     with zipfile.ZipFile(malicious, "w") as z:

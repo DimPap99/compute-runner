@@ -40,57 +40,80 @@ PROTECTED = {
 }
 
 
-def inventory(
-    source: Path, exclude: list[str], ignore_files=(".gitignore", ".kgrignore"), skip=()
-) -> tuple[Path, list[Path]]:
-    """skip lists folders left out wherever they appear inside source, such as its results folder."""
-    source = source.expanduser().absolute()
-    skipped = {Path(os.path.realpath(folder)) for folder in skip}
-    if source.is_symlink():
-        raise ValueError(f"Symlink source is not supported: {source}")
-    source = source.resolve(strict=True)
-    root = source if source.is_dir() else source.parent
-    patterns = list(exclude)
-    for name in ignore_files:
-        file = root / name
-        if file.is_file() and not file.is_symlink():
-            patterns.extend(file.read_text().splitlines())
-    ignored = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
-    selected = []
+def _protected(path: Path) -> bool:
+    """Version control, environments, caches and credentials never enter a bundle."""
+    return any(part.casefold() in PROTECTED for part in path.parts) or secret_filename(path.name)
 
-    def protect(path):
-        return any(p.casefold() in PROTECTED for p in path.parts) or secret_filename(path.name)
 
-    candidates = []
-    if source.is_dir():
-        for current, dirs, files in os.walk(root, followlinks=False):
-            relative = Path(current).relative_to(root)
-            allowed = []
-            for name in sorted(dirs):
-                rel = relative / name
-                if protect(rel) or ignored.match_file(rel.as_posix() + "/") or root / rel in skipped:
-                    continue
-                if (root / rel).is_symlink():
-                    raise ValueError(f"Symlinks are not supported: {rel}")
-                allowed.append(name)
-            dirs[:] = allowed
+class SourceScan:
+    """The files of a source or input to snapshot: what lies below it, less ignored and protected files.
+
+    exclude and the ignore files hold gitignore patterns. skip lists folders left out wherever
+    they appear inside the source, such as its results folder. Links are refused, not followed.
+    """
+
+    def __init__(self, source: Path, exclude, *, ignore_files=(".gitignore", ".kgrignore"), skip=()):
+        self.skipped = {Path(os.path.realpath(folder)) for folder in skip}
+        source = source.expanduser().absolute()
+        if source.is_symlink():
+            raise ValueError(f"Symlink source is not supported: {source}")
+        self.source = source.resolve(strict=True)
+        self.root = self.source if self.source.is_dir() else self.source.parent
+        patterns = [*exclude, *self._ignore_patterns(ignore_files)]
+        self.ignored = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+    def _ignore_patterns(self, names) -> list[str]:
+        patterns = []
+        for name in names:
+            file = self.root / name
+            if file.is_file() and not file.is_symlink():
+                patterns.extend(file.read_text().splitlines())
+        return patterns
+
+    def files(self) -> list[Path]:
+        """The selected files, relative to root, in sorted order."""
+        candidates = self._walk() if self.source.is_dir() else [Path(self.source.name)]
+        selected = [relative for relative in sorted(candidates) if self._selected(relative)]
+        if not selected:
+            raise ValueError(f"No uploadable files in {self.source}")
+        return selected
+
+    def _walk(self) -> list[Path]:
+        candidates = []
+        for current, dirs, files in os.walk(self.root, followlinks=False):
+            relative = Path(current).relative_to(self.root)
+            dirs[:] = [name for name in sorted(dirs) if self._entered(relative / name)]
             candidates.extend(relative / name for name in sorted(files))
-    else:
-        candidates = [Path(source.name)]
-    for rel in sorted(candidates):
-        if protect(rel) or ignored.match_file(rel.as_posix()):
-            continue
-        full = root / rel
+        return candidates
+
+    def _entered(self, relative: Path) -> bool:
+        if _protected(relative) or self.ignored.match_file(relative.as_posix() + "/"):
+            return False
+        if self.root / relative in self.skipped:
+            return False
+        if (self.root / relative).is_symlink():
+            raise ValueError(f"Symlinks are not supported: {relative}")
+        return True
+
+    def _selected(self, relative: Path) -> bool:
+        if _protected(relative) or self.ignored.match_file(relative.as_posix()):
+            return False
+        full = self.root / relative
         if full.is_symlink():
-            raise ValueError(f"Symlinks are not supported: {rel}")
+            raise ValueError(f"Symlinks are not supported: {relative}")
         if not full.is_file():
-            raise ValueError(f"Only regular files are supported: {rel}")
-        if rel.as_posix() == MANIFEST:
+            raise ValueError(f"Only regular files are supported: {relative}")
+        if relative.as_posix() == MANIFEST:
             raise ValueError(f"{MANIFEST} is reserved; rename it or exclude it")
-        selected.append(rel)
-    if not selected:
-        raise ValueError(f"No uploadable files in {source}")
-    return root, selected
+        return True
+
+
+def scan(
+    source: Path, exclude, *, ignore_files=(".gitignore", ".kgrignore"), skip=()
+) -> tuple[Path, list[Path]]:
+    """(root, files relative to it) of a source or input to snapshot; see SourceScan."""
+    found = SourceScan(source, exclude, ignore_files=ignore_files, skip=skip)
+    return found.root, found.files()
 
 
 def clean_notebook(path: Path, *, python=False) -> bytes:
@@ -113,8 +136,32 @@ def clean_notebook(path: Path, *, python=False) -> bytes:
 
 def describe(spec: JobSpec, *, skip=()) -> dict:
     """Plan the snapshot of a spec whose inputs are all local paths."""
-    root, files = inventory(spec.source, spec.exclude, skip=skip)
+    root, files = scan(spec.source, spec.exclude, skip=skip)
     source = spec.source.expanduser().resolve()
+    entrypoint, kind = _entry(spec, source, root, files)
+    if spec.requirements and Path(safe_relative(spec.requirements)) not in files:
+        raise ValueError("requirements must identify an included project file")
+    return dict(
+        root=str(root),
+        kind=kind,
+        single_file=source.is_file(),
+        entrypoint=entrypoint,
+        module=spec.module,
+        files=[p.as_posix() for p in files],
+        bytes=sum((root / p).stat().st_size for p in files),
+        inputs={alias: _describe_input(path, skip) for alias, path in spec.inputs.items()},
+        gpu=spec.gpu,
+        accelerator=spec.accelerator,
+        internet=spec.internet,
+        timeout_seconds=spec.timeout_seconds,
+        private=True,
+        datasets=spec.datasets,
+        environment_keys=list(spec.env),
+    )
+
+
+def _entry(spec: JobSpec, source: Path, root: Path, files: list[Path]) -> tuple[str | None, str]:
+    """(entrypoint, kind) of what runs: a file source itself, a module, or an entrypoint in the folder."""
     entrypoint = spec.entrypoint
     if source.is_file():
         if entrypoint or spec.module:
@@ -124,45 +171,27 @@ def describe(spec: JobSpec, *, skip=()) -> dict:
         module_path = spec.module.replace(".", "/")
         if not any(Path(p) in files for p in (module_path + ".py", module_path + "/__main__.py")):
             raise ValueError(f"Module {spec.module} is absent or excluded from the snapshot")
-        kind = "script"
-    elif entrypoint:
-        entrypoint = safe_relative(entrypoint)
-        if Path(entrypoint) not in files:
-            raise ValueError(f"Entrypoint is absent or excluded: {entrypoint}")
-        if Path(entrypoint).suffix not in {".py", ".ipynb"}:
-            raise ValueError("Entrypoint must be a .py or .ipynb file")
-        kind = "notebook" if entrypoint.endswith(".ipynb") else "script"
-        if kind == "notebook":
-            clean_notebook(root / entrypoint, python=True)
-    else:
+        return entrypoint, "script"
+    if not entrypoint:
         raise ValueError("Folder sources require entrypoint or module")
-    if spec.requirements and Path(safe_relative(spec.requirements)) not in files:
-        raise ValueError("requirements must identify an included project file")
-    inputs = {}
-    for alias, source_path in spec.inputs.items():
-        # Data folders often .gitignore exactly the files they exist to carry; only .kgrignore applies.
-        data_root, data_files = inventory(source_path, [], ignore_files=(".kgrignore",), skip=skip)
-        inputs[alias] = dict(
-            root=str(data_root),
-            files=[p.as_posix() for p in data_files],
-            bytes=sum((data_root / p).stat().st_size for p in data_files),
-        )
+    entrypoint = safe_relative(entrypoint)
+    if Path(entrypoint) not in files:
+        raise ValueError(f"Entrypoint is absent or excluded: {entrypoint}")
+    if Path(entrypoint).suffix not in {".py", ".ipynb"}:
+        raise ValueError("Entrypoint must be a .py or .ipynb file")
+    if entrypoint.endswith(".ipynb"):
+        clean_notebook(root / entrypoint, python=True)
+        return entrypoint, "notebook"
+    return entrypoint, "script"
+
+
+def _describe_input(path: Path, skip) -> dict:
+    # Data folders often .gitignore exactly the files they exist to carry; only .kgrignore applies.
+    root, files = scan(path, [], ignore_files=(".kgrignore",), skip=skip)
     return dict(
         root=str(root),
-        kind=kind,
-        single_file=source.is_file(),
-        entrypoint=entrypoint,
-        module=spec.module,
         files=[p.as_posix() for p in files],
         bytes=sum((root / p).stat().st_size for p in files),
-        inputs=inputs,
-        gpu=spec.gpu,
-        accelerator=spec.accelerator,
-        internet=spec.internet,
-        timeout_seconds=spec.timeout_seconds,
-        private=True,
-        datasets=spec.datasets,
-        environment_keys=list(spec.env),
     )
 
 
@@ -197,61 +226,87 @@ def plain_files(root: Path, *, allow_bundle_manifest=False) -> list[str]:
 
 
 def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=False, screen=True) -> dict:
-    """Copy an inventory of files into an immutable, content-addressed bundle.
+    """Copy an inventory of files into an immutable, content-addressed bundle; see BundleWriter."""
+    return BundleWriter(bundle_root, notebooks=notebooks, screen=screen).write(root, files)
+
+
+class BundleWriter:
+    """Writes immutable, content-addressed bundles: bundle_root/DIGEST/{files/, payload.zip}.
 
     screen rejects files containing recognizable credentials; copies of provider datasets,
-    which are already on the provider, are not screened.
+    which are already on the provider, are not screened. notebooks clears notebooks' outputs.
     """
-    bundle_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.TemporaryDirectory(prefix=".building-", dir=bundle_root) as temporary:
-        stage = Path(temporary)
+
+    def __init__(self, bundle_root: Path, *, notebooks=False, screen=True):
+        self.bundle_root = bundle_root
+        self.notebooks = notebooks
+        self.screen = screen
+
+    def write(self, root: Path, files: list) -> dict:
+        self.bundle_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix=".building-", dir=self.bundle_root) as temporary:
+            stage = Path(temporary)
+            records = {
+                relative.as_posix(): self._copy(root / relative, stage / "files" / relative, relative)
+                for relative in map(Path, files)
+            }
+            digest = json_digest(records)
+            atomic_json(stage / "files" / MANIFEST, dict(schema_version=1, digest=digest, files=records))
+            self._archive(stage, records)
+            self._publish(stage, digest)
+        return dict(digest=digest, bytes=sum(record["size"] for record in records.values()), files=records)
+
+    def _copy(self, original: Path, destination: Path, relative: Path) -> dict:
+        """Copy one file, screened; it must not change meanwhile. Returns its manifest record."""
+        before = original.stat()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        cleaned = self._cleaned(original)
+        with destination.open("wb") as output:
+            if cleaned is not None:
+                self._check(cleaned, relative)
+                output.write(cleaned)
+                digest, size = hashlib.sha256(cleaned), len(cleaned)
+            else:
+                digest, size = self._stream(original, output, relative)
+            output.flush()
+            os.fsync(output.fileno())
+        after = original.stat()
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ino,
+        ):
+            raise ValueError(f"File changed during snapshot; submit again: {original}")
+        return {"sha256": digest.hexdigest(), "size": size}
+
+    def _cleaned(self, original: Path) -> bytes | None:
+        if not (self.notebooks and original.suffix == ".ipynb"):
+            return None
+        try:
+            return clean_notebook(original)
+        except ValueError:
+            return None  # Only the entrypoint runs, and describe() validated it; copy others unchanged.
+
+    def _stream(self, original: Path, output, relative: Path):
+        digest, size, tail = hashlib.sha256(), 0, b""
+        with original.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                # A credential split between two chunks is still found in the previous chunk's tail.
+                self._check(tail + chunk, relative)
+                digest.update(chunk)
+                output.write(chunk)
+                size += len(chunk)
+                tail = chunk[-512:]
+        return digest, size
+
+    def _check(self, data: bytes, relative: Path) -> None:
+        if self.screen and (kind := detected_secret(data)):
+            raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
+
+    @staticmethod
+    def _archive(stage: Path, records: dict) -> None:
+        """payload.zip: every file and the manifest, byte-for-byte reproducible."""
         payload = stage / "files"
-        records = {}
-        for relative in map(Path, files):
-            original = root / relative
-            before = original.stat()
-            destination = payload / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            digest = hashlib.sha256()
-            size = 0
-            data = None
-            if notebooks and original.suffix == ".ipynb":
-                try:
-                    data = clean_notebook(original)
-                except ValueError:
-                    pass  # Only the entrypoint runs, and describe() validated it; copy others unchanged.
-            with destination.open("wb") as output:
-                if data is not None:
-                    if screen and (kind := detected_secret(data)):
-                        raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
-                    output.write(data)
-                    digest.update(data)
-                    size = len(data)
-                else:
-                    tail = b""
-                    with original.open("rb") as input_file:
-                        while chunk := input_file.read(1024 * 1024):
-                            if screen and (kind := detected_secret(tail + chunk)):
-                                raise ValueError(
-                                    f"Detected {kind} in {relative}; remove or exclude that credential"
-                                )
-                            digest.update(chunk)
-                            output.write(chunk)
-                            size += len(chunk)
-                            tail = chunk[-512:]
-                output.flush()
-                os.fsync(output.fileno())
-            after = original.stat()
-            if (before.st_size, before.st_mtime_ns, before.st_ino) != (
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ino,
-            ):
-                raise ValueError(f"File changed during snapshot; submit again: {original}")
-            records[relative.as_posix()] = {"sha256": digest.hexdigest(), "size": size}
-        fingerprint = json_digest(records)
-        manifest = dict(schema_version=1, digest=fingerprint, files=records)
-        atomic_json(payload / MANIFEST, manifest)
         with zipfile.ZipFile(stage / "payload.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for relative in [*sorted(records), MANIFEST]:
                 info = zipfile.ZipInfo(relative, date_time=(2020, 1, 1, 0, 0, 0))
@@ -259,14 +314,17 @@ def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=Fal
                 info.external_attr = 0o100644 << 16
                 with (payload / relative).open("rb") as source_file, archive.open(info, "w") as target:
                     shutil.copyfileobj(source_file, target, 1024 * 1024)
-        target = bundle_root / fingerprint
-        if not target.exists():
-            try:
-                os.rename(stage, target)
-            except OSError:
-                if not target.exists():
-                    raise
-        return dict(digest=fingerprint, bytes=sum(r["size"] for r in records.values()), files=records)
+
+    def _publish(self, stage: Path, digest: str) -> None:
+        """Move the finished bundle into place; one that already exists is kept, as it is identical."""
+        target = self.bundle_root / digest
+        if target.exists():
+            return
+        try:
+            os.rename(stage, target)
+        except OSError:
+            if not target.exists():
+                raise
 
 
 def snapshot(spec: JobSpec, state_dir: Path, *, skip=()) -> dict:

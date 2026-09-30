@@ -404,3 +404,33 @@ def test_cpu_override_clears_gpu_accelerator(setup, tmp_path, monkeypatch, agent
         ],
     )
     assert result.exit_code != 0 and len(client.list()) == 1
+
+
+def test_a_batch_is_cancelled_together_and_its_failed_jobs_rerun_together(setup):
+    client, backend, spec = setup
+    agent = AgentClient(client)
+    batch = agent.submit([spec] * 3, request_key="three")
+    ids = [job["id"] for job in batch["jobs"]]
+    client.worker().tick()
+    backend.remote[client.get(ids[0]).remote_ref]["state"] = "ERROR"
+    due(client, ids[0])
+    client.worker().tick()
+    assert client.get(ids[0]).state == "failed"
+    cancelled = agent.cancel(batch_id=batch["batch_id"])
+    # The failed job stays failed; the two still queued remotely are asked to stop.
+    assert cancelled["cancelled"] == 2 and "not_cancelled" not in cancelled
+    rerun = agent.retry(batch_id=batch["batch_id"], states=["failed"], request_key="rerun-failed")
+    assert rerun["total"] == 1 and rerun["jobs"][0]["parent_id"] == ids[0]
+    assert agent.retry(batch_id=batch["batch_id"], states=["failed"], request_key="rerun-failed")["replayed"]
+    with pytest.raises(ValueError, match="No job in the selection"):
+        agent.retry(batch_id=batch["batch_id"], states=["blocked"], request_key="rerun-blocked")
+
+
+def test_a_single_retry_key_from_before_bulk_retries_still_replays(setup):
+    client, backend, spec = setup
+    job = client.submit(spec)
+    client.cancel(job.id)
+    first = client.retry_batch(job.id, request_key="retry-once")
+    assert client.retry_jobs([job.id], request_key="retry-once").id == first.id
+    with pytest.raises(ValueError, match="different request"):
+        client.retry_jobs([job.id, job.id], request_key="retry-once")

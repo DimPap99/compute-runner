@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import re
 import sqlite3
 import time
 from typing import get_args
 
 import yaml
 
+from .logcache import LogCache
 from .models import JobState
 from .providers import short
 from .results import RUN_RECORD, listed_outputs
-from .store import atomic_write
 from .views import CapacityView
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
@@ -66,17 +64,12 @@ class AgentClient:
         self.client = client
 
     def _jobs(self, jobs):
-        if not jobs:
-            return []
-        with self.client.store.connection() as db:
-            rows = db.execute(
-                "SELECT job_id,batch_id,position FROM batch_jobs WHERE job_id IN ("
-                + ",".join("?" for _ in jobs)
-                + ")",
-                [job.id for job in jobs],
-            ).fetchall()
-        batches = {row[0]: {"batch_id": row[1], "batch_index": row[2]} for row in rows}
-        return [summary(job) | batches.get(job.id, {"batch_id": None}) for job in jobs]
+        batches = self.client.store.batch_positions([job.id for job in jobs])
+        return [summary(job) | self._batch_fields(batches.get(job.id)) for job in jobs]
+
+    @staticmethod
+    def _batch_fields(found):
+        return {"batch_id": None} if found is None else {"batch_id": found[0], "batch_index": found[1]}
 
     def _job_ids(self, job_ids):
         if job_ids is None:
@@ -84,6 +77,32 @@ class AgentClient:
         if isinstance(job_ids, str) or not 1 <= len(job_ids) <= 100:
             raise ValueError("job_ids must contain between 1 and 100 IDs")
         return list(dict.fromkeys(self.client.store.resolve_ids(list(job_ids))))
+
+    @staticmethod
+    def _one_selection(job_ids, batch_id):
+        if (job_ids is None) == (batch_id is None):
+            raise ValueError("Select either job IDs or a batch")
+
+    def _selected(self, job_ids, batch_id, *, states=None) -> list[str]:
+        """IDs of the named jobs (prefixes allowed; one ID may be a string) or a batch's, in some states."""
+        self._one_selection(job_ids, batch_id)
+        job_ids = self._job_ids([job_ids] if isinstance(job_ids, str) else job_ids)
+        _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, states=states, limit=-1)
+        return [job.id for job in jobs]
+
+    @staticmethod
+    def _states(states):
+        if states is None:
+            return None
+        if isinstance(states, str) or not states or not set(states) <= set(get_args(JobState)):
+            raise ValueError("states must be a nonempty list or set of valid job states")
+        return sorted(set(states))
+
+    @staticmethod
+    def _resource(resource):
+        if resource not in (None, "cpu", "gpu"):
+            raise ValueError("resource must be cpu or gpu")
+        return resource
 
     def _batch_status(self, batch):
         return self.status(batch_id=batch.id) | {"replayed": batch.replayed}
@@ -103,22 +122,22 @@ class AgentClient:
             value["error"] = short(health["error"])
         return value
 
-    def status(self, job_ids=None, *, batch_id=None, states=None, limit=20, offset=0):
+    def status(
+        self, job_ids=None, *, batch_id=None, states=None, account=None, resource=None, limit=20, offset=0
+    ):
         """Read local state only. Page size is bounded; counts cover the whole selection.
 
         A batch lists in submission order; other selections list the newest jobs first, so a new
-        conversation sees current work on the first page.
+        conversation sees current work on the first page. account and resource ("cpu" or "gpu")
+        narrow any selection.
         """
         _page_bounds(limit, offset)
-        job_ids = self._job_ids(job_ids)
-        if states is not None:
-            if isinstance(states, str) or not states or not set(states) <= set(get_args(JobState)):
-                raise ValueError("states must be a nonempty list or set of valid job states")
-            states = sorted(set(states))
         counts, jobs = self.client.store.page(
-            job_ids=job_ids,
+            job_ids=self._job_ids(job_ids),
             batch_id=batch_id,
-            states=states,
+            states=self._states(states),
+            account=account and self.client.config.account(account).id,
+            pool=self._resource(resource),
             limit=limit,
             offset=offset,
             newest_first=batch_id is None,
@@ -160,10 +179,8 @@ class AgentClient:
         when live; discovery gives each account's check age. resource "cpu" or "gpu" keeps runs
         holding that pool. A discovered run of unknown resource holds both, as the worker counts it.
         """
-        if resource not in (None, "cpu", "gpu"):
-            raise ValueError("resource must be cpu or gpu")
         view = CapacityView(self.client, live=live, account=account)
-        runs = view.runs(resource)
+        runs = view.runs(self._resource(resource))
         return dict(
             schema_version=1,
             resource=resource,
@@ -173,6 +190,45 @@ class AgentClient:
             runs=runs,
             discovery={account.id: view.checked(account.id) for account in view.accounts},
             worker=self.health(),
+        )
+
+    def overview(self, *, limit=10):
+        """The whole picture in one local call: the worker, jobs by state and account, each account's
+        slots and GPU time, what holds the slots, and up to limit jobs waiting on someone.
+        """
+        _page_bounds(limit)
+        view = CapacityView(self.client)
+        rows = view.account_rows()
+        by_account = self.client.store.counts_by_account()
+        runs = view.runs()
+        waiting, jobs = self.client.store.attention(limit)
+        counts = {}
+        for states in by_account.values():
+            for state, count in states.items():
+                counts[state] = counts.get(state, 0) + count
+        return dict(
+            schema_version=1,
+            worker=self.health(),
+            jobs=dict(total=sum(counts.values()), counts=counts),
+            accounts=[row | {"jobs": by_account.get(row["id"], {})} for row in rows],
+            totals=view.totals(rows),
+            running=dict(total=len(runs), counts=view.counts(runs)),
+            attention=dict(total=waiting, jobs=self._jobs(jobs)),
+        )
+
+    def cleanup(self, *, older_than_days=7, include_snapshots=False, account=None, local=True, limit=20):
+        """What this runner left behind and what could be deleted; reports only, deleting is the user's call.
+
+        Asks the providers for their listings, so it is not local; account limits that to one
+        account (local=False leaves the state directory out).
+        """
+        _page_bounds(limit)
+        return self.client.cleanup(
+            older_than_days=older_than_days,
+            include_snapshots=include_snapshots,
+            accounts=None if account is None else [account],
+            local=local,
+            limit=limit,
         )
 
     def runtime(self, job_id):
@@ -220,12 +276,19 @@ class AgentClient:
             private=True,
         )
 
-    def retry(self, job_id, *, request_key, account=None):
-        """Queue a finished or blocked job's saved code as a new job, on its account unless one is given."""
+    def retry(self, job_ids=None, *, request_key, account=None, batch_id=None, states=None):
+        """Queue finished or blocked jobs' saved code as new jobs, on their accounts unless one is given.
+
+        Select one job, several, or a batch's jobs in some states (such as failed); they are
+        queued together as one new batch, or not at all.
+        """
         if request_key is None:
             raise ValueError("request_key is required for agent retries")
-        job_id = self.client.store.resolve_id(job_id)
-        return self._batch_status(self.client.retry_batch(job_id, request_key=request_key, account=account))
+        job_ids = self._selected(job_ids, batch_id, states=self._states(states))
+        if not job_ids:
+            raise ValueError("No job in the selection to rerun")
+        batch = self.client.retry_jobs(job_ids, request_key=request_key, account=account)
+        return self._batch_status(batch)
 
     def continue_run(self, job_id, *, request_key, account=None):
         """Resume a stopped resumable job from its downloaded checkpoint as the next run of its experiment."""
@@ -242,8 +305,7 @@ class AgentClient:
         rejected. transfer allows copying datasets the account cannot read, also for jobs already there.
         """
         _page_bounds(limit)
-        if (job_ids is None) == (batch_id is None):
-            raise ValueError("Select either job IDs or a batch")
+        self._one_selection(job_ids, batch_id)
         job_ids = self._job_ids(job_ids)
         target = self.client.config.account(account).id
         _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
@@ -259,13 +321,23 @@ class AgentClient:
         value = self.status(job_ids, batch_id=batch_id, limit=limit) | {"moved": moved}
         return value | {"not_moved": rejected} if rejected else value
 
-    def cancel(self, job_id):
-        """Cancel pending work locally, or ask the provider to stop a running job; repeating is harmless."""
-        job_id = self.client.store.resolve_id(job_id)
-        job = self.client.get(job_id)
-        if job.state != "cancelled":
-            self.client.cancel(job_id)
-        return self.status([job_id])
+    def cancel(self, job_ids=None, *, batch_id=None, limit=20):
+        """Cancel pending work locally, or ask the provider to stop running jobs; repeating is harmless.
+
+        One job's failure is an error. For several jobs, or a batch (whose finished jobs are left
+        alone), not_cancelled lists the jobs that could not be cancelled.
+        """
+        _page_bounds(limit)
+        selected = self._selected(job_ids, batch_id)
+        if batch_id is not None:
+            selected = [job_id for job_id in selected if not self.client.get(job_id).terminal]
+        result = self.client.cancel_many(selected)
+        if result["failed"] and len(selected) == 1 and batch_id is None:
+            raise ValueError(next(iter(result["failed"].values())))
+        value = self.status(job_ids=selected if batch_id is None else None, batch_id=batch_id, limit=limit)
+        value["cancelled"] = len(result["cancelled"])
+        failed = [{"id": job_id, "error": short(message)} for job_id, message in result["failed"].items()]
+        return value | {"not_cancelled": failed} if failed else value
 
     def changes(self, *, after=0, batch_id=None, limit=20):
         """Latest state per changed job, coalesced. Drain has_more before waiting again.
@@ -287,54 +359,14 @@ class AgentClient:
         )
 
     def logs(self, job_id, *, tail=50, max_bytes=8192, refresh=False):
-        """Cache full logs privately on disk; return at most tail lines and max_bytes UTF-8 bytes.
-
-        An unfinished job gets a bounded live snapshot on every call (live=True). For a
-        finished job, first use, refresh=True, or a cache saved before it finished makes one
-        remote read (never follows a stream). Other cached reads work offline.
-        Cache replacement is atomic even on fetch failure.
-        """
+        """At most tail lines and max_bytes UTF-8 bytes of a job's log, cached privately (see LogCache)."""
         if type(tail) is not int or not 1 <= tail <= 500:
             raise ValueError("tail must be an integer between 1 and 500")
         if type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
             raise ValueError("max_bytes must be an integer between 1 and 65536")
         job_id = self.client.store.resolve_id(job_id)
-        job = self.client.get(job_id)
-        path = self.client.config.state_dir / "logs" / f"{job_id}.log"
-        live = job.remote_ref is not None and not job.terminal
-        fetched = (
-            refresh
-            or live
-            or not path.exists()
-            or (job.finished_at is not None and path.stat().st_mtime < job.finished_at)
-        )
-        if fetched:
-            atomic_write(
-                path,
-                (chunk.encode() for chunk in self.client.logs(job_id, follow=False)),
-                check_space=True,
-            )
-        with path.open("rb") as stream:
-            stat = os.fstat(stream.fileno())
-            stream.seek(max(0, stat.st_size - max_bytes))
-            data = stream.read(max_bytes)
-        # Drops undecodable bytes (e.g. a code point split at the leading byte boundary).
-        # Lines split on "\n" only, so "\r" progress-bar updates do not consume the tail.
-        decoded = data.decode("utf-8", errors="ignore")
-        text = "".join(re.findall(r"[^\n]*\n|[^\n]+", decoded)[-tail:])
-        size = len(text.encode("utf-8"))
-        return dict(
-            schema_version=1,
-            id=job_id,
-            text=text,
-            bytes=size,
-            total_bytes=stat.st_size,
-            truncated=size < stat.st_size,
-            path=str(path),
-            fetched=fetched,
-            cached_at=stat.st_mtime,
-            live=live,
-        )
+        found = LogCache(self.client).tail(job_id, lines=tail, max_bytes=max_bytes, refresh=refresh)
+        return dict(schema_version=1, **found)
 
     def wait(self, job_ids=None, *, batch_id=None, timeout=300, downloads=True, limit=20):
         """Block until every selected job settles or timeout seconds pass; a timeout is not an error.
@@ -345,8 +377,7 @@ class AgentClient:
         _page_bounds(limit)
         if type(timeout) not in (int, float) or not 0 <= timeout <= 86400:
             raise ValueError("timeout must be between 0 and 86400 seconds")
-        if (job_ids is None) == (batch_id is None):
-            raise ValueError("Select either job IDs or a batch")
+        self._one_selection(job_ids, batch_id)
         job_ids = self._job_ids(job_ids)
         started = time.monotonic()
         _, done = self.client.wait_many(job_ids, batch_id=batch_id, timeout=timeout, downloads=downloads)

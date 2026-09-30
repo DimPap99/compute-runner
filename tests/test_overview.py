@@ -105,3 +105,39 @@ def test_discovery_saved_by_an_older_worker_still_loads(tmp_path):
     assert found["kaggle:tester"].runs == {"tester/k": "gpu"} and found["kaggle:tester"].known
     assert found["kaggle:tester"].devices == [] and found["kaggle:tester"].gpu_refresh_at is None
     assert not found["kaggle:other"].known
+
+
+def test_overview_answers_in_one_bounded_call(two_accounts):
+    client, home, other, spec = two_accounts
+    client.config.failover = "ask"
+    gpu = spec.model_copy(update={"gpu": True})
+    first, waiting = client.submit(gpu), client.submit(gpu)
+    home.push_error = None
+    client.worker().tick()
+    blocked = client.submit(spec.model_copy(update={"datasets": ["nobody/missing"]}))
+    home.unreadable = other.unreadable = {"nobody/missing"}
+    client.worker().tick()
+    result = client.agent().overview(limit=1)
+    assert result["jobs"]["total"] == 3 and result["jobs"]["counts"]["remote_queued"] == 1
+    tester = {row["id"]: row for row in result["accounts"]}["kaggle:tester"]
+    assert tester["jobs"] == {"remote_queued": 1, "queued": 1, "blocked": 1} and tester["gpu"]["free"] == 0
+    assert result["running"] == {"total": 1, "counts": {"cpu": 0, "gpu": 1, "unknown": 0}}
+    # The blocked job and the job other could start both wait on someone; the newest is shown.
+    assert result["attention"]["total"] == 2 and [job["id"] for job in result["attention"]["jobs"]] == [
+        blocked.id
+    ]
+    assert (
+        client.get(waiting.id).suggested_account == "kaggle:other"
+        and client.get(first.id).state == "remote_queued"
+    )
+
+
+def test_status_narrows_to_an_account_and_a_resource(two_accounts):
+    client, home, other, spec = two_accounts
+    client.submit(spec)
+    client.submit(spec.model_copy(update={"gpu": True}))
+    client.submit(spec, account="kaggle:other")
+    agent = client.agent()
+    assert agent.status(account="KAGGLE:TESTER")["total"] == 2
+    assert agent.status(account="kaggle:tester", resource="gpu")["total"] == 1
+    assert agent.status(resource="cpu")["counts"] == {"queued": 2}
