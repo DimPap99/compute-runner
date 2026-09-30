@@ -4,15 +4,30 @@
 
 ```bash
 .venv/bin/pytest -q
-.venv/bin/ruff check src tests
-.venv/bin/python -m compileall -q src
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
 ```
+
+Ruff enforces PEP 8 (pycodestyle), bugbear checks, import order and a McCabe complexity of at most 10 per function; split a function rather than raising the limit.
+
+### Code layout
+
+| Where | What |
+| --- | --- |
+| `models.py` | Job specifications and records, and job lifecycle rules (`JobRecord.outstanding`, `movable`, `settled()`, `pool`) |
+| `store.py` | The queue database: transactions, filters, events |
+| `client.py`, `agent.py` | The Python API, and its bounded JSON form for agents |
+| `views.py`, `logcache.py`, `cleanup.py` | Read views across accounts, the log cache, and cleanup planning |
+| `worker/` | The scheduler, one class per responsibility: `capacity` (the admission rule, shared with the views), `datasets`, `preparation`, `submission`, `polling`, `dispatch`, `downloads`, and `loop` (the `Worker`) |
+| `providers/` | `base.Provider` and the adapters: `kaggle/` (client, bundles, notebooks, provider) and `ssh.py` with its remote helper `ssh_remote.py` |
+| `cli/` | The command line by topic, the agent commands (`cli/agent.py`), and shared options and output |
+| `runtime.py` | The standard-library bootstrap copied into every launch package |
 
 Tests use a Kaggle adapter with simulated network calls and local execution of generated launchers, and run the SSH adapter with its commands and SFTP served locally. `KGR_TEST_SSH=user@host:port` with `KGR_TEST_SSH_KEY` (and `KGR_TEST_SSH_CONFIG_DIR` holding a `known_hosts` that trusts the machine) also runs a job on a real SSH machine and removes its work directory afterwards. They cover scheduling, restart recovery, submission ambiguity, batch transactions, idempotency, cursor pagination, packaging, downloads, and CLI behavior. Automated tests do not create remote resources.
 
 ### Adding a provider
 
-The queue talks to providers only through the `Provider` protocol in `src/compute_runner/providers/__init__.py`, one instance per account; `connect()` chooses the adapter by `Account.provider`. An adapter:
+The queue talks to providers only through the abstract `Provider` class in `src/compute_runner/providers/base.py`, one instance per account. An adapter subclasses it and gets one entry in `ADAPTERS` in `providers/__init__.py`, which `connect()` looks up by `Account.provider`. The base class supplies launch naming (`launch_name`), attempt folders (`attempt_folder`) and the inputs that travel as bundles (`bundled_inputs`). An adapter implements:
 
 | Method | Contract |
 | --- | --- |
@@ -25,6 +40,16 @@ The queue talks to providers only through the `Provider` protocol in `src/comput
 | `status(ref)` | Return a state of `queued`, `running`, `cancelling`, `succeeded`, `failed`, or `cancelled` (or `None`), the raw provider state, and an error |
 | `download(ref, sink)` | Give the run's log and files to an output sink, which decides what to fetch and where it goes |
 | `url`, `cancel`, `active_runs`, `quota`, `logs`, `live_log` | Links, cancellation, capacity discovery, quota (GPU `available_seconds: None` means no time limit), and logs |
+
+Hooks with defaults, which an adapter overrides where its provider can do more:
+
+| Hook | Default |
+| --- | --- |
+| `bundles_for(job)` | Upload local inputs, and the source of a project (Kaggle embeds small projects instead) |
+| `inventory()` | Runs and GPU time from `active_runs()` and `quota()` (SSH adds GPU models) |
+| `diagnose()` | Quota and active runs, for `doctor` (SSH adds machine checks) |
+| `runtime(ref)`, `input_status(job)` | Not available (Kaggle reports saved accelerator settings and dataset states) |
+| `artifacts()`, `delete_artifact(artifact)` | Nothing to clean up (Kaggle and SSH list and remove only what the runner made) |
 
 `providers/launch.py` builds the runtime configuration and launcher that every adapter ships; `providers/ssh.py` is the second adapter and a compact example. The reference returned by `stage` is saved before `submit` runs, so an interrupted submission is reconciled through `status` rather than launched twice. Workloads read the provider-neutral `KGR_*` runtime variables; `providers/downloads.py` verifies outputs exposed as signed HTTPS URLs.
 

@@ -7,7 +7,7 @@ description: "Submit and monitor workloads with the local Compute Runner queue o
 
 Jobs run on accounts the user has connected: Kaggle accounts such as `kaggle:alice`, and machines reached over SSH such as `ssh:lab`. Commands and responses are the same on both. `compute-runner agent accounts` lists them. On an SSH account, submit with `--internet` (the machine cannot block network access, and a job without it is refused), use `--gpu` without an accelerator ID, and give data already on the machine as `--input data=ssh:/path/on/machine` instead of uploading it; submission records it as `ssh:NAME:/path`, and a job elsewhere uses it only as a copy the user approves.
 
-Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent status`, which lists the newest jobs first.
+Run `compute-runner agent ...` from any shell; if `compute-runner` is not on PATH, use `~/compute-runner/.venv/bin/compute-runner`. Each command prints one JSON object with `schema_version: 1`; a failure prints `{"error": ...}` and exits 1. `compute-runner agent --help` lists the commands. Job state lives on disk outside the current repository, so a new conversation can recover it with `compute-runner agent overview`, one call for the whole picture, and `compute-runner agent status`, which lists the newest jobs first.
 
 ## Let the application do its work
 
@@ -15,16 +15,16 @@ Everything the application offers goes through `compute-runner` commands: packag
 
 | Action | Commands | When |
 | --- | --- | --- |
-| Read state | `agent status`, `changes`, `accounts`, `outputs`, `health`, `wait`, `logs`, `submit --dry-run` | Freely. All are local except `logs`, which can read the provider |
+| Read state | `agent overview`, `status`, `changes`, `accounts`, `running`, `outputs`, `health`, `wait`, `logs`, `cleanup`, `submit --dry-run` | Freely. All are local except `logs` and `cleanup`, which read the providers |
 | Queue requested work | `agent submit` | For work the user asked to run. It spends the account's compute; enable `--gpu` or `--internet` only when the workload needs them |
 | Start processing | `compute-runner service start` | When `worker.running` is false and the user's request needs the queue to progress |
 | Choose or change account | `--account` on `submit`/`retry`/`continue`, `agent move` | See [Accounts](#accounts) |
 | Copy a dataset to another account | `agent move --transfer` | Only after the user approves the copy |
-| Rerun | `agent retry` | Only when the user wants a rerun |
+| Rerun | `agent retry`, also `--batch BATCH_ID --state failed` | Only when the user wants a rerun |
 | Continue a stopped resumable run | `agent continue` | When the user wants it continued |
-| Stop work | `agent cancel` | Only work the user wants stopped |
+| Stop work | `agent cancel JOB_ID...` or `--batch BATCH_ID` | Only work the user wants stopped |
 | Change the user's files | Workload code, a workload YAML | Only after the user approves the change; see below |
-| User decisions | `init`, `service install`/`stop`/`restart`, `account remove`, `resolve --not-submitted` | Only when the user explicitly asks |
+| User decisions | `init`, `service install`/`stop`/`restart`, `account remove`, `resolve --not-submitted`, `cleanup --delete` | Only when the user explicitly asks |
 | Accounts and credentials | `account add`, the credentials file, host keys | Never. The user sets these up |
 
 **The user's code.** Change workload code, or add a file to the user's project, only with the user's permission, and say what you will change before you do. This covers adding checkpointing for a resumable job and writing a workload YAML. Submit the workload as it is first: the application checks, packages and ships it. Propose a code change only when the application reports a problem. That means a submission that is refused, a job that is `blocked`, or a run that `failed` with its log pointing at the code. Show the user the error and the fix you suggest, and change the code once they agree. Then submit it again through the application. Do not edit code in advance to work around a problem the application has not reported.
@@ -46,7 +46,7 @@ Do not ask this question for a stateless workload that has no meaningful progres
 
 ## Accounts
 
-`compute-runner agent accounts` lists the accounts in preference order (the first is the default), the `failover` policy, CPU/GPU slots in use per account, and the last known `gpu_quota_seconds` (`gpu_quota_limited: false` marks SSH machines, which have no GPU time limit; otherwise null means not checked yet). It makes no remote calls. Check it before GPU work or when choosing where to run.
+`compute-runner agent accounts` lists the accounts in preference order (the first is the default), the `failover` policy, CPU/GPU slots `used`, `limit` and `free` per account (free is what the worker would start now; null while unknown), the last known `gpu_quota_seconds` (`gpu_quota_limited: false` marks SSH machines, which have no GPU time limit; otherwise null means not checked yet) and `gpu_refresh_at`, and `totals` over every account. It makes no remote calls. Check it before GPU work or when choosing where to run. `compute-runner agent running` lists what holds the slots, including runs started outside this queue (no `job_id`).
 
 Omit `--account` to use the default. Pass another account to `agent submit` or `agent retry` when the user named or approved it; with `failover: auto` you may also pick one that `agent accounts` shows with free slots.
 
@@ -96,7 +96,10 @@ RESULTS/NAME/
 
 ## Observe efficiently
 
+Start with one call for the whole picture: worker health, job counts by state and account, each account's free slots and GPU time, what runs, and up to ten jobs waiting on someone (`attention`). Then look closer only where it points:
+
 ```bash
+compute-runner agent overview
 compute-runner agent status --batch BATCH_ID
 compute-runner agent changes --batch BATCH_ID --after 0
 compute-runner agent changes --batch BATCH_ID --after RETURNED_CURSOR
@@ -105,7 +108,7 @@ compute-runner agent wait --batch BATCH_ID --timeout 300
 compute-runner agent outputs JOB_ID
 ```
 
-Status contains counts for the whole selection and at most 20 job summaries. Follow `next_offset` with `status --offset N` only when more rows are needed. Use `status ID1 ID2` to inspect several jobs at once, or repeat `--state` to filter states.
+Status contains counts for the whole selection and at most 20 job summaries. Follow `next_offset` with `status --offset N` only when more rows are needed. Use `status ID1 ID2` to inspect several jobs at once, repeat `--state` to filter states, and narrow with `--account ID` or `--resource gpu`.
 
 Changes coalesces events to the latest state of each changed job. Continue from `cursor`, draining `has_more` pages before waiting. Keep a separate cursor for each state directory and batch filter; after losing it, restart from 0. An empty `jobs` list means nothing changed.
 
@@ -125,4 +128,6 @@ To continue a stopped resumable run, use `compute-runner agent continue JOB_ID -
 
 `needs_attention` means a remote submission is uncertain, or the provider no longer knows a run it accepted (for example, a deleted notebook). Give the user the recorded `url` to inspect; do not retry, and do not generate new keys to bypass the uncertainty. Only the user can assert that no run exists, with `compute-runner resolve JOB_ID --not-submitted`; a retry is possible after that.
 
-`compute-runner agent cancel JOB_ID` cancels pending work locally, or asks the provider to stop a running job. The job then shows `reason: Cancellation requested on ACCOUNT` until it becomes `cancelled`, and its partial outputs are still collected. A job still queued on the provider is removed before it starts and becomes `cancelled` at once, with `reason: Cancelled before it started on ACCOUNT`. On Kaggle, a job that is starting but has not logged its session yet cannot be cancelled; try again a few seconds later. The queue starts jobs as capacity becomes available; timed or recurring schedules are not implemented.
+`compute-runner agent cancel JOB_ID` cancels pending work locally, or asks the provider to stop a running job; several IDs or `--batch BATCH_ID` cancel together, and `not_cancelled` lists any that could not be. The job then shows `reason: Cancellation requested on ACCOUNT` until it becomes `cancelled`, and its partial outputs are still collected. A job still queued on the provider is removed before it starts and becomes `cancelled` at once, with `reason: Cancelled before it started on ACCOUNT`. On Kaggle, a job that is starting but has not logged its session yet cannot be cancelled; try again a few seconds later. The queue starts jobs as capacity becomes available; timed or recurring schedules are not implemented.
+
+`compute-runner agent cleanup` reports what the runner left behind (launch notebooks, bundle datasets, SSH run folders, local staging and snapshots) and what could be deleted, with sizes and reasons. It deletes nothing. When the user wants the space back, tell them to run `compute-runner cleanup --delete`; deleting is their decision.

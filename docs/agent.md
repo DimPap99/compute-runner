@@ -3,20 +3,28 @@
 `compute-runner agent` returns one compact JSON object per operation. It does not require `--json`. Responses omit source manifests, full specifications, and environment values. The background worker performs polling and downloads without model calls.
 
 ```bash
+compute-runner agent overview
 compute-runner agent submit examples/batch.yaml --request-key experiment-v1 --dry-run
 compute-runner agent submit examples/batch.yaml --request-key experiment-v1
 compute-runner agent status --batch BATCH_ID
 compute-runner agent status JOB_ID_1 JOB_ID_2
 compute-runner agent status --state running --state failed
+compute-runner agent status --account kaggle:alice --resource gpu
 compute-runner agent changes --batch BATCH_ID --after 0
 compute-runner agent logs JOB_ID --tail 50 --max-bytes 8192
 compute-runner agent wait --batch BATCH_ID --timeout 300
 compute-runner agent outputs JOB_ID
 compute-runner agent continue JOB_ID --request-key continue-1
 compute-runner agent accounts
+compute-runner agent running --resource gpu
 compute-runner agent move JOB_ID --account kaggle:bob
+compute-runner agent cancel --batch BATCH_ID
+compute-runner agent retry --batch BATCH_ID --state failed --request-key rerun-failed-v1
+compute-runner agent cleanup
 compute-runner agent health
 ```
+
+`agent overview` is the place to start. In one local call it returns the worker's health, job counts by state (overall, and per account under each account's `jobs`), each account's slots, free slots and GPU time with `totals`, how many runs hold slots (`running`, with `counts` by resource), and `attention`: how many jobs wait on someone (blocked, needing attention, with failed downloads, or pending with a `suggested_account`) and the newest of them, at most `--limit` (default 10).
 
 `--dry-run` returns aggregate file sizes, file counts, and resource counts without queueing jobs. The response includes `total`, `experiment_dirs`, `files`, `bytes`, `gpu_jobs`, `internet_jobs`, and `private`. Use the standard `compute-runner submit --dry-run` command for individual filenames.
 
@@ -32,19 +40,26 @@ Retries use the original saved files:
 
 ```bash
 compute-runner agent retry JOB_ID --request-key experiment-retry-v1
+compute-runner agent retry --batch BATCH_ID --state failed --request-key rerun-failed-v1
 ```
+
+A retry of several jobs, or of a batch's jobs in the given states, queues them as one new batch, or none when one of them cannot be rerun.
 
 `agent submit`, `agent retry` and `agent continue` accept `--account`. An explicit account is part of the request, so a replay must repeat it; requests without one keep their original fingerprint.
 
 ## Accounts
 
-`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used`, `limit`, and `free`: slots a new job could take now, null while the account's runs are unknown), `gpu_quota_limited` (false on SSH machines, which have no GPU time limit), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check (null when not checked yet), and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered.
+`agent accounts` reads local state only. It returns `failover`, `default`, and for each account in preference order: `id`, `provider`, `cpu` and `gpu` (`used`, `limit`, and `free`: slots a new job could take now, null while the account's runs are unknown), `gpu_quota_limited` (false on SSH machines, which have no GPU time limit), `gpu_quota_seconds` and `checked_age_seconds` from the worker's last check (null when not checked yet), `gpu_refresh_at` (when Kaggle restores GPU time) and `devices` (an SSH machine's GPU models) when known, and `error` when that check failed. `used` counts this queue's runs and other runs the worker discovered; `free` applies the worker's own admission rule. `totals` adds up `cpu` and `gpu` and `gpu_quota_seconds` over every account; `complete` is false while some account is unknown, so the sums are lower bounds.
+
+`agent running` lists the runs holding each account's slots: this queue's jobs (`job_id`, `name`, `state`, `elapsed_seconds`, `url`), then runs started elsewhere, which have no `job_id`. `--resource cpu` or `gpu` keeps runs holding that pool, and a discovered run of unknown resource holds both. `discovery` gives each account's check age and error.
+
+`agent cleanup` reports what the runner left behind on each account and in the state directory: `totals` by verdict (`reclaimable`, `kept`, `unknown`), `by_location`, and the reclaimable `items` with the reason each may go. It asks the providers for their listings (`--no-remote` skips them). It never deletes; deleting is the user's decision, with `compute-runner cleanup --delete`.
 
 `agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it.
 
 ## Status and pagination
 
-Status, submit, retry, and cancel responses contain `schema_version`, `batch_id`, `total`, `counts`, `jobs`, `next_offset`, and `worker`. Submit and retry also return `replayed`.
+Status, submit, retry, and cancel responses contain `schema_version`, `batch_id`, `total`, `counts`, `jobs`, `next_offset`, and `worker`. Submit and retry also return `replayed`. Cancel also returns `cancelled`, and `not_cancelled` when some of several selected jobs could not be cancelled; a single job's failure is an error. `agent cancel --batch` leaves the batch's finished jobs alone.
 
 The default page size is 20 jobs, with a maximum of 100. A batch is listed in submission order; any other selection lists the newest jobs first. `counts` and `total` cover the full selection. Follow `next_offset` until it is null:
 
@@ -146,7 +161,8 @@ cursor = page["cursor"]
 | --- | --- |
 | `submit(specs, request_key=..., account=None)` | Batch status and replay flag |
 | `preview(specs, account=None)` | Aggregate upload inventory |
-| `status(job_ids=None, batch_id=None, states=None, limit=20, offset=0)` | Paginated job summaries and counts |
+| `overview(limit=10)` | Worker, job counts, accounts with totals, runs holding slots, and jobs waiting on someone |
+| `status(job_ids=None, batch_id=None, states=None, account=None, resource=None, limit=20, offset=0)` | Paginated job summaries and counts |
 | `changes(after=0, batch_id=None, limit=20)` | Changed jobs and the next event cursor |
 | `logs(job_id, tail=50, max_bytes=8192, refresh=False)` | Bounded text and cache metadata |
 | `wait(job_ids=None, batch_id=None, timeout=300, downloads=True, limit=20)` | Status once the selection settles or the timeout passes |
@@ -154,9 +170,10 @@ cursor = page["cursor"]
 | `accounts(live=False)` | Accounts, failover policy, slots in use and free, and last known GPU quota |
 | `running(resource=None, account=None, live=False)` | Runs holding each account's slots, including runs started elsewhere (no `job_id`), and each account's discovery age |
 | `move(job_ids=None, batch_id=None, account=..., transfer=False, limit=20)` | Status of the selection and the number moved |
-| `retry(job_id, request_key=..., account=None)` | Retry batch status and replay flag |
+| `retry(job_ids=None, request_key=..., account=None, batch_id=None, states=None)` | Retry batch status and replay flag; one job, several, or a batch's jobs in some states |
 | `continue_run(job_id, request_key=..., account=None)` | Continuation batch status and replay flag |
-| `cancel(job_id)` | Updated job status. Repeated cancellation of a cancelled job is accepted |
+| `cancel(job_ids=None, batch_id=None, limit=20)` | Updated status with `cancelled`; repeated cancellation of a cancelled job is accepted |
+| `cleanup(older_than_days=7, include_snapshots=False, account=None, local=True, remote=True, limit=20)` | Cleanup report; never deletes |
 | `health()` | Worker lock and heartbeat summary |
 
 Agent methods return JSON-compatible dictionaries and raise Python exceptions on errors. CLI responses use `schema_version: 1`. Handled operation errors return a JSON `error` and exit status 1. Argument parsing and startup failures use the standard CLI error output.

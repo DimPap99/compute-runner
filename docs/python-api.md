@@ -37,12 +37,15 @@ print(finished.state, finished.download_state, finished.result_dir)
 | `download(job_id)` | Collect outputs from a submitted job whose execution has terminated |
 | `retry(job_id, request_key=None, account=None)` | Create a job from the original saved files and settings, on the original account unless one is given |
 | `retry_batch(job_id, request_key=None, account=None)` | Create a retry and return its single-job batch |
+| `retry_jobs(job_ids, request_key=None, account=None)` | Rerun several jobs as one batch, or none when one of them cannot be rerun |
 | `continue_run(job_id, request_key=None, account=None)` | Continue a stopped resumable run from its verified checkpoint as the next run of its experiment |
 | `continue_batch(job_id, request_key=None, account=None)` | Create a continuation and return its single-job batch |
 | `move(job_id, account, transfer=False)` | Place a job that has not been submitted on another account; `transfer` allows copying datasets it cannot read |
 | `cancel(job_id)` | Cancel pending work locally, or ask the provider to stop a running job |
+| `cancel_many(job_ids)` | Cancel each job; returns `cancelled` and the `failed` ones with their errors |
 | `resolve_not_submitted(job_id)` | Record an operator's confirmation that a job needing attention has no remote execution |
 | `quota(account=None)` | Query one account's accelerator quota, or every account's |
+| `cleanup(older_than_days=7, include_snapshots=False, accounts=None, local=True, delete=False, limit=None)` | Report what the runner left behind and what may go; `delete=True` removes it (see [Cleanup](operations.md#cleanup)) |
 | `provider(account=None)` | Return the provider adapter for an account |
 | `worker_health()` | Read worker lock ownership and heartbeat data |
 | `worker()` | Construct a worker for this configuration |

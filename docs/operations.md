@@ -4,19 +4,46 @@
 
 `compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](accounts.md). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, results folder, dataset copies and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration, where each account's login comes from and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
 
-Two tables show what every account is doing:
-
-```bash
-compute-runner running              # runs holding CPU and GPU slots on every account
-compute-runner running gpu --account kaggle:alice
-compute-runner gpus                 # GPU slots in use and free, GPU time left, and totals
-```
-
-`running` lists this queue's submitted jobs with their notebook or run folder, type, state and time since launch, followed by runs started outside this queue (such as a notebook run on Kaggle's website), marked `(external)`. A run whose type discovery could not tell holds both CPU and GPU slots, so both filters show it. `gpus` shows, for each account, the GPU slots in use, how many a new job could take now (none once the account's GPU time is spent), the GPU time left, and when the worker last checked. Totals read `>=` while an account is unknown. Both commands read the worker's last [discovery](#worker-configuration), which it refreshes only while it has jobs to place, and say when that is old or failed. `--live` asks every provider now instead; on Kaggle this costs a request per notebook run in the last 24 hours.
-
 The worker runs as a `systemd --user` service, or in a terminal without systemd; local process locking uses `fcntl`. The service must be able to authenticate without an interactive shell, so keep credentials in the [credentials file](accounts.md#credentials) or Kaggle's standard locations. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
 
 Submission writes to the local queue; a running worker is required to upload and launch jobs. CLI job IDs may be unambiguous prefixes; batch IDs must be complete. The standard CLI prints full records as JSON with the global `--json` option (`compute-runner --json status JOB_ID`); use `compute-runner agent` for bounded responses intended for automation.
+
+## Looking across jobs and accounts
+
+```bash
+compute-runner list gpu --account kaggle:alice --active   # filter jobs: resource, account, state
+compute-runner list --state failed --limit 20             # the newest 20 failed jobs
+compute-runner running                                    # runs holding CPU and GPU slots on every account
+compute-runner running gpu --watch                        # redraw every polling interval until Ctrl-C
+compute-runner gpus                                       # GPU slots, GPU time left and when it resets
+compute-runner account list                               # CPU and GPU slots of every account, with totals
+compute-runner logs JOB_ID --tail 50                      # the end of a run's log
+```
+
+`running` lists this queue's submitted jobs with their notebook or run folder, type, state and time since launch, followed by runs started outside this queue (such as a notebook run on Kaggle's website), marked `(external)`. A run whose type discovery could not tell holds both CPU and GPU slots, so both filters show it. `gpus` shows, for each account, the GPU slots in use, how many a new job could take now (none once the account's GPU time is spent), the GPU time left, when Kaggle restores it, the GPU models of SSH machines, and when the worker last checked. `account list` shows the same for CPU and GPU slots. Totals read `>=` while an account is unknown. These views apply the worker's own admission rule, so a free slot is one the worker would use. They read the worker's last [discovery](#worker-configuration), which it refreshes only while it has jobs to place, and say when that is old or failed. `--live` asks every provider now instead; on Kaggle this costs a request per notebook run in the last 24 hours, so `running --watch --live` redraws at most once a minute.
+
+## Acting on several jobs
+
+```bash
+compute-runner cancel JOB_ID JOB_ID                       # several jobs
+compute-runner cancel --batch BATCH_ID                    # a batch's unfinished jobs
+compute-runner cancel --account kaggle:alice --state queued
+compute-runner retry --batch BATCH_ID --state failed      # rerun a batch's failures together
+```
+
+Cancelling more than one job asks for confirmation (`--yes` skips it) and lists the jobs that could not be cancelled. A retry of several jobs queues all of them as one batch, or none when one of them cannot be rerun.
+
+## Cleanup
+
+Nothing is removed automatically. `compute-runner cleanup` reports what the runner left behind: launch notebooks and bundle datasets on Kaggle, run folders and bundles on SSH machines, and the state directory's snapshots, staging folders, upload folders and log copies. Results folders are never touched.
+
+```bash
+compute-runner cleanup                       # report, with sizes and why each item stays or may go
+compute-runner cleanup --no-remote           # the state directory only, without remote calls
+compute-runner cleanup --older-than 30 --delete
+```
+
+An item may go once every job using it has finished, more than `--older-than` days ago (default 7), with its outputs downloaded or not wanted. A bundle shared with an unfinished job stays. Remote items this queue did not create are reported as unknown and never deleted, and a run still running on an SSH machine is refused. Local snapshots stay unless `--include-snapshots` is given, because `retry` and `continue` need them. `--delete` asks for confirmation (`--yes` skips it) and deletes only the items reported as reclaimable.
 
 ## Worker configuration
 
@@ -134,7 +161,7 @@ Output filters match remote relative paths such as `outputs/*.json`. Logs are co
 
 Execution and download states are separate. `succeeded` means the provider reported completion. `download_state=complete`, exposed as `outputs_ready: true` by the agent interface, means output collection completed. Downloads can be pending or failed after a successful computation.
 
-No automatic cleanup removes notebooks, datasets, SSH run folders, snapshots, logs, or results. Stop the worker before backing up or moving the complete state directory.
+No automatic cleanup removes notebooks, datasets, SSH run folders, snapshots, logs, or results; `compute-runner cleanup` reports what may go and deletes it on request (see [Cleanup](#cleanup)). Stop the worker before backing up or moving the complete state directory.
 
 ### Database upgrades
 

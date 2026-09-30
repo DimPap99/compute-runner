@@ -55,6 +55,7 @@ compute-runner logs JOB_ID --follow
 compute-runner wait JOB_ID
 compute-runner running gpu     # what holds each account's GPU slots, including runs started elsewhere
 compute-runner gpus            # GPU slots and time left on each account, and in total
+compute-runner cleanup         # what the runner left behind, and what may be deleted
 ```
 
 Submission writes to the local queue; the worker uploads and launches jobs. Add `--json` before a command for machine-readable output.
@@ -73,7 +74,7 @@ Any agent that can run shell commands can drive `compute-runner agent`, which pr
 | [Results](docs/results.md) | Run folders, `job.json` and `runs.md` |
 | [Agent interface](docs/agent.md) | JSON commands, request keys, pagination, change cursors, logs, the agent skill |
 | [Python API](docs/python-api.md) | `Client` and its methods |
-| [Operations](docs/operations.md) | Commands and settings, the worker, strict mode, failure handling, state files, upgrades |
+| [Operations](docs/operations.md) | Commands and settings, views across jobs and accounts, bulk actions, cleanup, the worker, strict mode, failure handling, state files, upgrades |
 | [Contributing](CONTRIBUTING.md) | Tests and adding a provider |
 
 ## Limitations
