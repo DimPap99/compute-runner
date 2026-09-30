@@ -6,17 +6,15 @@ import os
 import re
 import sqlite3
 import time
-from collections import Counter
-from dataclasses import asdict
 from typing import get_args
 
 import yaml
 
-from .models import ACTIVE, JobState
-from .providers import safe_message, short
+from .models import JobState
+from .providers import short
 from .results import RUN_RECORD, listed_outputs
 from .store import atomic_write
-from .worker import last_discovery, occupancy
+from .views import CapacityView
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
 ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
@@ -47,15 +45,6 @@ def summary(job):
     }.items():
         if item not in (None, "", {}):
             value[key] = item
-    return value
-
-
-def _checked(found, now):
-    """How old an account's last discovery is (None: never made), and why the latest one failed."""
-    checked = found.get("checked_at")
-    value = dict(checked_age_seconds=None if checked is None else max(0, round(now - checked)))
-    if found.get("error"):
-        value["error"] = short(found["error"])
     return value
 
 
@@ -145,64 +134,21 @@ class AgentClient:
             worker=self.health(),
         )
 
-    def _discovery(self, live=False, account=None):
-        """Configured accounts' runs, GPU seconds, check time and error, as the worker saves them.
-
-        From the worker's last check, or asked of each provider now when live (on Kaggle, a
-        request per notebook run in the last 24 hours). account keeps that account only.
-        """
-        accounts = [item.id for item in self.client.config.accounts if account in (None, item.id)]
-        if not live:
-            saved = last_discovery(self.client.config.state_dir)
-            return {account_id: saved.get(account_id) or {} for account_id in accounts}
-        # One at a time: Kaggle's client setup silences output by swapping the process's stdout.
-        found = {}
-        for account_id in accounts:
-            try:
-                current = self.client.provider(account_id).inventory()
-                found[account_id] = asdict(current) | {"checked_at": time.time()}
-            except ERRORS as error:  # One broken account must not hide the others.
-                found[account_id] = dict(error=safe_message(error))
-        return found
-
     def accounts(self, *, live=False):
-        """Configured accounts in preference order, with slots in use and free, and GPU quota left.
+        """Configured accounts in preference order, with slots in use and free, GPU time left, and totals.
 
         used counts this queue's runs and other runs discovered on the account; free is what a new
         job could take now, or None while the account's runs are unknown. Local only unless live,
         which asks every provider now instead of reading the worker's last check.
         """
-        config = self.client.config
-        found, now = self._discovery(live), time.time()
-        jobs = self.client.store.list(ACTIVE)
-        accounts = []
-        for account in config.accounts:
-            seen = found[account.id]
-            checked = _checked(seen, now)
-            known = checked["checked_age_seconds"] is not None and "error" not in checked
-            used = occupancy(jobs, account.id, seen.get("runs", {}))
-            quota = seen.get("gpu_seconds")
-            value = dict(id=account.id, provider=account.provider)
-            for pool in ("cpu", "gpu"):
-                limit = getattr(account, pool + "_limit")
-                # As the worker admits jobs: no GPU job starts once the GPU time is spent.
-                spent = pool == "gpu" and quota is not None and quota <= 0
-                free = None if not known else (0 if spent else max(0, limit - used[pool]))
-                value[pool] = dict(used=used[pool], limit=limit, free=free)
-            accounts.append(
-                value
-                | dict(
-                    # SSH machines have no GPU time limit; null elsewhere means not checked yet.
-                    gpu_quota_limited=account.provider != "ssh",
-                    gpu_quota_seconds=None if quota is None else round(quota),
-                )
-                | checked
-            )
+        view = CapacityView(self.client, live=live)
+        rows = view.account_rows()
         return dict(
             schema_version=1,
-            failover=config.failover,
-            default=accounts[0]["id"] if accounts else None,
-            accounts=accounts,
+            failover=self.client.config.failover,
+            default=rows[0]["id"] if rows else None,
+            accounts=rows,
+            totals=view.totals(rows),
             worker=self.health(),
         )
 
@@ -216,48 +162,16 @@ class AgentClient:
         """
         if resource not in (None, "cpu", "gpu"):
             raise ValueError("resource must be cpu or gpu")
-        selected = self.client.config.account(account).id if account else None
-        found, now = self._discovery(live, selected), time.time()
-        runs, ours = [], set()
-        for job in self.client.store.list(ACTIVE):
-            if not job.outstanding or selected not in (None, job.attempts[-1].account):
-                continue
-            attempt = job.attempts[-1]
-            ours.add((attempt.account, attempt.ref.lower()))
-            run = dict(
-                account=attempt.account,
-                ref=attempt.ref,
-                resource=job.pool,
-                job_id=job.id,
-                name=short(job.spec.name, 100),
-                state=job.state,
-                elapsed_seconds=max(0, round(now - attempt.started_at)),
-            )
-            extra = dict(accelerator=short(job.spec.accelerator, 100), url=job.url)
-            runs.append(run | {key: item for key, item in extra.items() if item})
-        for account_id, seen in found.items():
-            runs += [
-                dict(account=account_id, ref=ref, resource=kind if kind in ("cpu", "gpu") else "unknown")
-                for ref, kind in seen.get("runs", {}).items()
-                if (account_id, ref) not in ours
-            ]
-        runs = [
-            dict(run, provider=run["account"].partition(":")[0])
-            for run in runs
-            if resource is None or run["resource"] in (resource, "unknown")
-        ]
-        # Stable: this queue's runs stay oldest first. Accounts no longer configured go last.
-        order = {account_id: index for index, account_id in enumerate(found)}
-        runs.sort(key=lambda run: (order.get(run["account"], len(order)), "job_id" not in run))
-        counts = Counter(run["resource"] for run in runs)
+        view = CapacityView(self.client, live=live, account=account)
+        runs = view.runs(resource)
         return dict(
             schema_version=1,
             resource=resource,
-            account=selected,
+            account=view.selected,
             total=len(runs),
-            counts={kind: counts[kind] for kind in ("cpu", "gpu", "unknown")},
+            counts=view.counts(runs),
             runs=runs,
-            discovery={account_id: _checked(seen, now) for account_id, seen in found.items()},
+            discovery={account.id: view.checked(account.id) for account in view.accounts},
             worker=self.health(),
         )
 

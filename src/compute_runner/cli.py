@@ -582,23 +582,6 @@ def quota(ctx: typer.Context, account: str | None = None):
     _emit(ctx, _client(ctx).quota(account))
 
 
-def _gpu_total(accounts: list[dict]) -> dict:
-    """GPU slots and time over every account.
-
-    free and quota_seconds add up the accounts checked successfully (None when there are none);
-    complete says whether that is every account.
-    """
-    known = [account for account in accounts if account["gpu"]["free"] is not None]
-    quotas = [account["gpu_quota_seconds"] for account in known if account["gpu_quota_limited"]]
-    return dict(
-        used=sum(account["gpu"]["used"] for account in accounts),
-        limit=sum(account["gpu"]["limit"] for account in accounts),
-        free=sum(account["gpu"]["free"] for account in known) if known else None,
-        quota_seconds=sum(quotas) if quotas else None,
-        complete=len(known) == len(accounts),
-    )
-
-
 def _hours(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
@@ -614,9 +597,9 @@ def _gpu_quota(account: dict) -> str:
 def gpus(ctx: typer.Context, live: Annotated[bool, LIVE] = False):
     """GPU slots in use and free on each account, the GPU time left, and their totals."""
     result = _client(ctx).agent().accounts(live=live)
-    accounts, total = result["accounts"], _gpu_total(result["accounts"])
+    accounts, totals = result["accounts"], result["totals"]
     if ctx.obj["json"]:
-        _emit(ctx, result | {"gpu_total": total})
+        _emit(ctx, result)
         return
     table = Table("Account", "Location", "In use", "Free", "Quota left", "Checked")
     for account in accounts:
@@ -631,17 +614,18 @@ def gpus(ctx: typer.Context, live: Annotated[bool, LIVE] = False):
         ]
         table.add_row(*map(Text, cells))
     # Lower bounds while some account is unknown.
-    bound = "" if total["complete"] else ">="
-    if total["quota_seconds"] is not None:
-        quota = bound + _hours(total["quota_seconds"])
+    bound = "" if totals["complete"] else ">="
+    gpu = totals["gpu"]
+    if totals["gpu_quota_seconds"] is not None:
+        quota = bound + _hours(totals["gpu_quota_seconds"])
     else:
         quota = "?" if any(account["gpu_quota_limited"] for account in accounts) else "no limit"
     table.add_section()
     table.add_row(
         "Total",
         "",
-        f"{total['used']}/{total['limit']}",
-        "?" if total["free"] is None else f"{bound}{total['free']}",
+        f"{gpu['used']}/{gpu['limit']}",
+        "?" if gpu["free"] is None else f"{bound}{gpu['free']}",
         quota,
         "",
         style="bold",

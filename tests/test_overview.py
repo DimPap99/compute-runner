@@ -64,8 +64,9 @@ def test_gpus_table_totals_every_account_and_marks_lower_bounds(two_accounts, mo
     client, home, other, spec = two_accounts
     client.submit(spec.model_copy(update={"gpu": True}))
     client.worker().tick()
-    total = json.loads(cli(client, monkeypatch, "--json", "gpus", "--live"))["gpu_total"]
-    assert total == {"used": 1, "limit": 2, "free": 1, "quota_seconds": 200000, "complete": True}
+    totals = json.loads(cli(client, monkeypatch, "--json", "gpus", "--live"))["totals"]
+    assert totals["gpu"] == {"used": 1, "limit": 2, "free": 1}
+    assert totals["gpu_quota_seconds"] == 200000 and totals["complete"]
     table = cli(client, monkeypatch, "gpus")
     assert "kaggle:other" in table and "never" in table and ">=0" in table and ">=27.8h" in table
     assert "kaggle:other: not checked yet" in table and "--live asks the providers now" in table
@@ -87,3 +88,20 @@ def test_running_table_shows_names_and_errors_as_written_and_says_when_discovery
     assert "kaggle:other: last check failed: [Errno 111] Connection refused" in output
     assert "Accounts last checked up to 2h 00m ago" in output
     assert "0 running" in cli(client, monkeypatch, "running", "cpu", "--account", "kaggle:tester")
+
+
+def test_discovery_saved_by_an_older_worker_still_loads(tmp_path):
+    from compute_runner.worker import DiscoveryFile
+
+    (tmp_path / DISCOVERY).write_text(
+        json.dumps(
+            {
+                "kaggle:tester": {"runs": {"tester/k": "gpu"}, "checked_at": 5, "gpu_seconds": 7, "later": 1},
+                "kaggle:other": "not a discovery",
+            }
+        )
+    )
+    found = DiscoveryFile(tmp_path).load()
+    assert found["kaggle:tester"].runs == {"tester/k": "gpu"} and found["kaggle:tester"].known
+    assert found["kaggle:tester"].devices == [] and found["kaggle:tester"].gpu_refresh_at is None
+    assert not found["kaggle:other"].known

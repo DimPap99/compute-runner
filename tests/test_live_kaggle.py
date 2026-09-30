@@ -83,15 +83,15 @@ def live(tmp_path, monkeypatch):
     worker = client.worker()
     # Every discovery answer over the whole run, so a rate limit that later cleared is still seen.
     worker.limited = []
-    refresh = worker._refresh_inventory
+    refresh = worker.discoverer.refresh
 
     def watched(account):
-        refresh(account)
-        error = worker.discovery[account].error
-        if error and "429" in error:
-            worker.limited.append(error)
+        found = refresh(account)
+        if found.error and "429" in found.error:
+            worker.limited.append(found.error)
+        return found
 
-    worker._refresh_inventory = watched
+    worker.discoverer.refresh = watched
     return client, worker, project
 
 
