@@ -106,7 +106,9 @@ def test_download_rejects_unsafe_urls_before_connecting(tmp_path, url):
     calls = []
     pages = [Obj(files=[Obj(file_name="one.txt", url=url)], log=None)]
     with pytest.raises(ValueError):
-        download_outputs(pages, OutputSink(tmp_path), get=lambda *a, **k: calls.append(a) or Response(), strict=True)
+        download_outputs(
+            pages, OutputSink(tmp_path), get=lambda *a, **k: calls.append(a) or Response(), strict=True
+        )
     assert calls == []
 
 
@@ -318,7 +320,7 @@ def test_dataset_create_conflict_reconciles_exact_ref(tmp_path, first_code, fina
         dataset_list=lambda **kwargs: [],
         dataset_create_new=lambda *args, **kwargs: Obj(
             error='The requested title "kgr b digest" is already in use by a dataset. '
-            'Please choose another title.'
+            "Please choose another title."
         ),
     )
     ref = f"tester/kgr-b-{digest[:40]}"
@@ -364,9 +366,14 @@ def test_accepted_dataset_waits_for_visibility_without_reuploading(tmp_path, cod
 
     def backend(owner):
         provider = KaggleProvider(Account(user=owner), tmp_path)
-        provider._api = Obj(dataset_status=status, dataset_list=lambda **kwargs: [],
-            dataset_create_new=lambda *args, **kwargs: creates.append(owner)
-            or Obj(status="Ok", error=None, url=f"https://www.kaggle.com/datasets/{owner}/data"))
+        provider._api = Obj(
+            dataset_status=status,
+            dataset_list=lambda **kwargs: [],
+            dataset_create_new=lambda *args, **kwargs: (
+                creates.append(owner)
+                or Obj(status="Ok", error=None, url=f"https://www.kaggle.com/datasets/{owner}/data")
+            ),
+        )
         return provider
 
     first, second = backend("tester"), backend("second")
@@ -527,7 +534,10 @@ def test_validation_errors_name_every_problem_plainly(tmp_path):
     with pytest.raises(Exception) as typo:
         JobSpec.model_validate({"sorce": "x.py"})
     message = safe_message(typo.value)
-    assert "Invalid source: Field required" in message and "Invalid sorce: Extra inputs are not permitted" in message
+    assert (
+        "Invalid source: Field required" in message
+        and "Invalid sorce: Extra inputs are not permitted" in message
+    )
     with pytest.raises(Exception) as secret:
         JobSpec(source=tmp_path, params={"api_key": "abc"})
     assert safe_message(secret.value) == "parameter api_key looks secret; only nonsecret values are accepted"

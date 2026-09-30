@@ -53,9 +53,7 @@ def test_invalid_cadence_is_rejected(checkpointing, mode, every):
 
 def test_save_and_required_restore(checkpointing, tmp_path):
     compatibility = {"model": "tiny", "optimizer": "adamw"}
-    writer = checkpointing.CheckpointManager(
-        tmp_path / "new", compatibility=compatibility, suffix=".pickle"
-    )
+    writer = checkpointing.CheckpointManager(tmp_path / "new", compatibility=compatibility, suffix=".pickle")
     saved = writer.save(
         {"weights": [1, 2], "global_step": 9},
         dump=dump_pickle,

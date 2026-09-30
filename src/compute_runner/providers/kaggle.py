@@ -244,9 +244,11 @@ class KaggleProvider:
                         accepted = json.loads(receipt.read_text())
                     except (OSError, ValueError):
                         continue
-                    if (accepted.get("ref", "").lower() == ref.lower()
-                            and str(accepted.get("status", "")).lower() == "ok"
-                            and not accepted.get("error")):
+                    if (
+                        accepted.get("ref", "").lower() == ref.lower()
+                        and str(accepted.get("status", "")).lower() == "ok"
+                        and not accepted.get("error")
+                    ):
                         return None
             if converted.kind == "auth":
                 if http_code(error) != 403:
@@ -275,14 +277,17 @@ class KaggleProvider:
                     str(folder), public=False, quiet=True, convert_to_csv=False, dir_mode="skip"
                 )
                 receipt = {
-                    "ref": ref, "created_at": time.time(),
+                    "ref": ref,
+                    "created_at": time.time(),
                     **{key: getattr(response, key, None) for key in ("status", "error", "url")},
                 }
                 atomic_json(folder / "create-receipt.json", receipt)
                 if str(receipt["status"]).lower() == "ok" and not receipt["error"]:
                     atomic_json(accepted_path, receipt)
                 if str(getattr(response, "status", "")).lower() == "error" and not response.error:
-                    raise RemoteError("Kaggle rejected dataset creation without a message", "invalid", definitive=True)
+                    raise RemoteError(
+                        "Kaggle rejected dataset creation without a message", "invalid", definitive=True
+                    )
                 if response.error:
                     if "already in use by a dataset" in response.error.lower():
                         # The client checks this exact ref again inside create. A newly

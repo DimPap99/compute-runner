@@ -20,12 +20,18 @@ def inline_project(snapshot: dict, state_dir: Path) -> dict | None:
     transport; code-only projects need no asynchronous dataset creation.
     """
     files = snapshot["source"].get("files", {})
-    if (snapshot.get("single_file") or snapshot.get("kind") != "script" or not files
-            or sum(record["size"] for record in files.values()) > 2_000_000):
+    if (
+        snapshot.get("single_file")
+        or snapshot.get("kind") != "script"
+        or not files
+        or sum(record["size"] for record in files.values()) > 2_000_000
+    ):
         return None
     payload = state_dir / "bundles" / snapshot["source"]["digest"] / "files"
-    embedded = {name: base64.b64encode(gzip.compress((payload / name).read_bytes(), mtime=0)).decode()
-                for name in files}
+    embedded = {
+        name: base64.b64encode(gzip.compress((payload / name).read_bytes(), mtime=0)).decode()
+        for name in files
+    }
     if len(json.dumps({"inline_gzip": embedded, "source_files": files})) > 700_000:
         return None
     return embedded

@@ -38,7 +38,9 @@ def test_run_folders_are_numbered_at_submission_beside_the_code(setup, tmp_path)
     assert client.get(first.id).result_dir == first.result_dir
     # Submission reserves each run folder empty; the worker fills it.
     runs_on_disk = sorted(path for path in experiment.iterdir() if not path.name.startswith("."))
-    assert runs_on_disk == [job.result_dir for job in runs] and not any(any(p.iterdir()) for p in runs_on_disk)
+    assert runs_on_disk == [job.result_dir for job in runs] and not any(
+        any(p.iterdir()) for p in runs_on_disk
+    )
 
     client.worker().tick()
     record = json.loads((first.result_dir / "job.json").read_text())
@@ -152,7 +154,9 @@ def test_results_inside_a_project_are_not_uploaded_with_it(setup, tmp_path):
 
 def test_params_reach_the_command_line_and_environment(setup, tmp_path):
     client, backend, spec = setup
-    (tmp_path / "hello.py").write_text("import os, sys\nprint(sys.argv[1:])\nprint(os.environ['KGR_PARAMS_JSON'])\n")
+    (tmp_path / "hello.py").write_text(
+        "import os, sys\nprint(sys.argv[1:])\nprint(os.environ['KGR_PARAMS_JSON'])\n"
+    )
     params = {"lr": 0.01, "amp": True, "debug": False, "tag": "a b"}
     job = client.submit(spec.model_copy(update={"args": ["--epochs", "2"], "params": params}))
     script = staged_launcher(backend, job)
@@ -171,7 +175,14 @@ def test_param_options_are_read_like_yaml_and_screened(tmp_path):
         return workload_specs(tmp_path / "t.py", param=list(params), **options)
 
     [spec] = specs("lr=0.01", "seed=3", "amp=true", "arch=resnet", "empty=", "day=2020-01-01")
-    assert spec.params == {"lr": 0.01, "seed": 3, "amp": True, "arch": "resnet", "empty": "", "day": "2020-01-01"}
+    assert spec.params == {
+        "lr": 0.01,
+        "seed": 3,
+        "amp": True,
+        "arch": "resnet",
+        "empty": "",
+        "day": "2020-01-01",
+    }
     with pytest.raises(ValueError, match="NAME=VALUE"):
         specs("lr")
     with pytest.raises(ValueError, match="parameter api_key looks secret"):
@@ -218,7 +229,9 @@ def test_inputs_can_name_another_jobs_outputs(setup):
     client, backend, spec = setup
     backend.output_files = {"outputs/features/a.npy": "A", "outputs/metrics.json": "{}"}
     prep = client.submit(spec.model_copy(update={"name": "prep"}))
-    uses = spec.model_copy(update={"name": "train", "inputs": {"features": Path(f"job:{prep.id[:8]}/features")}})
+    uses = spec.model_copy(
+        update={"name": "train", "inputs": {"features": Path(f"job:{prep.id[:8]}/features")}}
+    )
     with pytest.raises(ValueError, match="not downloaded yet"):
         client.submit(uses)
     client.worker().tick()
@@ -249,7 +262,9 @@ def test_continue_resumes_from_the_verified_checkpoint_as_the_next_run(two_accou
     client, home, other, spec = two_accounts
     checkpoints(home)
     agent = client.agent()
-    first = agent.submit([spec.model_copy(update={"name": "train", "args": ["--resume", "auto"]})], request_key="t1")
+    first = agent.submit(
+        [spec.model_copy(update={"name": "train", "args": ["--resume", "auto"]})], request_key="t1"
+    )
     first = first["jobs"][0]
     with pytest.raises(ValueError, match="after it stops"):
         agent.continue_run(first["id"], request_key="t2")

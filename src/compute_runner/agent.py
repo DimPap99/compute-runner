@@ -277,13 +277,20 @@ class AgentClient:
             raise ValueError("Runtime diagnostics require a submitted Kaggle job")
         provider = self.client.provider(job.account)
         metadata = provider._kernels("get_kernel", ApiGetKernelRequest(), job.remote_ref).metadata
-        return {"schema_version": 1, "job_id": job.id, "account": job.account,
-                "ref": job.remote_ref, "url": provider.url(job.remote_ref),
-                "requested": {"gpu": job.spec.gpu, "accelerator": job.spec.accelerator},
-                "provider": {"enable_gpu": getattr(metadata, "enable_gpu", None),
-                             "machine_shape": getattr(metadata, "machine_shape", None)},
-                "session": provider.status(job.remote_ref),
-                "note": "Saved provider metadata; CUDA must also be confirmed inside the workload."}
+        return {
+            "schema_version": 1,
+            "job_id": job.id,
+            "account": job.account,
+            "ref": job.remote_ref,
+            "url": provider.url(job.remote_ref),
+            "requested": {"gpu": job.spec.gpu, "accelerator": job.spec.accelerator},
+            "provider": {
+                "enable_gpu": getattr(metadata, "enable_gpu", None),
+                "machine_shape": getattr(metadata, "machine_shape", None),
+            },
+            "session": provider.status(job.remote_ref),
+            "note": "Saved provider metadata; CUDA must also be confirmed inside the workload.",
+        }
 
     def inputs(self, job_id):
         """Read provider status for a pending job's exact input identities; never upload."""
@@ -306,8 +313,11 @@ class AgentClient:
         rows = []
         for alias, ref in list(refs.items())[:10]:
             row = {"alias": alias, "ref": ref}
-            bundle = (job.snapshot["source"] if alias == "source" else
-                      job.transfers.get(alias) or job.snapshot["inputs"].get(alias))
+            bundle = (
+                job.snapshot["source"]
+                if alias == "source"
+                else job.transfers.get(alias) or job.snapshot["inputs"].get(alias)
+            )
             if bundle:
                 row["bundle_bytes"] = bundle.get("bytes")
                 receipt = self.client.config.state_dir / "uploads" / bundle["digest"] / "create-receipt.json"
@@ -331,9 +341,18 @@ class AgentClient:
                         matches = [d for d in datasets if d and (d.ref or "").lower() == ref.lower()]
                         if matches:
                             d = matches[0]
-                            row["inventory"] = {k: short(getattr(d, k, None)) for k in
-                                                ("ref", "id", "title", "last_updated", "is_private",
-                                                 "total_bytes", "current_version_number")}
+                            row["inventory"] = {
+                                k: short(getattr(d, k, None))
+                                for k in (
+                                    "ref",
+                                    "id",
+                                    "title",
+                                    "last_updated",
+                                    "is_private",
+                                    "total_bytes",
+                                    "current_version_number",
+                                )
+                            }
                             break
                         page += 1
                 except Exception as error:

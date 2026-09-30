@@ -12,18 +12,26 @@ from compute_runner.runtime import json_digest
 
 
 def test_small_project_embeds_and_runs_with_verified_files(tmp_path):
-    contents = {"task.py": b"from helper import VALUE\nassert VALUE == 42\n",
-                "helper.py": b"VALUE = 42\n"}
-    records = {name: dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
-               for name, data in contents.items()}
+    contents = {"task.py": b"from helper import VALUE\nassert VALUE == 42\n", "helper.py": b"VALUE = 42\n"}
+    records = {
+        name: dict(size=len(data), sha256=hashlib.sha256(data).hexdigest()) for name, data in contents.items()
+    }
     digest = json_digest(records)
     payload = tmp_path / "bundles" / digest / "files"
     payload.mkdir(parents=True)
     for name, data in contents.items():
         (payload / name).write_bytes(data)
-    job = Obj(id="project", snapshot=dict(kind="script", single_file=False, module="task",
-              entrypoint=None, source=dict(digest=digest, files=records)),
-              spec=Obj(command_args=lambda: [], params={}, env={}, requirements=None))
+    job = Obj(
+        id="project",
+        snapshot=dict(
+            kind="script",
+            single_file=False,
+            module="task",
+            entrypoint=None,
+            source=dict(digest=digest, files=records),
+        ),
+        spec=Obj(command_args=lambda: [], params={}, env={}, requirements=None),
+    )
     work, stage = tmp_path / "work", tmp_path / "stage"
     stage.mkdir()
     config = launch_config(job, tmp_path, {}, working_root=str(work), source_ref=None)
@@ -47,10 +55,16 @@ def test_large_notebook_fits_kaggle_limit_and_restores_exact_source(tmp_path):
     job = Obj(
         id="large-notebook",
         snapshot=dict(
-            kind="notebook", single_file=True, module=None, entrypoint="notebook.ipynb",
-            source=dict(digest=digest, files={
-                "notebook.ipynb": dict(sha256=digest, size=len(original)),
-            }),
+            kind="notebook",
+            single_file=True,
+            module=None,
+            entrypoint="notebook.ipynb",
+            source=dict(
+                digest=digest,
+                files={
+                    "notebook.ipynb": dict(sha256=digest, size=len(original)),
+                },
+            ),
         ),
         spec=Obj(command_args=lambda: [], params={}, env={}, requirements=None),
     )

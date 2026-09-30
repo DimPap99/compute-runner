@@ -71,14 +71,18 @@ def test_exhausted_gpu_quota_follows_the_failover_policy(two_accounts, policy):
     assert client.agent().move([job.id], account="kaggle:other")["moved"] == 1
     client.worker().tick()
     moved = client.get(job.id)
-    assert moved.account == "kaggle:other" and moved.state == "remote_queued" and moved.suggested_account is None
+    assert (
+        moved.account == "kaggle:other" and moved.state == "remote_queued" and moved.suggested_account is None
+    )
 
 
 @pytest.mark.parametrize("policy", ["ask", "auto"])
 def test_launch_rejected_for_capacity_fails_over_although_discovery_saw_free_slots(two_accounts, policy):
     client, home, other, spec = two_accounts
     client.config.failover = policy
-    home.push_error = RemoteError("Maximum batch CPU session count of 5 reached.", "capacity", definitive=True)
+    home.push_error = RemoteError(
+        "Maximum batch CPU session count of 5 reached.", "capacity", definitive=True
+    )
     job = client.submit(spec)
     worker = client.worker()
     worker.tick()
@@ -184,7 +188,11 @@ def test_agent_accounts_report_policy_slots_and_last_quota(two_accounts):
     assert result["failover"] == "ask" and result["default"] == "kaggle:tester"
     first, second = result["accounts"]
     assert first["id"] == "kaggle:tester" and first["provider"] == "kaggle"
-    assert first["gpu"] == {"used": 1, "limit": 1, "free": 0} and first["cpu"] == {"used": 0, "limit": 5, "free": 5}
+    assert first["gpu"] == {"used": 1, "limit": 1, "free": 0} and first["cpu"] == {
+        "used": 0,
+        "limit": 5,
+        "free": 5,
+    }
     assert first["gpu_quota_seconds"] == 100000 and first["checked_age_seconds"] == 0
     assert second["gpu"]["used"] == 0 and second["checked_age_seconds"] is None
 
@@ -204,7 +212,10 @@ def test_account_commands_keep_order_and_protect_unfinished_jobs(tmp_path, monke
     with pytest.raises(ValueError, match="Credentials file not found"):
         run("account", "add", "kaggle", "other", "--credentials", str(missing))
     run("account", "add", "kaggle", "tester")
-    assert run("account", "add", "kaggle", "other", "--default")["accounts"] == ["kaggle:other", "kaggle:tester"]
+    assert run("account", "add", "kaggle", "other", "--default")["accounts"] == [
+        "kaggle:other",
+        "kaggle:tester",
+    ]
     # Updating an account typed in other casing keeps the ID its jobs refer to.
     assert run("account", "add", "kaggle", "TESTER", "--cpu-limit", "3")["account"] == "kaggle:tester"
     script = tmp_path / "hello.py"
@@ -230,7 +241,11 @@ def test_account_credentials_file_ignores_ambient_kaggle_settings(tmp_path, monk
     path = tmp_path / "kaggle.json"
     path.write_text(json.dumps({"username": "tester", "key": "0" * 32}))
     api = credentials_api(
-        path, monkeypatch, KAGGLE_USERNAME="intruder", KAGGLE_KEY="1" * 32, KAGGLE_API_TOKEN="KGAT_ambient_value"
+        path,
+        monkeypatch,
+        KAGGLE_USERNAME="intruder",
+        KAGGLE_KEY="1" * 32,
+        KAGGLE_API_TOKEN="KGAT_ambient_value",
     )
     assert api.config_values["username"] == "tester" and api.config_values["key"] == "0" * 32
     # The SDK transport would otherwise send the ambient token instead of this account's key.
@@ -256,7 +271,9 @@ def test_account_add_keeps_every_secret_in_the_credentials_file(tmp_path, monkey
     kaggle_json = tmp_path / "kaggle.json"
     kaggle_json.write_text(json.dumps({"username": "alice", "key": "a" * 32}))
     kaggle_json.chmod(0o644)  # Read as it is; no permission requirement.
-    assert add("kaggle", "alice", "--credentials", str(kaggle_json))["credentials_file"] == str(credentials_path())
+    assert add("kaggle", "alice", "--credentials", str(kaggle_json))["credentials_file"] == str(
+        credentials_path()
+    )
     with pytest.raises(ValueError, match="holds the key of alice, not bob"):
         add("kaggle", "bob", "--credentials", str(kaggle_json))
     # Typed secrets are not echoed, so the JSON output stays clean.
@@ -315,7 +332,9 @@ def test_auto_failover_does_not_bounce_a_job_between_full_accounts(two_accounts)
     client, home, other, spec = two_accounts
     client.config.failover = "auto"
     client.config.retry_seconds = 60
-    home.push_error = other.push_error = RemoteError("Maximum CPU session count reached", "capacity", definitive=True)
+    home.push_error = other.push_error = RemoteError(
+        "Maximum CPU session count reached", "capacity", definitive=True
+    )
     job = client.submit(spec)
     worker = client.worker()
     for _ in range(4):
@@ -347,7 +366,9 @@ def test_a_job_retrying_uploads_keeps_its_account_and_does_not_push_others_away(
     worker.tick()
     worker.tick()
     first = client.get(first.id)
-    assert first.state == "preparing" and first.account == "kaggle:tester" and "input:data" in first.upload_refs
+    assert (
+        first.state == "preparing" and first.account == "kaggle:tester" and "input:data" in first.upload_refs
+    )
     for job in map(client.get, [job.id for job in later]):
         assert job.account == "kaggle:tester" and job.state == "queued" and job.suggested_account is None
         assert job.wait_reason == "Queued behind a job preparing on kaggle:tester"
@@ -433,9 +454,14 @@ def test_doctor_says_where_each_login_comes_from_without_the_secrets(tmp_path, m
     monkeypatch.setenv("KGR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("KGR_STATE_DIR", str(tmp_path / "state"))
     runner = CliRunner()
-    runner.invoke(app, ["--json", "account", "add", "kaggle", "alice", "--enter-key"], input="KGAT_secret_value\n")
+    runner.invoke(
+        app, ["--json", "account", "add", "kaggle", "alice", "--enter-key"], input="KGAT_secret_value\n"
+    )
     runner.invoke(app, ["--json", "account", "add", "kaggle", "bob"])
     result = runner.invoke(app, ["--json", "doctor", "--offline"])
     assert "KGAT_secret_value" not in result.output
     found = json.loads(result.output)["credentials"]
-    assert found == {"kaggle:alice": "credentials file: token", "kaggle:bob": "Kaggle's default (~/.kaggle, KAGGLE_*)"}
+    assert found == {
+        "kaggle:alice": "credentials file: token",
+        "kaggle:bob": "Kaggle's default (~/.kaggle, KAGGLE_*)",
+    }

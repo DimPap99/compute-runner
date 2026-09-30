@@ -71,8 +71,7 @@ def _require_disk_space(path: Path, required: int):
     if usage.free < needed:
         raise OSError(
             errno.ENOSPC,
-            f"Insufficient disk space: need {needed} bytes including write headroom, "
-            f"have {usage.free}",
+            f"Insufficient disk space: need {needed} bytes including write headroom, have {usage.free}",
             str(path),
         )
     return usage

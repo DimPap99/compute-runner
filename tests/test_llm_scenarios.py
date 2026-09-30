@@ -117,7 +117,9 @@ def test_llm_submit_monitor_wait_and_read_results(setup, workload, monkeypatch):
     assert json.loads((run_dir / "outputs/result.json").read_text()) == {"ok": True}
     assert outputs["root"] == str(run_dir) and outputs["log_path"] == str(run_dir / "run.log")
     record = json.loads(Path(outputs["record_path"]).read_text())
-    assert record["job_id"] == train_id and record["state"] == "succeeded" and record["downloads"] == "complete"
+    assert (
+        record["job_id"] == train_id and record["state"] == "succeeded" and record["downloads"] == "complete"
+    )
 
     # A finished job's persisted log replaces the live snapshot once, then serves from cache.
     finished_log = command("logs", train_id)
@@ -239,9 +241,7 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
 
     remote = sorted(p.relative_to(working).as_posix() for p in working.rglob("*") if p.is_file())
     assert "project/pkg/helper.py" in remote and any("__pycache__" in name for name in remote)
-    pages = [
-        Obj(files=[Obj(file_name=n, url="https://example.test/" + n) for n in remote], log="done")
-    ]
+    pages = [Obj(files=[Obj(file_name=n, url="https://example.test/" + n) for n in remote], log="done")]
 
     class Response:
         def __init__(self, name):
@@ -460,7 +460,9 @@ def test_remote_cancel_uses_the_session_id_logged_by_this_job(tmp_path):
     # Still queued: no session exists, so the attempt's launch notebook is deleted.
     deleted = []
     backend.status = lambda ref: dict(state="queued")
-    backend._kernels = lambda method, request, ref=None: deleted.append((method, ref)) or Obj(error_message="")
+    backend._kernels = lambda method, request, ref=None: (
+        deleted.append((method, ref)) or Obj(error_message="")
+    )
     assert backend.cancel("tester/kgr-x", "job1") is True
     assert deleted == [("delete_kernel", "tester/kgr-x")]
     backend.live_log = lambda ref: "KGR workload job1 session 5\n"

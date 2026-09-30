@@ -132,7 +132,11 @@ class CheckpointManager:
 
         if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 0:
             raise ValueError("global_step must be a non-negative integer")
-        if isinstance(completed_epochs, bool) or not isinstance(completed_epochs, int) or completed_epochs < 0:
+        if (
+            isinstance(completed_epochs, bool)
+            or not isinstance(completed_epochs, int)
+            or completed_epochs < 0
+        ):
             raise ValueError("completed_epochs must be a non-negative integer")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,9 +196,7 @@ class CheckpointManager:
             else:
                 manifests = list(source.rglob("latest.json"))
                 if len(manifests) != 1:
-                    raise CheckpointError(
-                        f"expected one latest.json under {source}, found {len(manifests)}"
-                    )
+                    raise CheckpointError(f"expected one latest.json under {source}, found {len(manifests)}")
                 manifest = manifests[0]
         metadata = _read_manifest(manifest)
         checkpoint = manifest.parent / metadata["file"]

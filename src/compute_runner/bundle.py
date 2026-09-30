@@ -59,10 +59,7 @@ def inventory(
     selected = []
 
     def protect(path):
-        return (
-            any(p.casefold() in PROTECTED for p in path.parts)
-            or secret_filename(path.name)
-        )
+        return any(p.casefold() in PROTECTED for p in path.parts) or secret_filename(path.name)
 
     candidates = []
     if source.is_dir():

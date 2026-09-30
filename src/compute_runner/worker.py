@@ -25,7 +25,10 @@ PENDING = {"queued", "preparing"}
 # Jobs without a possible remote run; they can change account.
 MOVABLE = {"queued", "preparing", "blocked"}
 # How each provider's dataset references look, for errors that ask the user to check one.
-REFERENCE_FORMS = {"kaggle": "OWNER/SLUG or OWNER/SLUG/VERSION", "ssh": "MACHINE:/ABSOLUTE/PATH on that machine"}
+REFERENCE_FORMS = {
+    "kaggle": "OWNER/SLUG or OWNER/SLUG/VERSION",
+    "ssh": "MACHINE:/ABSOLUTE/PATH on that machine",
+}
 # Why preparation blocked a job, by error kind; the job's error has the details.
 BLOCKED_REASONS = {
     "access": "Move the job or allow copying its dataset; see error",
@@ -479,8 +482,11 @@ class Worker:
         try:
             bundles = {"input:" + alias: bundle for alias, bundle in job.snapshot["inputs"].items()}
             from .providers.launch import inline_project
-            embedded = (job.account.startswith("kaggle:")
-                        and inline_project(job.snapshot, self.config.state_dir) is not None)
+
+            embedded = (
+                job.account.startswith("kaggle:")
+                and inline_project(job.snapshot, self.config.state_dir) is not None
+            )
             if not job.snapshot["single_file"] and not embedded:
                 bundles["source"] = job.snapshot["source"]
             for key, bundle in bundles.items():
@@ -616,9 +622,9 @@ class Worker:
             with tempfile.TemporaryDirectory(prefix=".dataset-", dir=self.config.state_dir) as folder:
                 self.provider(account).fetch_dataset(ref, Path(folder))
                 # Copied as published: the owner's files are already on the provider, so not screened.
-                bundle = snapshot_bundle(Path(folder),
-                                         plain_files(Path(folder), allow_bundle_manifest=True),
-                                         bundles, screen=False)
+                bundle = snapshot_bundle(
+                    Path(folder), plain_files(Path(folder), allow_bundle_manifest=True), bundles, screen=False
+                )
             saved = dict(digest=bundle["digest"], bytes=bundle["bytes"])
             self.store.save_dataset_copy(source, **saved)
         return dict(source=source, **saved)

@@ -58,7 +58,9 @@ def test_unreadable_dataset_is_copied_only_when_allowed(two_accounts):
     job = client.submit(spec.model_copy(update={"inputs": {"data": Path("kaggle:other/private")}}))
     client.worker().tick()
     blocked = client.get(job.id)
-    assert blocked.state == "blocked" and "kaggle:other can" in blocked.error and "--transfer" in blocked.error
+    assert (
+        blocked.state == "blocked" and "kaggle:other can" in blocked.error and "--transfer" in blocked.error
+    )
     assert home.pushes == [] and other.fetched == []
 
     moved = client.agent().move([job.id], account="kaggle:tester", transfer=True)
@@ -74,7 +76,9 @@ def test_unreadable_dataset_is_copied_only_when_allowed(two_accounts):
 
     # Allowed for every job, the same dataset version is copied once.
     client.config.transfer = True
-    second = client.submit(spec.model_copy(update={"name": "b", "inputs": {"data": Path("kaggle:other/private")}}))
+    second = client.submit(
+        spec.model_copy(update={"name": "b", "inputs": {"data": Path("kaggle:other/private")}})
+    )
     client.worker().tick()
     assert other.fetched == ["other/private/7"] and client.get(second.id).state == "remote_queued"
 
@@ -86,8 +90,10 @@ def test_copying_an_existing_runner_bundle_verifies_and_reuses_payload(two_accou
     client, home, other, spec = two_accounts
     home.unreadable = {"other/private"}
     client.config.transfer = True
-    records = {name: {"sha256": hashlib.sha256(text.encode()).hexdigest(), "size": len(text.encode())}
-               for name, text in other.dataset_files.items()}
+    records = {
+        name: {"sha256": hashlib.sha256(text.encode()).hexdigest(), "size": len(text.encode())}
+        for name, text in other.dataset_files.items()
+    }
     digest = json_digest(records)
     other.dataset_files[MANIFEST] = json.dumps(dict(schema_version=1, digest=digest, files=records))
     if damage == "checksum":
@@ -110,7 +116,9 @@ def test_copying_an_existing_runner_bundle_verifies_and_reuses_payload(two_accou
     assert json.loads((copied / MANIFEST).read_text())["files"] == records
 
 
-@pytest.mark.parametrize("update", [{"inputs": {"data": Path("kaggle:nobody/data")}}, {"datasets": ["nobody/data/2"]}])
+@pytest.mark.parametrize(
+    "update", [{"inputs": {"data": Path("kaggle:nobody/data")}}, {"datasets": ["nobody/data/2"]}]
+)
 def test_dataset_no_account_can_find_blocks_before_launch(two_accounts, update):
     client, home, other, spec = two_accounts
     home.unreadable = other.unreadable = {"nobody/data"}
@@ -177,7 +185,9 @@ def test_failover_offers_an_account_that_needs_a_copy(two_accounts):
     client.config.failover = "ask"
     home.gpu_seconds = 0
     other.unreadable = {"tester/private"}
-    job = client.submit(spec.model_copy(update={"gpu": True, "inputs": {"data": Path("kaggle:tester/private")}}))
+    job = client.submit(
+        spec.model_copy(update={"gpu": True, "inputs": {"data": Path("kaggle:tester/private")}})
+    )
     client.worker().tick()
     summary = client.agent().status([job.id])["jobs"][0]
     assert summary["suggested_account"] == "kaggle:other" and summary["suggested_transfer"] is True
@@ -198,7 +208,9 @@ def test_cancelling_clears_a_suggested_copy(two_accounts):
     client.config.failover = "ask"
     home.gpu_seconds = 0
     other.unreadable = {"tester/private"}
-    job = client.submit(spec.model_copy(update={"gpu": True, "inputs": {"data": Path("kaggle:tester/private")}}))
+    job = client.submit(
+        spec.model_copy(update={"gpu": True, "inputs": {"data": Path("kaggle:tester/private")}})
+    )
     client.worker().tick()
     assert client.get(job.id).suggested_transfer
     client.cancel(job.id)
@@ -245,7 +257,9 @@ def test_kaggle_checks_access_even_for_pinned_datasets(tmp_path):
     assert backend.resolve_dataset("me/data/2") == "me/data/2" and calls == ["me/data"]
     assert backend.resolve_dataset("me/data") == "me/data/4"
     # A version past the latest does not exist.
-    assert backend.resolve_dataset("me/data/4") == "me/data/4" and backend.resolve_dataset("me/data/5") is None
+    assert (
+        backend.resolve_dataset("me/data/4") == "me/data/4" and backend.resolve_dataset("me/data/5") is None
+    )
     assert backend.resolve_dataset("them/data/1") is None and backend.resolve_dataset("gone/data") is None
     with pytest.raises(RemoteError) as error:
         backend.resolve_dataset("down/data")
@@ -270,5 +284,7 @@ def test_mounts_are_found_whatever_the_owners_casing(tmp_path):
     unzipped = inputs / f"datasets/dimpap99/kgr-b-{bundle['digest'][:40]}"
     with zipfile.ZipFile(tmp_path / "bundles" / bundle["digest"] / "payload.zip") as archive:
         archive.extractall(unzipped)
-    kind, location, _ = _find_bundle(f"DimPap99/kgr-b-{bundle['digest'][:40]}/1", bundle["digest"], input_root=inputs)
+    kind, location, _ = _find_bundle(
+        f"DimPap99/kgr-b-{bundle['digest'][:40]}/1", bundle["digest"], input_root=inputs
+    )
     assert (kind, location) == ("directory", unzipped)
