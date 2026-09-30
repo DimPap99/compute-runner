@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from ..models import TERMINAL, JobRecord
+from ..models import COLLECTED, JobRecord
 from ..providers import safe_message
 from ..results import JobOutputs
 from ..security import redacted_env_record
@@ -57,7 +57,7 @@ class DownloadScheduler(Component):
         self.running = {job_id: future for job_id, future in self.running.items() if not future.done()}
         # Downloads for a removed account wait until it is added again.
         configured = {account.id for account in self.config.accounts}
-        for job in self.store.list(TERMINAL):
+        for job in self.store.uncollected():
             if self._due(job, configured):
                 if self.pool:
                     self.running[job.id] = self.pool.submit(self._collect, job.id)
@@ -70,7 +70,8 @@ class DownloadScheduler(Component):
             and job.attempts[-1].state == "accepted"
             and job.attempts[-1].account in configured
             and job.spec.auto_download
-            and job.download_state != "complete"
+            # disabled: cancelled before it started, so there is nothing to collect.
+            and job.download_state not in COLLECTED
             and job.download_retry_at <= time.time()
             and job.id not in self.running
         )

@@ -285,7 +285,11 @@ class SshProvider(Provider):
             if code == TRANSIENT_EXIT:
                 raise RemoteError(detail)
             raise RemoteError(detail, "invalid", definitive=True)
-        return json.loads(output.strip().splitlines()[-1])
+        # The answer is the last line: login scripts may print before it.
+        lines = output.strip().splitlines()
+        if not lines:
+            raise RemoteError(f"{command} on {self._host_key_name} gave no answer")
+        return json.loads(lines[-1])
 
     @staticmethod
     def _mkdirs(sftp, path):

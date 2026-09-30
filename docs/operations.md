@@ -109,6 +109,7 @@ Error messages saved with jobs always receive the strict redaction, because they
 | --- | --- |
 | Capacity or quota rejection | Back off and retry with a fresh remote reference; the failover policy can move the job to another account |
 | Uncertain submission | Query the recorded remote reference before attempting another submission |
+| Status check failure | Keep the run's slot reserved, save the error, and check again next cycle; other jobs are unaffected |
 | Unresolved remote execution | Set `needs_attention` and continue reserving capacity |
 | Workload failure | Set `failed` and collect available outputs without rerunning the computation |
 | Transient upload error | Keep the job preparing on its account; completed uploads are kept and the rest retried |
@@ -131,7 +132,7 @@ compute-runner agent retry JOB_ID --request-key resolved-retry-v1
 
 `resolve` records an operator assertion and does not launch a job. It must not be used to bypass an active or uncertain execution.
 
-`compute-runner logs JOB_ID --follow` keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
+`compute-runner logs JOB_ID --follow` waits while the job is queued, preparing or being submitted, keeps waiting while a running session prints nothing, and gives up only after repeated connection failures.
 
 `compute-runner cancel JOB_ID` and `compute-runner agent cancel JOB_ID` cancel pending work locally. For a running job on an SSH machine, the run's supervisor stops it (see [SSH machines](ssh.md)). On Kaggle, they ask Kaggle to stop the session. The job shows the reason `Cancellation requested on ACCOUNT` until the worker sees the run end, usually within a minute. It then becomes `cancelled`, and its partial outputs and log are collected. Kaggle's public API does not return session IDs, so the runtime prints its own session ID at startup and cancellation reads it from the live log. A job still queued on Kaggle has no session yet: cancellation deletes that attempt's launch notebook instead, which removes the run from Kaggle's queue, and the job becomes `cancelled` at once with the reason `Cancelled before it started on ACCOUNT`. A job that is starting but has not printed its session ID yet, or was submitted by an older version of the runner, cannot be cancelled; try again shortly or stop it on its Kaggle page. A submission whose outcome is uncertain is never cancelled automatically.
 
@@ -146,6 +147,7 @@ Default locations:
 | `~/.config/compute-runner/known_hosts` | SSH host keys accepted with `--trust-new-host` |
 | `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, events, run numbers, downloaded-file receipts, and dataset copies |
 | `~/.local/share/compute-runner/bundles/` | Immutable source, input, and dataset-copy snapshots |
+| `~/.local/share/compute-runner/uploads/DIGEST/` | Kaggle bundle datasets: the files uploaded (`dataset/`) and each account's creation receipts |
 | `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
 | `~/.local/share/compute-runner/accounts.json` | Each account's last run discovery and GPU quota, written by the worker |
 | `~/.local/share/compute-runner/jobs/JOB_ID/` | Staged launch packages and the job's download lock |

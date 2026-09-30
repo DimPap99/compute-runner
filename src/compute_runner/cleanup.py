@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .models import JobRecord
+from .models import COLLECTED, JobRecord
 from .providers import Artifact, safe_message, short
 from .runtime import tree_size
 
@@ -157,7 +157,7 @@ class Cleanup:
         """Whether what a job left may go: it finished, before the cutoff, with its outputs saved."""
         if not job.terminal:
             return Verdict(KEPT, f"its job is {job.state}", job.id)
-        if job.download_state not in {"complete", "disabled"}:
+        if job.download_state not in COLLECTED:
             return Verdict(KEPT, f"its outputs are {job.download_state}", job.id)
         if (job.finished_at or job.updated_at) > self.cutoff:
             return Verdict(KEPT, "its job finished recently", job.id)

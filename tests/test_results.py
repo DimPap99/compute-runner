@@ -168,7 +168,7 @@ def test_params_reach_the_command_line_and_environment(setup, tmp_path):
     assert json.dumps(params) in result.stdout
 
 
-def test_param_options_are_read_like_yaml_and_screened(tmp_path):
+def test_param_options_are_typed_and_screened(tmp_path):
     (tmp_path / "t.py").write_text("")
 
     def specs(*params):
@@ -184,6 +184,21 @@ def test_param_options_are_read_like_yaml_and_screened(tmp_path):
         "empty": "",
         "day": "2020-01-01",
     }
+    # Decimal numbers only: YAML 1.1 would pass 010 as 8, 1:30 as 90 and yes as true.
+    [spec] = specs("lr=1e-4", "half=.5", "seed=010", "time=1:30", "flag=yes", "hex=0x1F", "neg=-3")
+    assert spec.params == {
+        "lr": 0.0001,
+        "half": 0.5,
+        "seed": "010",
+        "time": "1:30",
+        "flag": "yes",
+        "hex": "0x1F",
+        "neg": -3,
+    }
+    assert specs("x=.inf")[0].params == {"x": ".inf"}
+    # JSON has no infinity: such a record could never be read back from the queue.
+    with pytest.raises(ValueError, match="finite"):
+        specs("x=1e999")
     with pytest.raises(ValueError, match="NAME=VALUE"):
         specs("lr")
     with pytest.raises(ValueError, match="parameter api_key looks secret"):

@@ -55,7 +55,7 @@ A retry of several jobs, or of a batch's jobs in the given states, queues them a
 
 `agent cleanup` reports what the runner left behind on each account and in the state directory: `totals` by verdict (`reclaimable`, `kept`, `unknown`), `by_location`, and the reclaimable `items` with the reason each may go. It asks the providers for their listings (`--no-remote` skips them). It never deletes; deleting is the user's decision, with `compute-runner cleanup --delete`.
 
-`agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it.
+`agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it. A retry or continuation on the same account keeps that permission; on another account it must be given again.
 
 ## Status and pagination
 

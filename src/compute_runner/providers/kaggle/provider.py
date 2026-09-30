@@ -47,6 +47,8 @@ class KaggleProvider(Provider):
         self._api = None
         # Each active run's resource by (ref, last run), read once per run.
         self._resources = {}
+        # Whether a source travels inside its notebook, by (digest, kind, single file); deciding compresses.
+        self._inlined = {}
 
     # Authentication ---------------------------------------------------------------------------
 
@@ -113,9 +115,15 @@ class KaggleProvider(Provider):
     def bundles_for(self, job: JobRecord) -> dict[str, dict]:
         """Small script projects travel inside the notebook (see launch.inline_project), not as a dataset."""
         bundles = super().bundles_for(job)
-        if "source" in bundles and inline_project(job.snapshot, self.state_dir) is not None:
+        if "source" in bundles and self._inline(job.snapshot):
             del bundles["source"]
         return bundles
+
+    def _inline(self, snapshot: dict) -> bool:
+        key = (snapshot["source"]["digest"], snapshot.get("kind"), snapshot.get("single_file"))
+        if key not in self._inlined:
+            self._inlined[key] = inline_project(snapshot, self.state_dir) is not None
+        return self._inlined[key]
 
     def ensure_bundle(self, bundle) -> str | None:
         return self.bundles.ensure(bundle["digest"])

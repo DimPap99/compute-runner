@@ -34,7 +34,7 @@ Source and input paths are relative to the YAML file. Entrypoint and requirement
 | `entrypoint` | Unset | Relative script or notebook path within a directory source |
 | `module` | Unset | Python module to execute, such as `experiments.train` |
 | `args` | `[]` | Arguments passed to the workload |
-| `params` | `{}` | Named settings, passed after `args` as `--NAME VALUE` (`true` as `--NAME`, `false` omitted), exposed as `KGR_PARAMS_JSON`, and recorded with the results |
+| `params` | `{}` | Named settings, passed after `args` as `--NAME VALUE` (`true` as `--NAME`, `false` omitted), exposed as `KGR_PARAMS_JSON`, and recorded with the results. Numbers must be finite |
 | `env` | `{}` | Persisted, nonsecret environment values |
 | `gpu` | `false` | Request a GPU |
 | `accelerator` | Unset | Provider accelerator ID; Kaggle accepts NVIDIA IDs, SSH machines none. Setting this also enables GPU use |
@@ -66,7 +66,7 @@ jobs:
 
 A batch accepts 1 to 1000 jobs. Every source and local input is snapshotted before the jobs are committed in one database transaction. A snapshot or database failure leaves none of that batch's jobs queued. Unused local bundles may remain. Jobs execute independently after the commit.
 
-Both submit commands accept `--name`, `--entrypoint`, `--module`, `--requirements`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, `--account`, and repeated `--arg`, `--param NAME=VALUE` and `--input ALIAS=VALUE` options, so a single job rarely needs a YAML file. `--input` takes a local path, relative to the current folder, or a reference such as `kaggle:owner/slug/3`, `ssh:/data/set` or `job:JOB_ID/PATH`, and adds to the workload's `inputs`. `--param` values are read as YAML scalars, so `lr=0.01` is a number and `amp=true` a flag, and they are merged into each job's `params`. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
+Both submit commands accept `--name`, `--entrypoint`, `--module`, `--requirements`, `--gpu/--cpu`, `--internet/--no-internet`, `--accelerator`, `--timeout`, `--account`, and repeated `--arg`, `--param NAME=VALUE` and `--input ALIAS=VALUE` options, so a single job rarely needs a YAML file. `--input` takes a local path, relative to the current folder, or a reference such as `kaggle:owner/slug/3`, `ssh:/data/set` or `job:JOB_ID/PATH`, and adds to the workload's `inputs`. `--param` values `true` and `false` are flags and decimal numbers such as `lr=0.01` or `lr=1e-4` are numbers; anything else, such as `seed=010` or `time=1:30`, is passed as typed. They are merged into each job's `params`. Overrides apply to every job in the YAML file. `--cpu` clears a configured accelerator and cannot be combined with `--accelerator`.
 
 ## Packaging and runtime
 

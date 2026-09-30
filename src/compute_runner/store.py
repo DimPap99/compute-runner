@@ -16,7 +16,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import MOVABLE, BatchRecord, Config, JobRecord
+from .models import COLLECTED, MOVABLE, TERMINAL, BatchRecord, Config, JobRecord
 from .paths import application_dir, run_folder, run_number
 
 logger = logging.getLogger(__name__)
@@ -440,6 +440,22 @@ class Store:
 
     def list(self, states=None, *, account=None, pool=None) -> list[JobRecord]:
         return self.page(states=states, account=account, pool=pool, limit=-1)[1]
+
+    def uncollected(self) -> list[JobRecord]:
+        """Finished jobs, oldest first, whose outputs are neither saved nor unwanted (see COLLECTED).
+
+        Read every cycle, so the selection happens in SQL rather than over the whole history.
+        """
+        states, collected = sorted(TERMINAL), sorted(COLLECTED)
+        with self.connection() as db:
+            rows = db.execute(
+                f"SELECT record FROM jobs WHERE state IN ({','.join('?' * len(states))}) "
+                # Records saved before download states load as pending.
+                "AND IFNULL(json_extract(record,'$.download_state'),'pending') "
+                f"NOT IN ({','.join('?' * len(collected))}) ORDER BY created,id",
+                [*states, *collected],
+            ).fetchall()
+        return [JobRecord.model_validate_json(row[0]) for row in rows]
 
     def counts_by_account(self) -> dict[str, dict[str, int]]:
         """How many jobs each account has in each state: {account: {state: count}}."""

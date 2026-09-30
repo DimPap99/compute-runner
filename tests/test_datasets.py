@@ -47,6 +47,25 @@ def test_aliased_dataset_is_attached_and_found_under_its_alias(setup, tmp_path):
     assert f"TRAIN {mount}" in result.stdout
 
 
+def test_a_rerun_keeps_the_dataset_copies_allowed_on_its_own_account(two_accounts):
+    client, home, other, spec = two_accounts
+    home.unreadable = {"other/private"}
+    job = client.submit(spec.model_copy(update={"inputs": {"data": Path("kaggle:other/private")}}))
+    client.move(job.id, "kaggle:tester", transfer=True)
+    client.worker().tick()
+    home.remote[client.get(job.id).remote_ref]["state"] = "ERROR"
+    client.store.update(job.id, next_action_at=0)
+    client.worker().tick()
+    assert client.get(job.id).state == "failed"
+
+    rerun = client.retry(job.id)
+    assert rerun.transfer
+    client.worker().tick()
+    assert client.get(rerun.id).state == "remote_queued"
+    # Copies were allowed on kaggle:tester only; elsewhere the user decides again.
+    assert not client.retry(job.id, account="kaggle:other").transfer
+
+
 def test_invalid_dataset_inputs_are_rejected_at_submission(setup):
     client, _, spec = setup
     with pytest.raises(ValueError, match="Invalid Kaggle dataset reference"):

@@ -662,8 +662,15 @@ def test_a_supervisor_that_records_its_result_as_status_reads_is_not_a_failure(t
     monkeypatch.setattr(ssh_remote, "_alive", finished_meanwhile)
     assert ssh_remote.status(str(run)) == {"state": "succeeded", "error": None}
     monkeypatch.setattr(ssh_remote, "_alive", lambda pid: True)
-    monkeypatch.setattr(os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    signals = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append(pid))
+    # Recorded by start: the supervisor may not handle SIGTERM yet, so only the cancel file asks it.
     (run / "state.json").write_text(json.dumps({"state": "running", "pid": 1}))
+    assert ssh_remote.cancel(str(run)) == {"signalled": False} and signals == []
+    assert (run / "cancel").exists()
+    (run / "state.json").write_text(json.dumps({"state": "running", "pid": 1, "supervised": True}))
+    assert ssh_remote.cancel(str(run)) == {"signalled": True} and signals == [1]
+    monkeypatch.setattr(os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
     assert ssh_remote.cancel(str(run)) == {"signalled": False}
 
 

@@ -128,7 +128,8 @@ class BundleDatasets:
             raise remote_error(error) from error
 
     def _stage(self, ref: str, digest: str):
-        folder = self._folder(digest)
+        # Kaggle uploads every file of the folder, so the receipts beside it must stay out of it.
+        folder = self._folder(digest) / "dataset"
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         archive = folder / "payload.zip"
         if not archive.exists():
@@ -240,6 +241,15 @@ class BundleDatasets:
             raise remote_error(error, mutation=True) from error
         if response.error:
             raise RemoteError(response.error, "invalid", definitive=True)
+        self._forget(ref)
+
+    def _forget(self, ref: str) -> None:
+        """Drop the creation receipts of a deleted dataset; they would make ensure() wait for it forever."""
+        prefix = ref.partition("/")[2].removeprefix(PREFIX)
+        for folder in (self.provider.state_dir / "uploads").glob(prefix + "*"):
+            for path in (self._accepted_path(folder.name), folder / "create-receipt.json"):
+                if str(_read_json(path).get("ref", "")).lower() == ref.lower():
+                    path.unlink(missing_ok=True)
 
 
 def _dataset(ref: str) -> str:

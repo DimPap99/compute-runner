@@ -240,9 +240,11 @@ def test_cancelling_a_run_still_queued_on_the_provider_ends_it_at_once(setup):
     cancelled = client.cancel(job.id)
     assert cancelled.state == "cancelled" and cancelled.download_state == "disabled"
     assert cancelled.wait_reason == "Cancelled before it started on kaggle:tester"
-    # The worker has nothing left to poll, and a retry is allowed.
+    # The worker has nothing left to poll or collect, and a retry is allowed.
     client.worker().tick()
-    assert client.get(job.id).state == "cancelled"
+    after = client.get(job.id)
+    assert after.state == "cancelled" and after.download_state == "disabled"
+    assert backend.download_calls == 0
     assert client.retry(job.id).state == "queued"
 
 
@@ -383,6 +385,28 @@ def test_polling_does_not_undo_a_resolution_made_during_the_remote_call(setup):
     backend.status = resolved_meanwhile
     client.worker().tick()
     assert client.get(job.id).state == "blocked"
+
+
+def test_an_unexpected_status_failure_holds_back_only_its_own_job(setup):
+    client, backend, spec = setup
+    broken, healthy = client.submit_many([spec, spec])
+    client.worker().tick()
+    broken_ref, healthy_ref = (client.get(job.id).remote_ref for job in (broken, healthy))
+    backend.remote[healthy_ref]["state"] = "COMPLETE"
+    working = backend.status
+
+    def status(ref):
+        if ref == broken_ref:
+            raise IndexError("list index out of range")  # Such as an SSH helper that printed nothing.
+        return working(ref)
+
+    backend.status = status
+    for job in (broken, healthy):
+        due(client, job.id)
+    client.worker().tick()
+    assert client.get(healthy.id).state == "succeeded"
+    held = client.get(broken.id)
+    assert held.state == "remote_queued" and held.outstanding and "list index" in held.error
 
 
 def test_a_definitive_transient_launch_failure_is_retried_not_blocked(setup):

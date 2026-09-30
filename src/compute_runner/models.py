@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from pathlib import Path, PurePosixPath
@@ -72,6 +73,7 @@ class JobSpec(Model):
             raise ValueError("requirements installation requires internet=True")
         self._check_command()
         self._check_names()
+        self._check_params()
         validate_nonsecret_env(self.env)
         # Parameters are shown in results folders and on the command line.
         validate_nonsecret_env({name: str(value) for name, value in self.params.items()}, label="parameter")
@@ -91,9 +93,14 @@ class JobSpec(Model):
             raise ValueError("Input names must be unique ignoring case")
         if any(key.startswith("KGR_") for key in self.env):
             raise ValueError("KGR_ environment variables are reserved")
-        for name in self.params:
+
+    def _check_params(self):
+        for name, value in self.params.items():
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
                 raise ValueError(f"Invalid parameter name: {name}")
+            # Records are saved as JSON, which would store infinity or NaN as null and never load again.
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"Parameter {name} must be a finite number")
 
     @property
     def pool(self) -> Pool:
@@ -249,6 +256,8 @@ PENDING = {"queued", "preparing"}
 MOVABLE = {"queued", "preparing", "blocked"}
 # Settled without operator action, apart from download retries.
 HALTED = {"blocked", "needs_attention"}
+# Download states of a job whose outputs are saved, or not wanted (disabled).
+COLLECTED = {"complete", "disabled"}
 
 
 def checked_states(states) -> list[str] | None:

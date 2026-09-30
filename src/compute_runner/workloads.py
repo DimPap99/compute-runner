@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -33,15 +34,30 @@ def load_specs(path: Path) -> list[JobSpec]:
     return [JobSpec(source=path, name=path.stem)]
 
 
+_INTEGER = re.compile(r"[-+]?(?:0|[1-9][0-9]*)")
+_FLOAT = re.compile(r"[-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?=[eE]))(?:[eE][-+]?[0-9]+)?")
+
+
+def param_value(text: str):
+    """true and false as flags, decimal numbers (such as 0.01 or 1e-4) as numbers, anything else as typed.
+
+    YAML 1.1 would read 010 as 8, 1:30 as 90 and yes as true, and pass those to the workload instead.
+    """
+    if text.lower() in {"true", "false"}:
+        return text.lower() == "true"
+    if _INTEGER.fullmatch(text):
+        return int(text)
+    return float(text) if _FLOAT.fullmatch(text) else text
+
+
 def parse_params(items) -> dict:
-    """NAME=VALUE options; values are read as YAML scalars, so 0.01 is a number and true a flag."""
+    """NAME=VALUE options; see param_value for how values are read."""
     result = {}
     for item in items or []:
         name, separator, text = item.partition("=")
         if not separator:
             raise ValueError(f"--param takes NAME=VALUE, not {item}")
-        value = yaml.safe_load(text) if text else ""
-        result[name] = value if isinstance(value, (str, int, float, bool)) else text
+        result[name] = param_value(text)
     return result
 
 

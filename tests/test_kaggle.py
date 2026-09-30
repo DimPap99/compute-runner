@@ -387,6 +387,56 @@ def test_accepted_dataset_waits_for_visibility_without_reuploading(tmp_path, cod
     assert first.ensure_bundle({"digest": digest}) == f"tester/kgr-b-{digest[:40]}/1"
 
 
+def test_bundle_uploads_hold_only_the_bundle_and_a_deleted_one_is_created_again(tmp_path):
+    digest = "c" * 64
+    ref = f"tester/kgr-b-{digest[:40]}"
+    archive = tmp_path / "bundles" / digest / "payload.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"example")
+    response = requests.Response()
+    response.status_code = 404
+    uploaded, deleted = [], []
+
+    def missing(ref):
+        raise requests.HTTPError("Not yet visible", response=response)
+
+    def create(folder, **kwargs):
+        uploaded.append(sorted(os.listdir(folder)))
+        return Obj(status="Ok", error=None, url="https://www.kaggle.com/datasets/x")
+
+    def delete_dataset(request):
+        deleted.append(f"{request.owner_slug}/{request.dataset_slug}")
+        return Obj(error="")
+
+    class Client:
+        datasets = Obj(dataset_api_client=Obj(delete_dataset=delete_dataset))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def backend(owner):
+        provider = KaggleProvider(Account(user=owner), tmp_path)
+        provider._api = Obj(dataset_status=missing, dataset_create_new=create, build_kaggle_client=Client)
+        return provider
+
+    first, second = backend("tester"), backend("second")
+    assert first.ensure_bundle({"digest": digest}) is None
+    assert second.ensure_bundle({"digest": digest}) is None
+    # The second upload does not carry the first account's creation receipts.
+    assert uploaded == [["dataset-metadata.json", "payload.zip"]] * 2
+    # Accepted and still invisible: no second upload.
+    assert first.ensure_bundle({"digest": digest}) is None and len(uploaded) == 2
+    # Once deleted, the receipt no longer holds the bundle back: it is uploaded again.
+    first.bundles.delete(ref)
+    assert deleted == [ref]
+    assert first.ensure_bundle({"digest": digest}) is None and len(uploaded) == 3
+    # The other account's receipt is untouched.
+    assert second.ensure_bundle({"digest": digest}) is None and len(uploaded) == 3
+
+
 def test_existing_dataset_403_waits_without_creating_another(tmp_path):
     # Seen live: a dataset created moments ago answers 403 while Kaggle processes it.
     digest = "b" * 64

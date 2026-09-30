@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from ..models import TERMINAL, Attempt, JobRecord
-from ..providers import RemoteError, safe_message
+from ..providers import safe_message
 from .capacity import Discoverer
 from .context import Component
 
@@ -30,7 +30,9 @@ class Poller(Component):
         now = time.time()
         try:
             status = self.provider(attempt.account).status(attempt.ref)
-        except (RemoteError, ValueError) as error:  # ValueError: the account is no longer configured
+        # Any failure, such as an account no longer configured (ValueError): an error raised from
+        # here would end every cycle at this job, so no other job would be polled or placed.
+        except Exception as error:
             self._unreachable(job, attempt, error, now)
             return
         state = REMOTE_STATES.get(status["state"])

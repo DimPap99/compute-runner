@@ -172,8 +172,11 @@ class Client:
             jobs.append(self._new_job(spec, saved, target, experiment))
         return self._add(jobs, request_key, fingerprint)
 
-    def _new_job(self, spec, saved, account, experiment, parent_id=None):
-        """A job for experiment; _add numbers its run folder when the batch commits."""
+    def _new_job(self, spec, saved, account, experiment, parent: JobRecord | None = None):
+        """A job for experiment; _add numbers its run folder when the batch commits.
+
+        A rerun of parent on its own account keeps the dataset copies the user allowed there.
+        """
         return JobRecord(
             id=uuid.uuid4().hex,
             spec=spec,
@@ -181,7 +184,8 @@ class Client:
             account=account,
             result_dir=experiment,
             download_state="pending" if spec.auto_download else "disabled",
-            parent_id=parent_id,
+            parent_id=parent and parent.id,
+            transfer=bool(parent and parent.transfer and parent.account == account),
         )
 
     def _add(self, jobs, request_key, fingerprint):
@@ -336,7 +340,7 @@ class Client:
         target = account or self.config.account(job.account).id
         self.provider(target).check(job.spec)
         spec = job.spec.model_copy(deep=True)
-        return self._new_job(spec, job.snapshot, target, self._same_experiment(job), job.id)
+        return self._new_job(spec, job.snapshot, target, self._same_experiment(job), job)
 
     def _check_saved(self, job):
         for bundle in [job.snapshot["source"], *job.snapshot["inputs"].values()]:
@@ -380,7 +384,7 @@ class Client:
         saved["inputs"]["resume"] = snapshot_bundle(
             folder, ["latest.json", checkpoint], self.config.state_dir / "bundles"
         )
-        new = self._new_job(spec, saved, target, self._same_experiment(job), job.id)
+        new = self._new_job(spec, saved, target, self._same_experiment(job), job)
         return self._add([new], request_key, fingerprint)
 
     def move(self, job_id, account: str, *, transfer: bool = False) -> JobRecord:
@@ -469,7 +473,8 @@ class Client:
         """
         job = self.get(job_id)
         watch = self._worker_watch()
-        while follow and not job.remote_ref and job.state in {"queued", "preparing", "submitting"}:
+        # A submitting job already names its run, which may not exist until the provider accepts it.
+        while follow and job.state in {"queued", "preparing", "submitting"}:
             watch()
             time.sleep(min(2, self.config.poll_seconds))
             job = self.get(job_id)

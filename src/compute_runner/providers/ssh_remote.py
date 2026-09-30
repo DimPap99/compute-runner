@@ -193,7 +193,8 @@ class Supervisor:
     def supervise(self):
         signal.signal(signal.SIGTERM, self._terminate)
         signal.signal(signal.SIGINT, self._terminate)
-        record = _running(os.getpid(), self.env)
+        # supervised: from now on SIGTERM stops the run; before, it would kill this process unrecorded.
+        record = {**_running(os.getpid(), self.env), "supervised": True}
         _write_json(self.run / "state.json", record)
         try:
             self._run_workload()
@@ -301,11 +302,14 @@ def status(run):
 
 
 def cancel(run):
-    """Ask the supervisor to stop the workload; one that has not started yet stops at once."""
+    """Ask the supervisor to stop the workload; one that has not started yet stops at once.
+
+    A supervisor still starting up sees the cancel file before it starts the workload.
+    """
     run = Path(run)
     (run / "cancel").touch()
     record = _read_json(run / "state.json")
-    if record and record["state"] == "running" and _alive(record["pid"]):
+    if record and record["state"] == "running" and record.get("supervised") and _alive(record["pid"]):
         try:
             os.kill(record["pid"], signal.SIGTERM)
             return {"signalled": True}
