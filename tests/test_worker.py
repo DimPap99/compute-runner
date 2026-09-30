@@ -4,7 +4,6 @@ import pytest
 
 from compute_runner import Account, JobSpec
 from compute_runner.providers import RemoteError
-from compute_runner.worker import outstanding
 
 from conftest import due
 
@@ -364,7 +363,7 @@ def test_a_deleted_run_can_be_resolved_and_frees_its_slot(setup):
     client.worker().tick()
     assert client.get(job.id).state == "needs_attention"
     resolved = client.resolve_not_submitted(job.id)
-    assert resolved.state == "blocked" and not outstanding(resolved)
+    assert resolved.state == "blocked" and not resolved.outstanding
     retried = client.retry(job.id)
     client.worker().tick()
     assert client.get(retried.id).state == "remote_queued"

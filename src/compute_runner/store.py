@@ -16,7 +16,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import BatchRecord, Config, JobRecord
+from .models import MOVABLE, BatchRecord, Config, JobRecord
 from .paths import application_dir, run_folder, run_number
 
 logger = logging.getLogger(__name__)
@@ -434,6 +434,29 @@ class Store:
             if previous != self._observable(job):
                 self._event(db, job, job.error or job.wait_reason or job.download_state)
             return job
+
+    def place(self, job_id: str, account: str, reason: str, *, transfer=None) -> JobRecord | None:
+        """Put a job that has no remote run on another account; None if it changed meanwhile.
+
+        Requeueing also stops a preparation in progress, whose updates expect "preparing".
+        transfer, when given, sets whether its datasets may be copied there.
+        """
+        changes = {} if transfer is None else {"transfer": transfer}
+        return self.update(
+            job_id,
+            expected=MOVABLE,
+            account=account,
+            state="queued",
+            # Uploads and attached datasets belong to the previous account; copies stay cached locally.
+            upload_refs={},
+            transfers={},
+            suggested_account=None,
+            suggested_transfer=False,
+            error=None,
+            wait_reason=reason,
+            next_action_at=0,
+            **changes,
+        )
 
     @staticmethod
     def _observable(job):

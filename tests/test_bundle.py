@@ -8,7 +8,7 @@ import pytest
 
 from compute_runner import JobSpec
 from compute_runner.bundle import describe, inventory, snapshot, snapshot_bundle
-from compute_runner.runtime import _find_bundle, _unpack
+from compute_runner.runtime import _find_bundle, unpack_bundle
 
 from conftest import staged_launcher
 
@@ -180,7 +180,7 @@ def test_archive_and_expanded_lookup(tmp_path):
     assert found[0] == "archive"
     target = tmp_path / "extracted"
     target.mkdir()
-    _unpack(archive, bundle["digest"], target)
+    unpack_bundle(archive, bundle["digest"], target)
     assert (target / "hello.py").read_text() == "print(42)"
     shutil.copytree(tmp_path / "bundles" / bundle["digest"] / "files", mount, dirs_exist_ok=True)
     assert (
@@ -202,7 +202,7 @@ def test_rejects_tampered_archive(tmp_path):
         z.writestr("hello.py", "modified")
         z.writestr("../escape", "bad")
     with pytest.raises(ValueError, match="Unexpected"):
-        _unpack(malicious, bundle["digest"], tmp_path / "out")
+        unpack_bundle(malicious, bundle["digest"], tmp_path / "out")
 
 
 def test_offline_requirements_validation():

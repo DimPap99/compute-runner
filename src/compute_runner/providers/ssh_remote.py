@@ -23,8 +23,9 @@ import time
 import zipfile
 from pathlib import Path
 
-if "_unpack" not in globals():  # Imported on its own, as in tests; on the machine it follows runtime.py.
-    from compute_runner.runtime import MANIFEST, _unpack, file_digest
+# Imported on its own, as in tests; on the machine this file follows runtime.py.
+if "unpack_bundle" not in globals():
+    from compute_runner.runtime import MANIFEST, file_digest, unpack_bundle
 
 STOP_GRACE_SECONDS = 20
 # How long start may take between marking a run started and recording its supervisor.
@@ -115,7 +116,7 @@ def _unpack_once(archive, digest, target):
     if staging.exists():
         _make_writable(staging)
         shutil.rmtree(staging)
-    _unpack(Path(archive), digest, staging)
+    unpack_bundle(Path(archive), digest, staging)
     with zipfile.ZipFile(archive) as bundle:
         (staging / MANIFEST).write_bytes(bundle.read(MANIFEST))
     for root, _dirs, files in os.walk(staging):
@@ -167,7 +168,11 @@ def _running(pid, env):
 
 
 def supervise(run, env):
-    """Run the workload with its timeout and record how it ended in state.json.
+    return Supervisor(run, env).supervise()
+
+
+class Supervisor:
+    """Runs one attempt's workload with its timeout and records how it ended in state.json.
 
     A stop, from cancel or the timeout, sends SIGTERM to every process of the run and SIGKILL
     after STOP_GRACE_SECONDS; so does a workload that exits and leaves processes behind. The
@@ -175,80 +180,99 @@ def supervise(run, env):
     The cancel file is watched too, so a cancel that arrives before the SIGTERM handler exists
     is not lost.
     """
-    run = Path(run)
-    settings = json.loads((run / "run.json").read_text())
-    state = run / "state.json"
-    stop = {"at": None}
-    child = None
-    marker = f"{run.name}-{os.getpid()}-{time.time_ns()}"
 
-    def signal_all(sig):
-        for pid in _members(marker, child.pid):
+    def __init__(self, run, env):
+        self.run = Path(run)
+        self.env = env
+        self.settings = json.loads((self.run / "run.json").read_text())
+        self.marker = f"{self.run.name}-{os.getpid()}-{time.time_ns()}"
+        self.stop_at = None  # When a stop was requested, on the monotonic clock.
+        self.child = None
+        self.outcome = {"state": "failed", "exit_code": None, "error": None}
+
+    def supervise(self):
+        signal.signal(signal.SIGTERM, self._terminate)
+        signal.signal(signal.SIGINT, self._terminate)
+        record = _running(os.getpid(), self.env)
+        _write_json(self.run / "state.json", record)
+        try:
+            self._run_workload()
+            self._conclude()
+        except Exception as error:  # Recorded rather than lost: nobody is attached to this process.
+            self.outcome["error"] = f"{type(error).__name__}: {error}"
+        _write_json(self.run / "state.json", {**record, **self.outcome, "finished_at": time.time()})
+        return self.outcome
+
+    def _run_workload(self):
+        command = self._command(self._python())
+        if self._cancelled():
+            return
+        environment = {**os.environ, **self.env, MARKER: self.marker}
+        self.child = subprocess.Popen(command, cwd=self.run, env=environment, start_new_session=True)
+        self._watch()
+        self.outcome["exit_code"] = self.child.returncode
+
+    def _python(self):
+        """The interpreter to run with: a virtual environment of the run when it installs requirements."""
+        if not self.settings["requirements"] or self._cancelled():
+            return sys.executable
+        venv = self.run / "venv"
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(venv)], check=True)
+        return str(venv / "bin" / "python")
+
+    def _command(self, python):
+        code = self.settings["code_file"]
+        if self.settings["kind"] != "notebook":
+            return [python, "-u", code]
+        output = str(self.run / "working" / "notebook.ipynb")
+        execute = [python, "-m", "nbconvert", "--to", "notebook", "--execute", code]
+        return [*execute, "--output", output, "--ExecutePreprocessor.timeout=-1"]
+
+    def _watch(self):
+        """Wait until every process of the run is gone, stopping them once the run must end."""
+        deadline = time.monotonic() + self.settings["timeout_seconds"]
+        grace = self.settings.get("stop_grace_seconds", STOP_GRACE_SECONDS)
+        stopping = None  # When SIGTERM went to the run's processes.
+        while self.child.poll() is None or _members(self.marker, self.child.pid):
+            now = time.monotonic()
+            if stopping is None and self._must_stop(now, deadline):
+                stopping = self.stop_at or now
+                self._signal_all(signal.SIGTERM)
+            elif stopping is not None and now - stopping >= grace:
+                self._signal_all(signal.SIGKILL)
+            time.sleep(0.5)
+
+    def _must_stop(self, now, deadline):
+        """Whether the run ends now: cancelled, timed out, or its workload exited."""
+        if self.child.returncode is None and now >= deadline and not self._cancelled():
+            self.outcome["error"] = f"Timed out after {self.settings['timeout_seconds']} seconds"
+        return self._cancelled() or self.outcome["error"] is not None or self.child.returncode is not None
+
+    def _conclude(self):
+        if self._cancelled():
+            self.outcome["state"] = "cancelled"
+        elif self.outcome["error"] is None and self.child.returncode == 0:
+            self.outcome["state"] = "succeeded"
+        elif self.outcome["error"] is None:
+            self.outcome["error"] = f"The workload exited with status {self.child.returncode}"
+
+    def _terminate(self, *_):
+        if self.stop_at is None:
+            self.stop_at = time.monotonic()
+            if self.child is not None:
+                self._signal_all(signal.SIGTERM)
+
+    def _cancelled(self):
+        if self.stop_at is None and (self.run / "cancel").exists():
+            self._terminate()
+        return self.stop_at is not None
+
+    def _signal_all(self, sig):
+        for pid in _members(self.marker, self.child.pid):
             try:
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError):
                 pass
-
-    def terminate(*_):
-        if stop["at"] is None:
-            stop["at"] = time.monotonic()
-            if child is not None:
-                signal_all(signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, terminate)
-    signal.signal(signal.SIGINT, terminate)
-    record = _running(os.getpid(), env)
-    _write_json(state, record)
-
-    def cancelled():
-        if stop["at"] is None and (run / "cancel").exists():
-            terminate()
-        return stop["at"] is not None
-
-    outcome = {"state": "failed", "exit_code": None, "error": None}
-    try:
-        python = sys.executable
-        if settings["requirements"] and not cancelled():
-            subprocess.run([python, "-m", "venv", "--system-site-packages", str(run / "venv")], check=True)
-            python = str(run / "venv" / "bin" / "python")
-        if settings["kind"] == "notebook":
-            command = [python, "-m", "nbconvert", "--to", "notebook", "--execute", settings["code_file"]]
-            command += [
-                "--output",
-                str(run / "working" / "notebook.ipynb"),
-                "--ExecutePreprocessor.timeout=-1",
-            ]
-        else:
-            command = [python, "-u", settings["code_file"]]
-        if not cancelled():
-            child = subprocess.Popen(
-                command, cwd=run, env={**os.environ, **env, MARKER: marker}, start_new_session=True
-            )
-            deadline = time.monotonic() + settings["timeout_seconds"]
-            grace = settings.get("stop_grace_seconds", STOP_GRACE_SECONDS)
-            stopping = None  # When SIGTERM went to the run's processes.
-            while child.poll() is None or _members(marker, child.pid):
-                now = time.monotonic()
-                if stopping is None:
-                    if child.returncode is None and now >= deadline and not cancelled():
-                        outcome["error"] = f"Timed out after {settings['timeout_seconds']} seconds"
-                    if cancelled() or outcome["error"] or child.returncode is not None:
-                        stopping = stop["at"] or now
-                        signal_all(signal.SIGTERM)
-                elif now - stopping >= grace:
-                    signal_all(signal.SIGKILL)
-                time.sleep(0.5)
-            outcome["exit_code"] = child.returncode
-        if cancelled():
-            outcome["state"] = "cancelled"
-        elif outcome["error"] is None and child.returncode == 0:
-            outcome["state"] = "succeeded"
-        elif outcome["error"] is None:
-            outcome["error"] = f"The workload exited with status {child.returncode}"
-    except Exception as error:  # Recorded rather than lost: nobody is attached to this process.
-        outcome["error"] = f"{type(error).__name__}: {error}"
-    _write_json(state, {**record, **outcome, "finished_at": time.time()})
-    return outcome
 
 
 def status(run):

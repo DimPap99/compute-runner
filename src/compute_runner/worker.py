@@ -14,16 +14,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .bundle import plain_files, snapshot_bundle
-from .models import ACTIVE, TERMINAL, Attempt, Config
+from .models import ACTIVE, PENDING, TERMINAL, Attempt, Config
 from .providers import RemoteError, safe_message
 from .results import JobOutputs, publish
 from .security import redacted_env_record
 from .store import Store, atomic_json
 
 logger = logging.getLogger(__name__)
-PENDING = {"queued", "preparing"}
-# Jobs without a possible remote run; they can change account.
-MOVABLE = {"queued", "preparing", "blocked"}
 # How each provider's dataset references look, for errors that ask the user to check one.
 REFERENCE_FORMS = {
     "kaggle": "OWNER/SLUG or OWNER/SLUG/VERSION",
@@ -77,17 +74,9 @@ def collect_outputs(store, provider, job_id, *, strict=False):
             raise
 
 
-def outstanding(job):
-    return bool(
-        job.attempts
-        and job.attempts[-1].state in {"submitting", "accepted", "uncertain"}
-        and job.state not in TERMINAL
-    )
-
-
 def occupancy(jobs, account, runs):
     """Runs holding an account's CPU and GPU slots: our outstanding attempts plus other known runs."""
-    ours = [job for job in jobs if outstanding(job) and job.attempts[-1].account == account]
+    ours = [job for job in jobs if job.outstanding and job.attempts[-1].account == account]
     refs = {job.remote_ref.lower() for job in ours}
     counts = {"cpu": sum(not job.spec.gpu for job in ours), "gpu": sum(job.spec.gpu for job in ours)}
     for ref, resource in runs.items():
@@ -123,37 +112,6 @@ def waiting_for_capacity(account, pool):
 
 def queued_behind(account):
     return f"Queued behind a job preparing on {account}"
-
-
-def place(store, job_id, account, reason, *, transfer=None):
-    """Put a job that has no remote run on another account; None if it changed meanwhile.
-
-    Requeueing also stops a preparation in progress, whose updates expect "preparing".
-    transfer, when given, sets whether its datasets may be copied there.
-    """
-    changes = {} if transfer is None else {"transfer": transfer}
-    return store.update(
-        job_id,
-        expected=MOVABLE,
-        account=account,
-        state="queued",
-        # Uploads and attached datasets belong to the previous account; copies stay cached locally.
-        upload_refs={},
-        transfers={},
-        suggested_account=None,
-        suggested_transfer=False,
-        error=None,
-        wait_reason=reason,
-        next_action_at=0,
-        **changes,
-    )
-
-
-def settled(job, *, downloads=True):
-    """Nothing further happens without operator action, apart from download retries."""
-    if job.state in {"blocked", "needs_attention"}:
-        return True
-    return job.terminal and (not downloads or job.download_state in {"complete", "disabled", "error"})
 
 
 @dataclass
@@ -216,7 +174,7 @@ class Worker:
         self.store.heartbeat(state="running", stage="monitoring")
         now = time.time()
         for job in self.store.list(ACTIVE):
-            if outstanding(job) and job.next_action_at <= now:
+            if job.outstanding and job.next_action_at <= now:
                 self._poll(job)
         pending = self.store.list(PENDING)
         if pending and not self.stop_event.is_set():
@@ -308,8 +266,7 @@ class Worker:
         if reserve:
             # Jobs already preparing there take the next slots.
             count += sum(
-                job.account == account and job.spec.gpu == (pool == "gpu")
-                for job in self.store.list({"preparing"})
+                job.account == account and job.pool == pool for job in self.store.list({"preparing"})
             )
         return count >= getattr(self.config.account(account), pool + "_limit")
 
@@ -413,7 +370,7 @@ class Worker:
             job = self.store.get(original.id)
             if job.state not in PENDING:
                 continue
-            pool = "gpu" if job.spec.gpu else "cpu"
+            pool = job.pool
             if job.account not in configured:
                 # Usually an account added after this worker started; it runs once the worker restarts.
                 self._hold(
@@ -445,7 +402,7 @@ class Worker:
                 if not (allowed and self.config.failover == "auto" and job.state == "queued"):
                     self._hold(job, reason, target, copy)
                     continue
-                job = place(self.store, job.id, target, f"Moved from {job.account}: {reason}")
+                job = self.store.place(job.id, target, f"Moved from {job.account}: {reason}")
                 if job is None:
                     continue
                 key = (job.account, pool)

@@ -14,7 +14,7 @@ import nbformat
 import pathspec
 
 from .models import JobSpec
-from .runtime import MANIFEST, _manifest, _verify, json_digest, safe_relative
+from .runtime import MANIFEST, json_digest, manifest_records, safe_relative, verify_files
 from .security import detected_secret, secret_filename
 from .store import atomic_json
 
@@ -184,12 +184,12 @@ def plain_files(root: Path, *, allow_bundle_manifest=False) -> list[str]:
             raise ValueError(f"{MANIFEST} is reserved")
         try:
             metadata = json.loads((root / MANIFEST).read_text())
-            records = _manifest(metadata, metadata["digest"])
+            records = manifest_records(metadata, metadata["digest"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("Invalid existing bundle manifest") from error
         if set(files) != set(records) | {MANIFEST} or MANIFEST in records:
             raise ValueError("Existing bundle inventory differs from manifest")
-        _verify(root, records)
+        verify_files(root, records)
         files = list(records)
     if not files:
         raise ValueError("The dataset has no files")

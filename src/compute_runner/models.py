@@ -18,6 +18,7 @@ class Model(BaseModel):
 
 
 PROVIDERS = ("kaggle", "ssh")
+Pool = Literal["cpu", "gpu"]
 # An input value naming data that is not a local path: another job's outputs, or a provider dataset.
 _REFERENCE = re.compile(rf"^(job|{'|'.join(PROVIDERS)}):(.+)$")
 
@@ -65,14 +66,24 @@ class JobSpec(Model):
 
     @model_validator(mode="after")
     def validate_options(self):
-        if self.entrypoint and self.module:
-            raise ValueError("Choose entrypoint or module, not both")
-        if self.module and not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*", self.module):
-            raise ValueError("module must be a Python dotted module name")
         if self.accelerator:
             self.gpu = True
         if self.requirements and not self.internet:
             raise ValueError("requirements installation requires internet=True")
+        self._check_command()
+        self._check_names()
+        validate_nonsecret_env(self.env)
+        # Parameters are shown in results folders and on the command line.
+        validate_nonsecret_env({name: str(value) for name, value in self.params.items()}, label="parameter")
+        return self
+
+    def _check_command(self):
+        if self.entrypoint and self.module:
+            raise ValueError("Choose entrypoint or module, not both")
+        if self.module and not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*", self.module):
+            raise ValueError("module must be a Python dotted module name")
+
+    def _check_names(self):
         for name in [*self.env, *self.inputs]:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 raise ValueError(f"Invalid environment/input name: {name}")
@@ -80,13 +91,14 @@ class JobSpec(Model):
             raise ValueError("Input names must be unique ignoring case")
         if any(key.startswith("KGR_") for key in self.env):
             raise ValueError("KGR_ environment variables are reserved")
-        validate_nonsecret_env(self.env)
         for name in self.params:
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
                 raise ValueError(f"Invalid parameter name: {name}")
-        # Parameters are shown in results folders and on the command line.
-        validate_nonsecret_env({name: str(value) for name, value in self.params.items()}, label="parameter")
-        return self
+
+    @property
+    def pool(self) -> Pool:
+        """The slots a run of this spec takes on its account."""
+        return "gpu" if self.gpu else "cpu"
 
     def command_args(self) -> list[str]:
         """args, then each parameter as --NAME VALUE; true passes --NAME alone and false omits it."""
@@ -229,7 +241,14 @@ JobState = Literal[
     "needs_attention",
 ]
 TERMINAL = {"succeeded", "failed", "cancelled"}
+# May hold a remote run, and so an account's slot.
 ACTIVE = {"submitting", "remote_queued", "running", "needs_attention"}
+# Waiting to start on their account.
+PENDING = {"queued", "preparing"}
+# Without a possible remote run, so they can change account.
+MOVABLE = {"queued", "preparing", "blocked"}
+# Settled without operator action, apart from download retries.
+HALTED = {"blocked", "needs_attention"}
 
 
 class Attempt(Model):
@@ -303,6 +322,30 @@ class JobRecord(Model):
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL
+
+    @property
+    def pool(self) -> Pool:
+        return self.spec.pool
+
+    @property
+    def movable(self) -> bool:
+        """It has no possible remote run, so it can change account."""
+        return self.state in MOVABLE
+
+    @property
+    def outstanding(self) -> bool:
+        """Its latest attempt may still run remotely, so it holds a slot on that attempt's account."""
+        return bool(
+            self.attempts
+            and self.attempts[-1].state in {"submitting", "accepted", "uncertain"}
+            and not self.terminal
+        )
+
+    def settled(self, *, downloads: bool = True) -> bool:
+        """Nothing further happens without operator action, apart from download retries."""
+        if self.state in HALTED:
+            return True
+        return self.terminal and (not downloads or self.download_state in {"complete", "disabled", "error"})
 
 
 class BatchRecord(Model):

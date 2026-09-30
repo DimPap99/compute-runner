@@ -16,7 +16,7 @@ from .models import ACTIVE, JobState
 from .providers import safe_message
 from .results import RUN_RECORD, listed_outputs
 from .store import atomic_write
-from .worker import MOVABLE, inventory, last_discovery, occupancy, outstanding
+from .worker import inventory, last_discovery, occupancy
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
 ERRORS = (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error, yaml.YAMLError)
@@ -35,7 +35,7 @@ def summary(job):
         name=short(job.spec.name, 100),
         state=job.state,
         account=job.account,
-        resource=short(job.spec.accelerator, 100) or ("gpu" if job.spec.gpu else "cpu"),
+        resource=short(job.spec.accelerator, 100) or job.pool,
         internet=job.spec.internet,
         downloads=job.download_state,
         outputs_ready=job.download_state == "complete",
@@ -227,14 +227,14 @@ class AgentClient:
         found, now = self._discovery(live, selected), time.time()
         runs, ours = [], set()
         for job in self.client.store.list(ACTIVE):
-            if not outstanding(job) or selected not in (None, job.attempts[-1].account):
+            if not job.outstanding or selected not in (None, job.attempts[-1].account):
                 continue
             attempt = job.attempts[-1]
             ours.add((attempt.account, attempt.ref.lower()))
             run = dict(
                 account=attempt.account,
                 ref=attempt.ref,
-                resource="gpu" if job.spec.gpu else "cpu",
+                resource=job.pool,
                 job_id=job.id,
                 name=short(job.spec.name, 100),
                 state=job.state,
@@ -411,7 +411,7 @@ class AgentClient:
         _, jobs = self.client.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
         moved, rejected = 0, []
         for job in jobs:
-            if job.state not in MOVABLE or (job.account == target and (job.transfer or not transfer)):
+            if not job.movable or (job.account == target and (job.transfer or not transfer)):
                 continue
             try:
                 self.client.move(job.id, target, transfer=transfer)

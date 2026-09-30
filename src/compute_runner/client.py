@@ -14,7 +14,7 @@ from .providers import Provider, connect
 from .results import experiment_dir, outputs_dir, verified_checkpoint
 from .runtime import json_digest, safe_relative
 from .store import Store, load_config, try_lock
-from .worker import MOVABLE, Worker, collect_outputs, outstanding, place, settled
+from .worker import Worker, collect_outputs
 
 
 def resume_required(spec: JobSpec) -> JobSpec:
@@ -223,7 +223,7 @@ class Client:
         job = self.get(job_id)
         if job.terminal:
             raise ValueError(f"The job has already finished ({job.state})")
-        if outstanding(job):
+        if job.outstanding:
             attempt = job.attempts[-1]
             if attempt.state != "accepted":
                 raise ValueError(f"The submission is unconfirmed; inspect it first: {job.url}")
@@ -264,7 +264,7 @@ class Client:
         if previous is not None:
             return previous
         job = self.get(job_id)
-        if outstanding(job):
+        if job.outstanding:
             raise ValueError(f"An execution may still exist; resolve it before rerunning: {job.url}")
         if not job.terminal and job.state != "blocked":
             raise ValueError("Retry accepts a terminal or blocked job only")
@@ -330,11 +330,11 @@ class Client:
         target = self.config.account(account).id
         if target == job.account and not (transfer and not job.transfer):
             raise ValueError(f"The job is already on {target}")
-        if job.state not in MOVABLE:
+        if not job.movable:
             raise ValueError(f"Only jobs that have not been submitted can move; this one is {job.state}")
         self.provider(target).check(job.spec)
         reason = f"Moved from {job.account} on request" if target != job.account else "Dataset copies allowed"
-        moved = place(self.store, job_id, target, reason, transfer=transfer or job.transfer)
+        moved = self.store.place(job_id, target, reason, transfer=transfer or job.transfer)
         if moved is None:
             raise ValueError("Job changed state while moving; inspect its current status")
         return moved
@@ -376,7 +376,7 @@ class Client:
         while True:
             _, jobs = self.store.page(batch_id=batch_id, job_ids=job_ids, limit=-1)
             now = time.monotonic()
-            if all(settled(job, downloads=downloads) for job in jobs):
+            if all(job.settled(downloads=downloads) for job in jobs):
                 return jobs, True
             if deadline is not None and now >= deadline:
                 return jobs, False
