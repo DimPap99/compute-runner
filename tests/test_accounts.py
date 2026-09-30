@@ -98,10 +98,9 @@ def test_busy_slots_move_only_as_many_jobs_as_the_other_account_can_start(two_ac
         account.cpu_limit = 1
     # Moved jobs stay in preparation there, so they must still count against its slots.
     other.upload_ready = False
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "main.py").write_text("print('hi')\n")
-    jobs = client.submit_many([spec.model_copy(update={"source": project, "entrypoint": "main.py"})] * 3)
+    data = tmp_path / "data.txt"
+    data.write_text("input")
+    jobs = client.submit_many([spec.model_copy(update={"inputs": {"data": data}})] * 3)
     client.worker().tick()
     placed = [client.get(job.id) for job in jobs]
     assert [(job.account, job.state) for job in placed] == [
@@ -117,20 +116,19 @@ def test_busy_slots_move_only_as_many_jobs_as_the_other_account_can_start(two_ac
 
 def test_moved_job_uploads_its_inputs_to_the_new_account(two_accounts, tmp_path):
     client, home, other, spec = two_accounts
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "main.py").write_text("print('hi')\n")
+    data = tmp_path / "data.txt"
+    data.write_text("input")
     home.push_error = RemoteError("Invalid machine shape", "invalid", definitive=True)
-    job = client.submit(spec.model_copy(update={"source": project, "entrypoint": "main.py"}))
+    job = client.submit(spec.model_copy(update={"inputs": {"data": data}}))
     client.worker().tick()
     blocked = client.get(job.id)
-    assert blocked.state == "blocked" and blocked.upload_refs["source"].startswith("tester/")
+    assert blocked.state == "blocked" and blocked.upload_refs["input:data"].startswith("tester/")
     moved = client.move(job.id, "kaggle:other")
     assert moved.state == "queued" and moved.upload_refs == {} and moved.wait_reason.startswith("Moved from")
     client.worker().tick()
     job = client.get(job.id)
-    assert job.state == "remote_queued" and job.upload_refs["source"].startswith("other/")
-    assert other.pushes[0]["dataset_sources"] == [job.upload_refs["source"]]
+    assert job.state == "remote_queued" and job.upload_refs["input:data"].startswith("other/")
+    assert other.pushes[0]["dataset_sources"] == [job.upload_refs["input:data"]]
     assert [attempt.account for attempt in job.attempts] == ["kaggle:tester", "kaggle:other"]
 
 
@@ -332,11 +330,9 @@ def test_a_job_retrying_uploads_keeps_its_account_and_does_not_push_others_away(
     client, home, other, spec = two_accounts
     client.config.failover = "auto"
     client.config.retry_seconds = 60
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "main.py").write_text("print('hi')\n")
-    data = tmp_path / "data.txt"
+    data, extra = tmp_path / "data.txt", tmp_path / "extra.txt"
     data.write_text("input")
+    extra.write_text("more input")
     uploaded = home.ensure_bundle
 
     def second_upload_fails(bundle):
@@ -345,7 +341,7 @@ def test_a_job_retrying_uploads_keeps_its_account_and_does_not_push_others_away(
         return uploaded(bundle)
 
     home.ensure_bundle = second_upload_fails
-    first = client.submit(spec.model_copy(update={"source": project, "entrypoint": "main.py", "inputs": {"data": data}}))
+    first = client.submit(spec.model_copy(update={"inputs": {"data": data, "extra": extra}}))
     later = client.submit_many([spec] * 2)
     worker = client.worker()
     worker.tick()
