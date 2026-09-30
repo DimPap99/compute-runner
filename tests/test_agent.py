@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from compute_runner import AgentClient, Client, JobSpec
 from compute_runner.cli import app
 from compute_runner.store import Store
+
 from conftest import due
 
 

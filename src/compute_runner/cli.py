@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from . import service
 from .agent import ERRORS
 from .agent_cli import agent_app
 from .client import Client
@@ -25,7 +26,6 @@ from .providers import connect, safe_message
 from .security import redacted_env_record
 from .store import atomic_json, config_path, load_config
 from .workloads import workload_specs
-from . import service
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -328,7 +328,8 @@ def submit(
         list[str] | None,
         typer.Option(
             "--input",
-            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); read as KGR_INPUT_ALIAS",
+            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); "
+            "read as KGR_INPUT_ALIAS",
         ),
     ] = None,
     requirements: Annotated[

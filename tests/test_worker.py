@@ -5,6 +5,7 @@ import pytest
 from compute_runner import Account, JobSpec
 from compute_runner.providers import RemoteError
 from compute_runner.worker import outstanding
+
 from conftest import due
 
 
@@ -298,6 +299,7 @@ def test_fifo_waits_for_inputs_but_other_resource_pool_progresses(setup, tmp_pat
 
 def test_concurrent_clients_keep_every_submission(setup):
     from concurrent.futures import ThreadPoolExecutor
+
     from compute_runner import Client
 
     client, backend, spec = setup

@@ -57,7 +57,8 @@ def submit(
         list[str] | None,
         typer.Option(
             "--input",
-            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); read as KGR_INPUT_ALIAS",
+            help="ALIAS=PATH or ALIAS=REFERENCE (kaggle:OWNER/SLUG, ssh:/PATH, job:ID); "
+            "read as KGR_INPUT_ALIAS",
         ),
     ] = None,
     requirements: Annotated[

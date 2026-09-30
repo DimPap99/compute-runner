@@ -17,11 +17,12 @@ import urllib3
 from typer.testing import CliRunner
 
 from compute_runner import Account, JobSpec
+from compute_runner.cli import app
 from compute_runner.providers import RemoteError
 from compute_runner.providers.downloads import download_outputs
 from compute_runner.providers.kaggle import READ_TIMEOUT, KaggleProvider
-from compute_runner.cli import app
 from compute_runner.results import JobOutputs
+
 from conftest import due, staged_launcher
 
 

@@ -25,10 +25,10 @@ from compute_runner.bundle import snapshot_bundle
 from compute_runner.cli import app
 from compute_runner.credentials import account_secrets, credentials_path
 from compute_runner.models import SshSettings, input_reference
-from compute_runner.providers import RemoteError
-from compute_runner.providers import ssh_remote
+from compute_runner.providers import RemoteError, ssh_remote
 from compute_runner.providers.ssh import HELPER, SshProvider
 from compute_runner.runtime import __file__ as RUNTIME
+
 from conftest import FakeProvider, due
 
 
@@ -174,7 +174,8 @@ def test_a_workload_runs_detached_and_its_outputs_come_back(lab):
 def test_requirements_install_into_a_virtual_environment_of_the_run(lab):
     (lab.project / "requirements.txt").write_text("")
     (lab.project / "env.py").write_text(
-        "import os, sys\nfrom pathlib import Path\nPath(os.environ['KGR_OUTPUT_DIR'], 'python.txt').write_text(sys.prefix)\n"
+        "import os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['KGR_OUTPUT_DIR'], 'python.txt').write_text(sys.prefix)\n"
     )
     spec = JobSpec(source=lab.project, entrypoint="env.py", internet=True, requirements="requirements.txt")
     [job] = settle(lab.client, lab.client.submit(spec).id, seconds=180)
@@ -253,7 +254,8 @@ def test_processes_a_finished_workload_leaves_behind_are_stopped(lab):
 
 def test_following_a_log_returns_exactly_what_was_written(lab):
     (lab.project / "talk.py").write_text(
-        "import time\nfor i in range(5):\n    print(f'line {i} \u00e9\u00e8', flush=True)\n    time.sleep(0.4)\n"
+        "import time\nfor i in range(5):\n"
+        "    print(f'line {i} \u00e9\u00e8', flush=True)\n    time.sleep(0.4)\n"
     )
     job = lab.client.submit(JobSpec(source=lab.project, entrypoint="talk.py", internet=True))
     running(lab.client, job.id)
@@ -297,7 +299,8 @@ def test_a_run_whose_machine_restarted_is_reported_failed(lab):
 def test_gpu_jobs_get_their_own_device_and_wait_when_all_are_busy(lab):
     (lab.project / "gpu.py").write_text(
         "import os, time\nfrom pathlib import Path\n"
-        "Path(os.environ['KGR_OUTPUT_DIR'], 'cuda.txt').write_text(os.environ['CUDA_VISIBLE_DEVICES'])\ntime.sleep(3)\n"
+        "Path(os.environ['KGR_OUTPUT_DIR'], 'cuda.txt').write_text(os.environ['CUDA_VISIBLE_DEVICES'])\n"
+        "time.sleep(3)\n"
     )
     ids = [
         lab.client.submit(
@@ -368,7 +371,8 @@ def test_a_kaggle_dataset_is_copied_onto_the_machine(lab):
     lab.client.config.transfer = True
     (lab.project / "use.py").write_text(
         "import os\nfrom pathlib import Path\n"
-        "Path(os.environ['KGR_OUTPUT_DIR'], 'files.txt').write_text(' '.join(sorted(os.listdir(os.environ['KGR_INPUT_DATA']))))\n"
+        "listed = ' '.join(sorted(os.listdir(os.environ['KGR_INPUT_DATA'])))\n"
+        "Path(os.environ['KGR_OUTPUT_DIR'], 'files.txt').write_text(listed)\n"
     )
     spec = JobSpec(
         source=lab.project, entrypoint="use.py", internet=True, inputs={"data": Path("kaggle:tester/private")}

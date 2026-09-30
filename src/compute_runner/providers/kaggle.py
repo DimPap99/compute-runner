@@ -268,7 +268,8 @@ class KaggleProvider:
                     id=ref,
                     title="kgr b " + digest[:40],
                     licenses=[{"name": "other"}],
-                    description="Private workload snapshot. Original copyright and license terms in the included "
+                    description="Private workload snapshot. Original copyright and license terms in the "
+                    "included "
                     "files apply; no additional permissions are granted. SHA256: " + digest,
                 ),
             )

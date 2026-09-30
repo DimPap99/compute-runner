@@ -9,6 +9,7 @@ import pytest
 from compute_runner import JobSpec
 from compute_runner.bundle import describe, inventory, snapshot, snapshot_bundle
 from compute_runner.runtime import _find_bundle, _unpack
+
 from conftest import staged_launcher
 
 
@@ -121,7 +122,8 @@ def test_notebook_outputs_cleared_without_editing_original(tmp_path):
 def test_script_launcher_executes_locally(setup, tmp_path):
     client, backend, spec = setup
     spec.source.write_text(
-        'import os\nfrom pathlib import Path\nPath(os.environ["KGR_OUTPUT_DIR"], "result.txt").write_text("ok")\n'
+        "import os\nfrom pathlib import Path\n"
+        'Path(os.environ["KGR_OUTPUT_DIR"], "result.txt").write_text("ok")\n'
     )
     job = client.submit(spec)
     script = staged_launcher(backend, job)

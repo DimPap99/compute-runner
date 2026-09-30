@@ -9,8 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .security import validate_nonsecret_env
 from .paths import application_dir
+from .security import validate_nonsecret_env
 
 
 class Model(BaseModel):
@@ -176,7 +176,8 @@ class Config(Model):
     strict: bool = False
     # Parent of the experiment folders; None puts results/ beside each workload's code.
     results_dir: Path | None = None
-    # Copy a dataset the job's account cannot read from an account that can; see docs/accounts.md, "Datasets across accounts".
+    # Copy a dataset the job's account cannot read from an account that can; see docs/accounts.md,
+    # "Datasets across accounts".
     transfer: bool = False
     state_dir: Path = Field(default_factory=lambda: application_dir("STATE"))
 

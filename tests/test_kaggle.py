@@ -7,8 +7,8 @@ from types import SimpleNamespace as Obj
 import pytest
 import requests
 
-from compute_runner import store as store_module
 from compute_runner import Account
+from compute_runner import store as store_module
 from compute_runner.providers import RemoteError, remote_error, safe_message
 from compute_runner.providers.downloads import download_outputs
 from compute_runner.providers.kaggle import KaggleProvider, render_log

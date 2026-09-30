@@ -2,7 +2,8 @@
 
 Opt-in, since it launches notebooks and creates private datasets on the account:
 
-    KGR_TEST_KAGGLE=USERNAME KGR_TEST_KAGGLE_CREDENTIALS=path/to/kaggle.json-or-token pytest tests/test_live_kaggle.py
+    KGR_TEST_KAGGLE=USERNAME KGR_TEST_KAGGLE_CREDENTIALS=path/to/kaggle.json-or-token \\
+        pytest tests/test_live_kaggle.py
 
 KGR_TEST_KAGGLE_GPU=1 trains on a GPU (a minute or two of GPU quota). KGR_TEST_KAGGLE_PACE sets the
 seconds between worker cycles (default 20).

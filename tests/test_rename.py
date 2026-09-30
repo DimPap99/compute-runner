@@ -3,8 +3,7 @@
 import pytest
 from typer.testing import CliRunner
 
-from compute_runner import Client, Config, JobSpec
-from compute_runner import service
+from compute_runner import Client, Config, JobSpec, service
 from compute_runner.cli import app
 from compute_runner.paths import APP_NAME, LEGACY_APP_NAME, application_dir
 from compute_runner.store import atomic_json, config_path

@@ -118,7 +118,7 @@ def _unpack_once(archive, digest, target):
     _unpack(Path(archive), digest, staging)
     with zipfile.ZipFile(archive) as bundle:
         (staging / MANIFEST).write_bytes(bundle.read(MANIFEST))
-    for root, dirs, files in os.walk(staging):
+    for root, _dirs, files in os.walk(staging):
         for name in files:
             os.chmod(os.path.join(root, name), 0o444)
         os.chmod(root, 0o555)
@@ -131,7 +131,7 @@ def _unpack_once(archive, digest, target):
 
 
 def _make_writable(root):
-    for current, dirs, files in os.walk(root):
+    for current, _dirs, _files in os.walk(root):
         os.chmod(current, 0o755)
 
 

@@ -5,8 +5,8 @@ import json
 import re
 import sqlite3
 import subprocess
-from contextlib import contextmanager
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,7 @@ import pytest
 from compute_runner import Client, JobSpec
 from compute_runner.client import resume_required
 from compute_runner.workloads import load_specs, workload_specs
+
 from conftest import due, staged_launcher
 
 

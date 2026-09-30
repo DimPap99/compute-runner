@@ -10,14 +10,13 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import zipfile
-
+from pathlib import Path, PurePosixPath
 
 MANIFEST = "kgr-manifest.json"
 

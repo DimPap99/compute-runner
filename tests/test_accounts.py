@@ -8,9 +8,10 @@ from typer.testing import CliRunner
 
 from compute_runner import Account, Config
 from compute_runner.cli import app
-from compute_runner.providers import RemoteError
 from compute_runner.credentials import account_secrets, credentials_path, kaggle_secrets
+from compute_runner.providers import RemoteError
 from compute_runner.providers.kaggle import KaggleProvider, _api_class
+
 from conftest import due
 
 
@@ -253,7 +254,7 @@ def test_account_credentials_file_ignores_ambient_kaggle_settings(tmp_path, monk
         assert client._http_client._session.auth == ("tester", "0" * 32)
     provider = KaggleProvider(Account(user="someoneelse", credentials=path), tmp_path)
     with pytest.raises(RemoteError, match="authenticate as tester") as error:
-        provider.api
+        _ = provider.api
     assert error.value.kind == "auth"
 
 
@@ -310,7 +311,7 @@ def test_providers_read_the_credentials_file_before_older_settings(tmp_path, mon
     assert provider._secrets()["key"] == "n" * 32
     credentials_path().write_text(json.dumps({"kaggle:alice": {"password": "x"}}))
     with pytest.raises(RemoteError, match="take text fields: key, token, username") as error:
-        provider.api
+        _ = provider.api
     assert "x" not in str(error.value).split("take text fields")[0].split(":")[-1]
 
 

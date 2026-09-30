@@ -4,8 +4,8 @@ from typer.testing import CliRunner
 
 from compute_runner import Client
 from compute_runner.cli import app
-from compute_runner.workloads import load_specs
 from compute_runner.service import unit_text
+from compute_runner.workloads import load_specs
 
 
 def test_cli_init_dry_run_and_submit(tmp_path, monkeypatch):

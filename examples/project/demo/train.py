@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+
 from demo.util import square
 
 parser = argparse.ArgumentParser()
