@@ -59,16 +59,31 @@ def initialize(
             "unchanged when omitted",
         ),
     ] = None,
+    retention_days: Annotated[
+        float | None,
+        typer.Option(
+            min=0,
+            help="Days after a job finished before the worker deletes its local leftovers and queue "
+            "record, as cleanup --delete would; 0 turns it off. Default off; unchanged when omitted",
+        ),
+    ] = None,
 ):
-    """Save worker-wide settings: failover, polling, strict mode, results folder and dataset copies."""
+    """Save worker-wide settings: failover, polling, strict mode, results, dataset copies and retention."""
+    # "" and 0 restore these settings' defaults.
+    unset = []
+    if results_dir == "":
+        unset.append("results_dir")
+    if retention_days == 0:
+        unset.append("retention_days")
     config = save_settings(
         ctx,
-        unset=("results_dir",) if results_dir == "" else (),
+        unset=unset,
         failover=failover,
         poll_seconds=poll_seconds,
         strict=strict,
         results_dir=Path(results_dir).expanduser().absolute() if results_dir else None,
         transfer=transfer,
+        retention_days=retention_days or None,
     )
     output(ctx).emit(
         dict(
@@ -78,6 +93,7 @@ def initialize(
             strict=config.strict,
             results_dir=str(config.results_dir or "results/ beside each workload's code"),
             transfer=config.transfer,
+            retention_days=config.retention_days,
         )
     )
 

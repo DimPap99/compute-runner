@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -16,7 +15,10 @@ import pathspec
 from .models import JobSpec
 from .runtime import MANIFEST, json_digest, manifest_records, safe_relative, verify_files
 from .security import detected_secret, secret_filename
-from .store import atomic_json
+from .store import json_bytes
+
+# The archive of every bundle; see BundleWriter.
+PAYLOAD = "payload.zip"
 
 PROTECTED = {
     ".git",
@@ -230,10 +232,22 @@ def snapshot_bundle(root: Path, files: list, bundle_root: Path, *, notebooks=Fal
     return BundleWriter(bundle_root, notebooks=notebooks, screen=screen).write(root, files)
 
 
-class BundleWriter:
-    """Writes immutable, content-addressed bundles: bundle_root/DIGEST/{files/, payload.zip}.
+def bundle_payload(state_dir: Path, digest: str) -> Path:
+    """A saved bundle's archive: every file and the manifest, and the only copy the runner keeps."""
+    return state_dir / "bundles" / digest / PAYLOAD
 
-    screen rejects files containing recognizable credentials; copies of provider datasets,
+
+def bundle_files(state_dir: Path, digest: str, names) -> dict[str, bytes]:
+    """Some files of a saved bundle, read from its archive."""
+    with zipfile.ZipFile(bundle_payload(state_dir, digest)) as archive:
+        return {name: archive.read(name) for name in names}
+
+
+class BundleWriter:
+    """Writes immutable, content-addressed bundles: bundle_root/DIGEST/payload.zip.
+
+    Files go straight into the archive, which is byte-for-byte reproducible; no unpacked copy is
+    kept. screen rejects files containing recognizable credentials; copies of provider datasets,
     which are already on the provider, are not screened. notebooks clears notebooks' outputs.
     """
 
@@ -246,30 +260,33 @@ class BundleWriter:
         self.bundle_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(prefix=".building-", dir=self.bundle_root) as temporary:
             stage = Path(temporary)
-            records = {
-                relative.as_posix(): self._copy(root / relative, stage / "files" / relative, relative)
-                for relative in map(Path, files)
-            }
-            digest = json_digest(records)
-            atomic_json(stage / "files" / MANIFEST, dict(schema_version=1, digest=digest, files=records))
-            self._archive(stage, records)
+            with zipfile.ZipFile(stage / PAYLOAD, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                # In name order, so the same files always make the same archive.
+                records = {
+                    name: self._copy(root / name, archive, name)
+                    for name in sorted(Path(relative).as_posix() for relative in files)
+                }
+                digest = json_digest(records)
+                manifest = json_bytes(dict(schema_version=1, digest=digest, files=records))
+                with archive.open(_archive_entry(MANIFEST, len(manifest)), "w") as target:
+                    target.write(manifest)
+            with (stage / PAYLOAD).open("rb") as written:
+                os.fsync(written.fileno())
             self._publish(stage, digest)
         return dict(digest=digest, bytes=sum(record["size"] for record in records.values()), files=records)
 
-    def _copy(self, original: Path, destination: Path, relative: Path) -> dict:
-        """Copy one file, screened; it must not change meanwhile. Returns its manifest record."""
+    def _copy(self, original: Path, archive: zipfile.ZipFile, name: str) -> dict:
+        """Add one file to the archive, screened; it must not change meanwhile. Returns its record."""
         before = original.stat()
-        destination.parent.mkdir(parents=True, exist_ok=True)
         cleaned = self._cleaned(original)
-        with destination.open("wb") as output:
+        size = before.st_size if cleaned is None else len(cleaned)
+        with archive.open(_archive_entry(name, size), "w") as output:
             if cleaned is not None:
-                self._check(cleaned, relative)
+                self._check(cleaned, name)
                 output.write(cleaned)
-                digest, size = hashlib.sha256(cleaned), len(cleaned)
+                digest = hashlib.sha256(cleaned)
             else:
-                digest, size = self._stream(original, output, relative)
-            output.flush()
-            os.fsync(output.fileno())
+                digest, size = self._stream(original, output, name)
         after = original.stat()
         if (before.st_size, before.st_mtime_ns, before.st_ino) != (
             after.st_size,
@@ -287,33 +304,21 @@ class BundleWriter:
         except ValueError:
             return None  # Only the entrypoint runs, and describe() validated it; copy others unchanged.
 
-    def _stream(self, original: Path, output, relative: Path):
+    def _stream(self, original: Path, output, name: str):
         digest, size, tail = hashlib.sha256(), 0, b""
         with original.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
                 # A credential split between two chunks is still found in the previous chunk's tail.
-                self._check(tail + chunk, relative)
+                self._check(tail + chunk, name)
                 digest.update(chunk)
                 output.write(chunk)
                 size += len(chunk)
                 tail = chunk[-512:]
         return digest, size
 
-    def _check(self, data: bytes, relative: Path) -> None:
+    def _check(self, data: bytes, name: str) -> None:
         if self.screen and (kind := detected_secret(data)):
-            raise ValueError(f"Detected {kind} in {relative}; remove or exclude that credential")
-
-    @staticmethod
-    def _archive(stage: Path, records: dict) -> None:
-        """payload.zip: every file and the manifest, byte-for-byte reproducible."""
-        payload = stage / "files"
-        with zipfile.ZipFile(stage / "payload.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for relative in [*sorted(records), MANIFEST]:
-                info = zipfile.ZipInfo(relative, date_time=(2020, 1, 1, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = 0o100644 << 16
-                with (payload / relative).open("rb") as source_file, archive.open(info, "w") as target:
-                    shutil.copyfileobj(source_file, target, 1024 * 1024)
+            raise ValueError(f"Detected {kind} in {name}; remove or exclude that credential")
 
     def _publish(self, stage: Path, digest: str) -> None:
         """Move the finished bundle into place; one that already exists is kept, as it is identical."""
@@ -325,6 +330,16 @@ class BundleWriter:
         except OSError:
             if not target.exists():
                 raise
+
+
+def _archive_entry(name: str, size: int) -> zipfile.ZipInfo:
+    """An archive entry that does not depend on when or where it was written."""
+    info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o100644 << 16
+    # Known in advance, so a file over 2 GiB gets ZIP64 headers rather than failing.
+    info.file_size = size
+    return info
 
 
 def snapshot(spec: JobSpec, state_dir: Path, *, skip=()) -> dict:

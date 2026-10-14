@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from .. import runtime
+from ..bundle import PAYLOAD, bundle_payload
 from ..credentials import account_secrets, credentials_path
 from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets
@@ -332,8 +333,8 @@ class SshProvider(Provider):
         target = self._bundle_dir(digest)
         if self._call("bundle_ready", target=posixpath.join(target, "files"))["ready"]:
             return digest
-        archive = posixpath.join(target, "payload.zip")
-        local = self.state_dir / "bundles" / digest / "payload.zip"
+        archive = posixpath.join(target, PAYLOAD)
+        local = bundle_payload(self.state_dir, digest)
         with self._sftp_session(f"Uploading bundle {digest[:12]}") as sftp:
             self._mkdirs(sftp, target)
             temporary = f"{archive}.{time.time_ns()}.part"

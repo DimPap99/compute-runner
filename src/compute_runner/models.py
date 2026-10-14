@@ -198,6 +198,9 @@ class Config(Model):
     # Copy a dataset the job's account cannot read from an account that can; see docs/accounts.md,
     # "Datasets across accounts".
     transfer: bool = False
+    # Days after a job finished before the worker deletes its local leftovers and queue record;
+    # None keeps them until a cleanup. See docs/operations.md, "Cleanup".
+    retention_days: float | None = Field(default=None, gt=0)
     state_dir: Path = Field(default_factory=lambda: application_dir("STATE"))
 
     @model_validator(mode="before")
@@ -260,6 +263,23 @@ HALTED = {"blocked", "needs_attention"}
 COLLECTED = {"complete", "disabled"}
 
 
+def slim_snapshot(snapshot: dict) -> dict:
+    """A job's snapshot as its record keeps it: input bundles by digest and size, without file lists.
+
+    Nothing reads an input's list from the record, and each bundle's manifest holds it; a large
+    input folder would otherwise put megabytes into a record that every update rewrites. The
+    source keeps its list, which launches and output listings read.
+    """
+    inputs = snapshot.get("inputs") or {}
+    if not any("files" in bundle for bundle in inputs.values()):
+        return snapshot
+    slim = {
+        alias: {key: value for key, value in bundle.items() if key != "files"}
+        for alias, bundle in inputs.items()
+    }
+    return snapshot | {"inputs": slim}
+
+
 def checked_states(states) -> list[str] | None:
     """Job states named by a caller, sorted and without repeats; None stays None (every state)."""
     if states is None:
@@ -314,6 +334,11 @@ class JobRecord(Model):
     transfer: bool = False
     # Datasets copied for this job: {alias: {"source": ..., "digest": ..., "bytes": ...}}.
     transfers: dict[str, dict] = Field(default_factory=dict)
+
+    @field_validator("snapshot")
+    @classmethod
+    def _slim(cls, snapshot: dict) -> dict:
+        return slim_snapshot(snapshot)
 
     @model_validator(mode="before")
     @classmethod

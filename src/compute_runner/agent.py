@@ -10,7 +10,7 @@ import yaml
 from .logcache import LogCache
 from .models import checked_states
 from .providers import short
-from .results import RUN_RECORD, listed_outputs
+from .results import RUN_LOG, RUN_RECORD, listed_outputs
 from .views import CapacityView
 
 # Operation failures reported to callers as a message; anything else is a bug and keeps its traceback.
@@ -388,7 +388,7 @@ class AgentClient:
         job = self.client.get(self.client.store.resolve_id(job_id))
         root, files = listed_outputs(job)
         page = files[offset : offset + limit]
-        log = job.result_dir / "run.log"
+        log = job.result_dir / RUN_LOG
         value = dict(
             schema_version=1,
             id=job.id,

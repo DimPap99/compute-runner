@@ -6,7 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..bundle import plain_files, snapshot_bundle
+from ..bundle import bundle_payload, plain_files, snapshot_bundle
 from ..models import JobRecord
 from ..providers import RemoteError
 from .context import Component
@@ -135,7 +135,7 @@ class DatasetAccess(Component):
         source = f"{self.config.account(account).provider}:{ref}"
         bundles = self.config.state_dir / "bundles"
         saved = self.store.dataset_copy(source)
-        if saved is None or not (bundles / saved["digest"] / "payload.zip").is_file():
+        if saved is None or not bundle_payload(self.config.state_dir, saved["digest"]).is_file():
             self.heartbeat(stage=f"copying dataset {ref}")
             with tempfile.TemporaryDirectory(prefix=".dataset-", dir=self.config.state_dir) as folder:
                 self.provider(account).fetch_dataset(ref, Path(folder))

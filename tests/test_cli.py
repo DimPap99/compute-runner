@@ -90,6 +90,11 @@ def test_settings_and_account_limits_persist(tmp_path, monkeypatch):
     assert [(a["user"], a["cpu_limit"]) for a in saved["accounts"]] == [("tester", 2)]
     assert saved["strict"] is True and saved["failover"] == "auto"
     assert Client().provider().strict is True
+    assert runner.invoke(app, ["init", "--retention-days", "30"]).exit_code == 0
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert Client().config.retention_days == 30
+    assert runner.invoke(app, ["init", "--retention-days", "0"]).exit_code == 0
+    assert Client().config.retention_days is None
     result = runner.invoke(app, ["init", "--failover", "sometimes"])
     assert isinstance(result.exception, ValueError) and "failover" in str(result.exception)
 

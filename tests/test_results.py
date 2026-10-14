@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from compute_runner import Client, JobSpec
+from compute_runner.bundle import bundle_files
 from compute_runner.client import resume_required
+from compute_runner.runtime import MANIFEST
 from compute_runner.workloads import load_specs, workload_specs
 
 from conftest import due, staged_launcher
@@ -55,7 +57,7 @@ def test_run_folders_are_numbered_at_submission_beside_the_code(setup, tmp_path)
     finish(client, backend)
     assert json.loads((first.result_dir / "job.json").read_text())["state"] == "succeeded"
     assert (first.result_dir / "outputs/result.json").read_text() == '{"ok": true}'
-    assert (first.result_dir / "run.log").read_text() == "remote completed\n"
+    assert (first.result_dir / "run.log").read_text() == "example log\n"
     rows = (experiment / "runs.md").read_text()
     assert rows.count("| succeeded |") == 3 and rows.count("| complete |") == 3
 
@@ -254,9 +256,16 @@ def test_inputs_can_name_another_jobs_outputs(setup):
     finish(client, backend)
     train = client.submit(uses)
     assert str(train.spec.inputs["features"]) == f"job:{prep.id}/features"
-    assert list(train.snapshot["inputs"]["features"]["files"]) == ["a.npy"]
+    assert saved_files(client, train.snapshot["inputs"]["features"]) == ["a.npy"]
     with pytest.raises(ValueError, match="has no output missing"):
         client.submit(spec.model_copy(update={"inputs": {"x": Path(f"job:{prep.id}/missing")}}))
+
+
+def saved_files(client, bundle) -> list[str]:
+    """A saved input's files, from its bundle's manifest: job records keep inputs by digest and size."""
+    assert "files" not in bundle
+    manifest = bundle_files(client.config.state_dir, bundle["digest"], [MANIFEST])[MANIFEST]
+    return sorted(json.loads(manifest)["files"])
 
 
 def checkpoints(backend, digest=None):
@@ -296,8 +305,8 @@ def test_continue_resumes_from_the_verified_checkpoint_as_the_next_run(two_accou
     assert job.spec.args == ["--resume", "required"]
     assert str(job.spec.inputs["resume"]) == f"job:{first['id']}/checkpoints"
     # Only the manifest and the checkpoint it names are uploaded.
-    resume = job.snapshot["inputs"]["resume"]["files"]
-    assert sorted(resume) == ["checkpoint-step-000000000010.pt", "latest.json"]
+    resume = saved_files(client, job.snapshot["inputs"]["resume"])
+    assert resume == ["checkpoint-step-000000000010.pt", "latest.json"]
     client.worker().tick()
     assert len(other.pushes) == 1
     assert "| 001 |" in (job.result_dir.parent / "runs.md").read_text()

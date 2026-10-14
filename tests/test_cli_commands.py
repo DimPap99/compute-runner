@@ -133,8 +133,9 @@ def test_cleanup_reports_and_deletes_after_confirmation(setup, run):
     assert f"jobs/{job.id}" in run("cleanup") and "--delete removes them" in run("cleanup")
     run("cleanup", "--delete", input="n\n", code=1)
     assert (client.config.state_dir / "jobs" / job.id).exists()
-    assert "Deleted 1 items" in run("cleanup", "--delete", "--yes")
-    assert not (client.config.state_dir / "jobs" / job.id).exists()
+    # Its staging folder, then its record.
+    assert "Deleted 2 items" in run("cleanup", "--delete", "--yes")
+    assert not (client.config.state_dir / "jobs" / job.id).exists() and client.list() == []
 
 
 def test_agent_commands_for_the_whole_picture(setup, run):

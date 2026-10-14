@@ -39,3 +39,6 @@ id_ed25519
 
 # Results of running the examples
 examples/**/results/
+
+# Local planning notes
+MCP_BLUEPRINT.md

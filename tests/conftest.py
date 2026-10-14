@@ -81,7 +81,8 @@ class FakeProvider(KaggleProvider):
         self.download_calls += 1
         if self.download_error:
             raise self.download_error
-        sink.log("remote completed\n")
+        # The same log logs() serves, as a provider's stored log is one.
+        sink.log("".join(self.logs(ref)))
         # Remote names are relative to /kaggle/working, as on Kaggle.
         for name, text in self.output_files.items():
             if (target := sink.target(name)) is not None:

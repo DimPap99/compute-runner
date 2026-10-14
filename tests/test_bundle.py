@@ -7,7 +7,7 @@ import nbformat
 import pytest
 
 from compute_runner import JobSpec
-from compute_runner.bundle import describe, scan, snapshot, snapshot_bundle
+from compute_runner.bundle import bundle_files, bundle_payload, describe, scan, snapshot, snapshot_bundle
 from compute_runner.runtime import _find_bundle, unpack_bundle
 
 from conftest import staged_launcher
@@ -19,8 +19,12 @@ def test_snapshot_is_immutable_and_reused(setup):
     second = client.submit(spec)
     assert first.snapshot["source"]["digest"] == second.snapshot["source"]["digest"]
     spec.source.write_text("raise RuntimeError('changed')")
-    saved = client.config.state_dir / "bundles" / first.snapshot["source"]["digest"] / "files" / "hello.py"
-    assert saved.read_text() == "print('hello')\n"
+    digest = first.snapshot["source"]["digest"]
+    assert bundle_files(client.config.state_dir, digest, ["hello.py"]) == {"hello.py": b"print('hello')\n"}
+    # The archive is the only copy kept.
+    assert [path.name for path in bundle_payload(client.config.state_dir, digest).parent.iterdir()] == [
+        "payload.zip"
+    ]
     assert client.submit(spec).snapshot["source"]["digest"] != first.snapshot["source"]["digest"]
 
 
@@ -114,7 +118,7 @@ def test_notebook_outputs_cleared_without_editing_original(tmp_path):
     )
     nbformat.write(notebook, source)
     bundle = snapshot_bundle(*scan(source, []), tmp_path / "bundles", notebooks=True)
-    saved = nbformat.read(tmp_path / "bundles" / bundle["digest"] / "files" / source.name, as_version=4)
+    saved = nbformat.reads(bundle_files(tmp_path, bundle["digest"], [source.name])[source.name], as_version=4)
     assert saved.cells[0].outputs == []
     assert nbformat.read(source, as_version=4).cells[0].outputs
 
@@ -156,7 +160,8 @@ Path(os.environ['KGR_OUTPUT_DIR'], 'result.txt').write_text(str(VALUE))
     job.upload_refs["input:data"] = backend.ensure_bundle(job.snapshot["inputs"]["data"])
     for key, bundle in [("source", job.snapshot["source"]), ("input:data", job.snapshot["inputs"]["data"])]:
         mount = tmp_path / "input" / job.upload_refs[key].split("/")[1]
-        shutil.copytree(client.config.state_dir / "bundles" / bundle["digest"] / "files", mount)
+        with zipfile.ZipFile(bundle_payload(client.config.state_dir, bundle["digest"])) as archive:
+            archive.extractall(mount)
     script = staged_launcher(backend, job)
     script.write_text(
         script.read_text()
@@ -182,7 +187,8 @@ def test_archive_and_expanded_lookup(tmp_path):
     target.mkdir()
     unpack_bundle(archive, bundle["digest"], target)
     assert (target / "hello.py").read_text() == "print(42)"
-    shutil.copytree(tmp_path / "bundles" / bundle["digest"] / "files", mount, dirs_exist_ok=True)
+    with zipfile.ZipFile(archive) as expanded:
+        expanded.extractall(mount)
     assert (
         _find_bundle("tester/test-bundle", bundle["digest"], input_root=tmp_path / "input")[0] == "directory"
     )
@@ -196,9 +202,9 @@ def test_rejects_tampered_archive(tmp_path):
     source.write_text("original")
     bundle = snapshot_bundle(*scan(source, []), tmp_path / "bundles")
     malicious = tmp_path / "bad.zip"
-    saved = tmp_path / "bundles" / bundle["digest"] / "files"
+    manifest = bundle_files(tmp_path, bundle["digest"], ["kgr-manifest.json"])["kgr-manifest.json"]
     with zipfile.ZipFile(malicious, "w") as z:
-        z.write(saved / "kgr-manifest.json", "kgr-manifest.json")
+        z.writestr("kgr-manifest.json", manifest)
         z.writestr("hello.py", "modified")
         z.writestr("../escape", "bad")
     with pytest.raises(ValueError, match="Unexpected"):

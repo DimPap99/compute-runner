@@ -7,6 +7,7 @@ from types import SimpleNamespace as Obj
 
 import nbformat
 
+from compute_runner.bundle import snapshot_bundle
 from compute_runner.providers.launch import launch_config, write_launcher
 from compute_runner.runtime import json_digest
 
@@ -16,11 +17,12 @@ def test_small_project_embeds_and_runs_with_verified_files(tmp_path):
     records = {
         name: dict(size=len(data), sha256=hashlib.sha256(data).hexdigest()) for name, data in contents.items()
     }
-    digest = json_digest(records)
-    payload = tmp_path / "bundles" / digest / "files"
-    payload.mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
     for name, data in contents.items():
-        (payload / name).write_bytes(data)
+        (project / name).write_bytes(data)
+    digest = snapshot_bundle(project, list(contents), tmp_path / "bundles")["digest"]
+    assert digest == json_digest(records)
     job = Obj(
         id="project",
         snapshot=dict(
@@ -48,10 +50,10 @@ def test_large_notebook_fits_kaggle_limit_and_restores_exact_source(tmp_path):
     payload = base64.b64encode(random.Random(0).randbytes(350_000)).decode()
     notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(f"payload = {payload!r}\n")])
     original = nbformat.writes(notebook).encode()
-    digest = hashlib.sha256(original).hexdigest()
-    files = tmp_path / "bundles" / digest / "files"
-    files.mkdir(parents=True)
-    (files / "notebook.ipynb").write_bytes(original)
+    folder = tmp_path / "project"
+    folder.mkdir()
+    (folder / "notebook.ipynb").write_bytes(original)
+    digest = snapshot_bundle(folder, ["notebook.ipynb"], tmp_path / "bundles")["digest"]
     job = Obj(
         id="large-notebook",
         snapshot=dict(
@@ -62,7 +64,7 @@ def test_large_notebook_fits_kaggle_limit_and_restores_exact_source(tmp_path):
             source=dict(
                 digest=digest,
                 files={
-                    "notebook.ipynb": dict(sha256=digest, size=len(original)),
+                    "notebook.ipynb": dict(sha256=hashlib.sha256(original).hexdigest(), size=len(original)),
                 },
             ),
         ),

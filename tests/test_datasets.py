@@ -11,6 +11,7 @@ import pytest
 import requests
 
 from compute_runner import Account, Client, JobSpec
+from compute_runner.bundle import bundle_files
 from compute_runner.models import input_reference
 from compute_runner.providers import RemoteError
 from compute_runner.providers.kaggle import KaggleProvider
@@ -131,9 +132,9 @@ def test_copying_an_existing_runner_bundle_verifies_and_reuses_payload(two_accou
         return
     assert job.state == "remote_queued"
     assert job.transfers["data"]["digest"] == digest
-    copied = client.config.state_dir / "bundles" / digest / "files"
-    assert (copied / "train.csv").read_text() == other.dataset_files["train.csv"]
-    assert json.loads((copied / MANIFEST).read_text())["files"] == records
+    copied = bundle_files(client.config.state_dir, digest, ["train.csv", MANIFEST])
+    assert copied["train.csv"].decode() == other.dataset_files["train.csv"]
+    assert json.loads(copied[MANIFEST])["files"] == records
 
 
 @pytest.mark.parametrize(

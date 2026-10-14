@@ -31,14 +31,16 @@ class Preparer(Component):
         Completed uploads are kept on the job (upload_refs), so a later cycle continues where
         this one stopped: while the provider processes an upload, or after a passing failure.
         """
+        # A job already preparing keeps its reason and error, such as "Waiting for dataset processing":
+        # resetting them each pass would record two events a cycle while nothing changes.
+        starting = dict(error=None, wait_reason="Preparing private inputs") if job.state == "queued" else {}
         job = self.store.update(
             job.id,
             expected=PENDING,
             state="preparing",
-            error=None,
-            wait_reason="Preparing private inputs",
             suggested_account=None,
             suggested_transfer=False,
+            **starting,
         )
         if job is None:
             return False

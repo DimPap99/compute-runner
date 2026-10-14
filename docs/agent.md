@@ -34,7 +34,7 @@ Agent submissions and retries require `--request-key`. Standard `compute-runner 
 
 A key identifies one intended operation within a state directory. Repeating the same request returns the original batch with `replayed: true`. This holds across concurrent callers, process restarts, and completed runs. Reusing the key with different settings raises an error. Submit and retry operations share the same key namespace.
 
-Keys must match `[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`. The comparison uses normalized workload settings, including paths. It does not compare the current contents of source files. A replay uses the original snapshots even if those files have changed or disappeared. Use a new key to run changed code or intentionally repeat an experiment. Submission receipts do not expire automatically.
+Keys must match `[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`. The comparison uses normalized workload settings, including paths. It does not compare the current contents of source files. A replay uses the original snapshots even if those files have changed or disappeared. Use a new key to run changed code or intentionally repeat an experiment. Submission receipts do not expire. Once a cleanup removes a request's jobs, replaying its key is refused with `use a new key`.
 
 Retries use the original saved files:
 
@@ -53,7 +53,7 @@ A retry of several jobs, or of a batch's jobs in the given states, queues them a
 
 `agent running` lists the runs holding each account's slots: this queue's jobs (`job_id`, `name`, `state`, `elapsed_seconds`, `url`), then runs started elsewhere, which have no `job_id`. `--resource cpu` or `gpu` keeps runs holding that pool, and a discovered run of unknown resource holds both. `discovery` gives each account's check age and error.
 
-`agent cleanup` reports what the runner left behind on each account and in the state directory: `totals` by verdict (`reclaimable`, `kept`, `unknown`), `by_location`, and the reclaimable `items` with the reason each may go. It asks the providers for their listings (`--no-remote` skips them). It never deletes; deleting is the user's decision, with `compute-runner cleanup --delete`.
+`agent cleanup` reports what the runner left behind on each account, in the state directory and in the queue (job records): `totals` by verdict (`reclaimable`, `kept`, `unknown`), `by_location`, and the reclaimable `items` with the reason each may go. It asks the providers for their listings (`--no-remote` skips them). It never deletes; deleting is the user's decision, with `compute-runner cleanup --delete`.
 
 `agent move JOB_ID... --account ID` (or `--batch BATCH_ID`) moves the selected jobs that have not been submitted and returns their status with `moved`. Submitted and finished jobs, and jobs already on that account, stay where they are; `not_moved` lists jobs the target account cannot run. `--transfer` also allows copying datasets the account cannot read, including for jobs already on it. A retry or continuation on the same account keeps that permission; on another account it must be given again.
 
@@ -111,9 +111,9 @@ compute-runner agent logs JOB_ID --refresh
 
 While a submitted job is unfinished, every call reads a live snapshot, and the response has `live: true`. Kaggle stores a session's log only after it ends, so on Kaggle the snapshot comes from its log stream, which replays the log from the start and is read for at most 20 seconds (5 when idle). On an SSH machine it is the end of the run's log file.
 
-For a finished job, the first call fetches the stored log and saves a private local copy. Later calls read that copy unless `--refresh` is supplied or the job has finished since the copy was saved. A failed refresh preserves the existing cache.
+A finished job whose outputs are downloaded is read from the `run.log` in its run folder, without a remote call. For another finished job, the first call fetches the stored log and saves a private local copy. Later calls read that copy unless `--refresh` is supplied, which always fetches into the private copy, or the job has finished since the copy was saved. A failed refresh preserves the existing copy.
 
-The response contains `text`, `bytes`, `total_bytes`, `truncated`, `path`, `fetched`, `cached_at`, and `live`, together with `schema_version` and the job `id`. `path` identifies the full cached log. `cached_at` is its modification time as a Unix timestamp.
+The response contains `text`, `bytes`, `total_bytes`, `truncated`, `path`, `fetched`, `cached_at`, and `live`, together with `schema_version` and the job `id`. `path` is the full log that was read: the run's `run.log` or the private copy. `cached_at` is its modification time as a Unix timestamp.
 
 The default response contains at most 50 lines and 8192 UTF-8 bytes. The maximum permitted limits are 500 lines and 65536 bytes. Lines are split on `\n` only, so carriage-return progress bars count as one line. Byte truncation can leave a partial first line. The size limit applies to the returned text, not the download from the provider. Agent log retrieval does not follow a stream.
 

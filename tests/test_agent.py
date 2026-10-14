@@ -239,7 +239,8 @@ def test_old_queue_migrates_and_legacy_events_are_visible(setup):
 
 def test_bounded_utf8_logs_are_cached_and_failed_refresh_keeps_old_copy(setup):
     client, backend, spec = setup
-    job = client.submit(spec)
+    # Without downloads there is no run.log to read, so the log is fetched and cached.
+    job = client.submit(spec.model_copy(update={"auto_download": False}))
     client.worker().tick()
     backend.remote[client.get(job.id).remote_ref]["state"] = "COMPLETE"
     due(client, job.id)

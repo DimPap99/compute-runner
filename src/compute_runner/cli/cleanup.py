@@ -34,9 +34,10 @@ def cleanup(
     """Report what this runner left behind and what may go; --delete removes it.
 
     Covers only runner-made items: launch notebooks, bundle datasets, SSH run folders and
-    bundles, and the state directory's snapshots, staging folders, uploads and log copies. An
-    item may go once every job using it finished before the cutoff with its outputs downloaded.
-    Remote items this queue did not create are never deleted.
+    bundles, the state directory's snapshots, staging folders, uploads and log copies, and the
+    queue's job records. An item may go once every job using it finished before the cutoff with
+    its outputs downloaded. A job's record goes last, once a check of every account found its
+    remote items may go. Remote items this queue did not create are never deleted.
     """
     planner = Cleanup(
         client(ctx),

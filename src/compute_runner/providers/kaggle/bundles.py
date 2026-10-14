@@ -8,6 +8,7 @@ import time
 
 import requests
 
+from ...bundle import PAYLOAD, bundle_payload
 from ...store import atomic_json
 from .. import RemoteError, classify, http_code, remote_error, short
 from ..base import Artifact
@@ -131,9 +132,9 @@ class BundleDatasets:
         # Kaggle uploads every file of the folder, so the receipts beside it must stay out of it.
         folder = self._folder(digest) / "dataset"
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-        archive = folder / "payload.zip"
+        archive = folder / PAYLOAD
         if not archive.exists():
-            os.link(self.provider.state_dir / "bundles" / digest / "payload.zip", archive)
+            os.link(bundle_payload(self.provider.state_dir, digest), archive)
         description = (
             "Private workload snapshot. Original copyright and license terms in the included files "
             "apply; no additional permissions are granted. SHA256: " + digest

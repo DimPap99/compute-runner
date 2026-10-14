@@ -15,13 +15,15 @@ from datetime import datetime
 from pathlib import Path
 
 from .models import Config, JobRecord, JobSpec
-from .paths import experiment_folder
+from .paths import experiment_folder, run_number
 from .runtime import file_digest, safe_relative
 from .security import redact_secrets
 from .store import atomic_json, atomic_write
 
 logger = logging.getLogger(__name__)
 RUN_RECORD = "job.json"
+# The run's log, beside its outputs.
+RUN_LOG = "run.log"
 INDEX = "runs.md"
 
 
@@ -90,7 +92,7 @@ class OutputSink:
 
     def log(self, text: str) -> None:
         data = redact_secrets(text, strict=self.strict).encode()
-        atomic_write(self.root / "run.log", data, check_space=True, expected_bytes=len(data))
+        atomic_write(self.root / RUN_LOG, data, check_space=True, expected_bytes=len(data))
 
     def saved(self, name: str, target: Path, sha256: str) -> None:
         self.receipts[name] = dict(
@@ -206,8 +208,13 @@ def _cell(value):
 
 
 def write_index(folder: Path, jobs: list[JobRecord]) -> None:
-    """runs.md: one row per run of the experiment, so its params and state are visible at a glance."""
-    runs = {job.id: job.result_dir.name.split("_")[0] for job in jobs}
+    """runs.md: one row per run of the experiment, so its params and state are visible at a glance.
+
+    jobs are the queue's runs of the experiment; the other run folders' job.json give theirs, such
+    as runs whose records cleanup removed.
+    """
+    records = sorted([*map(run_record, jobs), *_other_runs(folder, jobs)], key=lambda record: record["run"])
+    runs = {record["job_id"]: record["folder"].split("_")[0] for record in records}
     lines = [
         f"# {folder.name}",
         "",
@@ -216,12 +223,46 @@ def write_index(folder: Path, jobs: list[JobRecord]) -> None:
         "| Run | State | Params | Outputs | Account | From | Job |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for job in jobs:
-        params = ", ".join(f"{name}={value}" for name, value in job.spec.params.items())
-        parent = runs.get(job.parent_id) or (job.parent_id or "")[:12]
-        row = [job.result_dir.name, job.state, params, job.download_state, job.account, parent, job.id[:12]]
+    for record in records:
+        params = ", ".join(f"{name}={value}" for name, value in record.get("params", {}).items())
+        parent_id = record.get("parent_id") or ""
+        row = [
+            record["folder"],
+            record.get("state", ""),
+            params,
+            record.get("downloads", ""),
+            record.get("account", ""),
+            runs.get(parent_id) or parent_id[:12],
+            record["job_id"][:12],
+        ]
         lines.append("| " + " | ".join(_cell(item) for item in row) + " |")
     atomic_write(folder / INDEX, ("\n".join(lines) + "\n").encode())
+
+
+def _other_runs(folder: Path, jobs: list[JobRecord]) -> list[dict]:
+    """The job.json of run folders in the experiment that are not among jobs."""
+    known = {job.result_dir.name for job in jobs}
+    found = []
+    for path in sorted(folder.iterdir()):
+        if path.name in known or run_number(path.name) is None:
+            continue
+        try:
+            record = json.loads((path / RUN_RECORD).read_text())
+        except (OSError, ValueError):  # Not written yet, or not a run folder of ours.
+            continue
+        if _run_shaped(record):
+            found.append(record)
+    return found
+
+
+def _run_shaped(record) -> bool:
+    """Whether a job.json has the fields a runs.md row needs, as run_record writes them."""
+    return (
+        isinstance(record, dict)
+        and isinstance(record.get("run"), int)
+        and all(isinstance(record.get(key), str) for key in ("job_id", "folder"))
+        and isinstance(record.get("params", {}), dict)
+    )
 
 
 def publish(store) -> None:

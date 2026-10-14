@@ -2,7 +2,7 @@
 
 ## Commands and settings
 
-`compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](accounts.md). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, results folder, dataset copies and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration, where each account's login comes from and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
+`compute-runner account add` connects an account and its local scheduling limits; see [Accounts and failover](accounts.md). `compute-runner init` saves worker-wide settings: the failover policy, polling interval, results folder, dataset copies, [retention](#retention) and [strict mode](#strict-mode). Rerunning either command changes only the options you pass. `compute-runner doctor` checks the local configuration, where each account's login comes from and, for each account, remote quota information and active runs. Use `compute-runner doctor --offline` for local checks only.
 
 The worker runs as a `systemd --user` service, or in a terminal without systemd; local process locking uses `fcntl`. The service must be able to authenticate without an interactive shell, so keep credentials in the [credentials file](accounts.md#credentials) or Kaggle's standard locations. Credentials supplied only through temporary shell variables are not copied into the generated service unit.
 
@@ -35,7 +35,7 @@ Cancelling more than one job asks for confirmation (`--yes` skips it) and lists 
 
 ## Cleanup
 
-Nothing is removed automatically. `compute-runner cleanup` reports what the runner left behind: launch notebooks and bundle datasets on Kaggle, run folders and bundles on SSH machines, and the state directory's snapshots, staging folders, upload folders and log copies. Results folders are never touched.
+Nothing is removed automatically unless [retention](#retention) is on. `compute-runner cleanup` reports what the runner left behind: launch notebooks and bundle datasets on Kaggle, run folders and bundles on SSH machines, the state directory's snapshots, staging folders, upload folders and log copies, and the queue's job records. Results folders are never touched.
 
 ```bash
 compute-runner cleanup                       # report, with sizes and why each item stays or may go
@@ -44,6 +44,19 @@ compute-runner cleanup --older-than 30 --delete
 ```
 
 An item may go once every job using it has finished, more than `--older-than` days ago (default 7), with its outputs downloaded or not wanted. A bundle shared with an unfinished job stays. Remote items this queue did not create are reported as unknown and never deleted, and a run still running on an SSH machine is refused. Local snapshots stay unless `--include-snapshots` is given, because `retry` and `continue` need them. `--delete` asks for confirmation (`--yes` skips it) and deletes only the items reported as reclaimable.
+
+A job's record (kind `record`) goes last, with its launch notebook or run folder and the bundle datasets it used, and only in a cleanup that checked every account: once no record names them, remote items could not be recognized as this queue's again. A record that stays says why, such as `records go only in a cleanup that checks every account`. Removing records also removes their events and download receipts, and gives the space back to the file system. The job then no longer appears in `list` or `status`, and cannot be retried or continued. Its run folder, `job.json` and row in `runs.md` stay, and its run number is never given again. Replaying its request key is refused with `The jobs of request KEY were removed by cleanup; use a new key`.
+
+Versions before 0.6 kept an unpacked copy of every snapshot beside its archive. Cleanup reports those copies (kind `unpacked`) as reclaimable at any age.
+
+### Retention
+
+```bash
+compute-runner init --retention-days 30
+compute-runner service restart
+```
+
+With retention on, the worker does once a day what `compute-runner cleanup --older-than 30 --delete` would do in the state directory: it deletes the local leftovers of jobs that finished more than 30 days ago with their outputs downloaded, and their records. It never deletes remote items, so the record of a job whose notebook or run folder is still on its account stays until `compute-runner cleanup --delete` removes them. Snapshots go once no remaining job uses them. `--retention-days 0` turns retention off, which is the default.
 
 ## Worker configuration
 
@@ -71,8 +84,9 @@ Use `compute-runner worker run` to run in the foreground, or `compute-runner wor
 | Strict mode | Off |
 | Results folder | `results/` beside each workload's code |
 | Dataset copies between accounts | Off |
+| Retention | Off |
 
-Set an account's resource limits through `compute-runner account add`, and failover, polling, strict mode, the results folder, and dataset copies through `compute-runner init`, then restart the worker. Omitted options keep their saved values:
+Set an account's resource limits through `compute-runner account add`, and failover, polling, strict mode, the results folder, dataset copies and retention through `compute-runner init`, then restart the worker. Omitted options keep their saved values:
 
 ```bash
 compute-runner account add kaggle YOUR_KAGGLE_USERNAME --cpu-limit 5 --gpu-limit 1
@@ -85,7 +99,7 @@ The results folder applies to jobs submitted after the change; existing jobs kee
 
 A resource limit of zero pauses launches for that account's pool. CPU and GPU queues are independent, and each account has its own. The worker writes each account's last discovery to `accounts.json` in the state directory. Each discovery also reads the account's GPU quota, and the worker accounts for discovered external runs and quota before admission. On Kaggle, discovery checks only notebooks run within the last 24 hours, which keeps it within Kaggle's rate limits, and reads each active run's own settings once, because Kaggle's notebook listing reports every notebook as CPU. On an SSH machine, it lists the runner's own runs in the work directory. Discovery can be stale, so Kaggle's capacity and quota responses remain authoritative. Local limits do not guarantee available resources or an unlimited CPU allowance.
 
-Dataset preparation, uploads and dataset copies run in the dispatcher and can extend a polling cycle. A copy needs local disk space for about three times the dataset: the download, the snapshot, and its archive. Output downloads run separately.
+Dataset preparation, uploads and dataset copies run in the dispatcher and can extend a polling cycle. A copy needs local disk space for about twice the dataset: the download and its snapshot. Output downloads run separately.
 
 ### Strict mode
 
@@ -145,10 +159,10 @@ Default locations:
 | `~/.config/compute-runner/config.json` | Account and worker configuration, without secrets |
 | `~/.config/compute-runner/credentials.json` | Every account's keys, tokens and passwords; see [Credentials](accounts.md#credentials) |
 | `~/.config/compute-runner/known_hosts` | SSH host keys accepted with `--trust-new-host` |
-| `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, events, run numbers, downloaded-file receipts, and dataset copies |
-| `~/.local/share/compute-runner/bundles/` | Immutable source, input, and dataset-copy snapshots |
+| `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, each job's latest event, run numbers, downloaded-file receipts, and dataset copies |
+| `~/.local/share/compute-runner/bundles/DIGEST/payload.zip` | Immutable source, input, and dataset-copy snapshots, each one archive |
 | `~/.local/share/compute-runner/uploads/DIGEST/` | Kaggle bundle datasets: the files uploaded (`dataset/`) and each account's creation receipts |
-| `~/.local/share/compute-runner/logs/JOB_ID.log` | Agent log cache |
+| `~/.local/share/compute-runner/logs/JOB_ID.log` | Logs fetched from providers; a finished job with downloaded outputs is read from its `run.log` instead |
 | `~/.local/share/compute-runner/accounts.json` | Each account's last run discovery and GPU quota, written by the worker |
 | `~/.local/share/compute-runner/jobs/JOB_ID/` | Staged launch packages and the job's download lock |
 | `~/.local/share/compute-runner/results/JOB_ID/` | Results of jobs saved before run folders |
@@ -163,10 +177,12 @@ Output filters match remote relative paths such as `outputs/*.json`. Logs are co
 
 Execution and download states are separate. `succeeded` means the provider reported completion. `download_state=complete`, exposed as `outputs_ready: true` by the agent interface, means output collection completed. Downloads can be pending or failed after a successful computation.
 
-No automatic cleanup removes notebooks, datasets, SSH run folders, snapshots, logs, or results; `compute-runner cleanup` reports what may go and deletes it on request (see [Cleanup](#cleanup)). Stop the worker before backing up or moving the complete state directory.
+Nothing removes notebooks, datasets, SSH run folders or results automatically, nor snapshots, logs or job records unless [retention](#retention) is on; `compute-runner cleanup` reports what may go and deletes it on request (see [Cleanup](#cleanup)). Stop the worker before backing up or moving the complete state directory.
 
 ### Database upgrades
 
 Version 0.2 upgrades schema version 1 to version 2 by adding batch and request records. Version 0.3 upgrades it to version 3, whose job records name their account. Version 0.4 upgrades it to version 4, adding run numbers, download receipts, and dataset copies. Existing job IDs, events, and snapshots are preserved. Older application versions cannot open the upgraded database.
+
+Version 0.6 keeps schema version 4 and compacts the queue once, when it is first opened: job records keep each input's digest and size rather than its file list, which the snapshot holds, and only each job's latest event is kept. On a large queue that first open takes a few seconds. Older versions can still open the result.
 
 Back up the database before upgrading. To restore an older application version, stop the worker and restore a compatible backup. Preserve any jobs and artifacts created after that backup separately.

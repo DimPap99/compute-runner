@@ -1,4 +1,7 @@
-"""The worker loop: each cycle polls runs, dispatches pending jobs and schedules downloads."""
+"""The worker loop: each cycle polls runs, dispatches pending jobs and schedules downloads.
+
+With retention on, it also deletes old leftovers once a day.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ from .dispatch import Dispatcher
 from .downloads import DownloadScheduler
 from .polling import Poller
 from .preparation import Preparer
+from .retention import Retention
 from .submission import Submitter
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,7 @@ class Worker:
             stop=self.stop_event,
         )
         self.downloads = DownloadScheduler(context)
+        self.retention = Retention(context)
 
     @property
     def discovery(self):
@@ -103,4 +108,5 @@ class Worker:
         self.downloads.schedule()
         publish(self.store)
         self.discoverer.save()
+        self.retention.run_due()
         self.store.heartbeat(state="running", stage="idle")

@@ -7,15 +7,17 @@ import re
 from pathlib import Path
 
 from .models import JobRecord
+from .results import RUN_LOG
 from .store import atomic_write
 
 
 class LogCache:
-    """logs/JOB_ID.log: a run's full log, fetched from its provider only when the copy may be stale.
+    """logs/JOB_ID.log: a run's full log, fetched from its provider only when no current copy exists.
 
-    An unfinished job gets a bounded live snapshot on every read. For a finished job, first
-    use, refresh, or a copy saved before it finished makes one remote read (never follows a
-    stream); other reads work offline. Replacing a copy is atomic, even when the fetch fails.
+    An unfinished job gets a bounded live snapshot on every read. A finished job whose outputs
+    are downloaded is read from its run folder's run.log, which the download saved; otherwise
+    first use, refresh, or a copy saved before it finished makes one remote read (never follows
+    a stream), and other reads work offline. Replacing a copy is atomic, even when the fetch fails.
     """
 
     def __init__(self, client):
@@ -27,12 +29,8 @@ class LogCache:
     def tail(self, job_id: str, *, lines: int, max_bytes: int, refresh: bool = False) -> dict:
         """At most lines lines and max_bytes UTF-8 bytes from the end of a job's log, and the copy's facts."""
         job = self.client.get(job_id)
-        path = self.path(job.id)
         live = job.remote_ref is not None and not job.terminal
-        fetched = refresh or live or self._stale(job, path)
-        if fetched:
-            chunks = (chunk.encode() for chunk in self.client.logs(job.id, follow=False))
-            atomic_write(path, chunks, check_space=True)
+        path, fetched = self._source(job, refresh=refresh or live)
         with path.open("rb") as stream:
             stat = os.fstat(stream.fileno())
             stream.seek(max(0, stat.st_size - max_bytes))
@@ -49,6 +47,19 @@ class LogCache:
             cached_at=stat.st_mtime,
             live=live,
         )
+
+    def _source(self, job: JobRecord, *, refresh: bool) -> tuple[Path, bool]:
+        """The file to read, and whether it was fetched from the provider now."""
+        cached = self.path(job.id)
+        if not refresh and not self._stale(job, cached):
+            return cached, False
+        downloaded = job.result_dir / RUN_LOG
+        # The download saved the whole log once the run ended; fetching it again would keep a second copy.
+        if not refresh and job.download_state == "complete" and downloaded.is_file():
+            return downloaded, False
+        chunks = (chunk.encode() for chunk in self.client.logs(job.id, follow=False))
+        atomic_write(cached, chunks, check_space=True)
+        return cached, True
 
     @staticmethod
     def _stale(job: JobRecord, path: Path) -> bool:

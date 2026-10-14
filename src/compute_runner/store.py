@@ -16,7 +16,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import COLLECTED, MOVABLE, TERMINAL, BatchRecord, Config, JobRecord
+from .models import COLLECTED, MOVABLE, TERMINAL, BatchRecord, Config, JobRecord, slim_snapshot
 from .paths import application_dir, run_folder, run_number
 
 logger = logging.getLogger(__name__)
@@ -103,8 +103,29 @@ def atomic_write(path: Path, data, *, check_space=False, expected_bytes=None):
         temporary.unlink(missing_ok=True)
 
 
+def json_bytes(value) -> bytes:
+    """How the state directory writes JSON files: indented UTF-8."""
+    return json.dumps(value, indent=2, ensure_ascii=False).encode()
+
+
 def atomic_json(path: Path, value):
-    atomic_write(path, json.dumps(value, indent=2, ensure_ascii=False).encode())
+    atomic_write(path, json_bytes(value))
+
+
+def _compact_json(value) -> str:
+    """A record as the queue stores it: compact UTF-8, as pydantic writes it."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def vacuum(db) -> None:
+    """Give the pages freed by deleted rows back to the file system.
+
+    Best effort: it needs the database to itself for a moment, and waits for other connections.
+    """
+    try:
+        db.execute("VACUUM")
+    except sqlite3.OperationalError as error:
+        logger.warning("Could not compact the queue database: %s", error)
 
 
 class Store:
@@ -163,6 +184,29 @@ class Store:
             UPDATE meta SET value='4' WHERE key='schema_version';
             COMMIT;
         """)
+        if db.execute("SELECT 1 FROM meta WHERE key='compacted'").fetchone() is None:
+            Store._compact(db)
+
+    @staticmethod
+    def _compact(db):
+        """Once per queue, slim job records (see slim_snapshot) and keep each job's latest event only.
+
+        Versions before 0.6 stored both in full; the space freed goes back to the file system. Records
+        are edited as JSON, so one this version cannot load is slimmed too. Older versions read the
+        result, so the schema version stays.
+        """
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM meta WHERE key='compacted'").fetchone() is None:
+            for job_id, text in db.execute("SELECT id,record FROM jobs").fetchall():
+                record = json.loads(text)
+                snapshot = record.get("snapshot", {})
+                if (slim := slim_snapshot(snapshot)) is not snapshot:
+                    record["snapshot"] = slim
+                    db.execute("UPDATE jobs SET record=? WHERE id=?", (_compact_json(record), job_id))
+            db.execute("DELETE FROM events WHERE id NOT IN (SELECT MAX(id) FROM events GROUP BY job_id)")
+            db.execute("INSERT INTO meta VALUES ('compacted','1')")
+        db.execute("COMMIT")
+        vacuum(db)
 
     @contextmanager
     def connection(self):
@@ -179,6 +223,11 @@ class Store:
 
     @staticmethod
     def _event(db, job, detail):
+        """Record that a job changed; only its latest event is kept, the only one changes() reads.
+
+        AUTOINCREMENT never reuses an ID, so cursors stay valid after older events go.
+        """
+        db.execute("DELETE FROM events WHERE job_id=?", (job.id,))
         db.execute(
             "INSERT INTO events(job_id,timestamp,state,detail) VALUES(?,?,?,?)",
             (job.id, time.time(), job.state, detail),
@@ -209,6 +258,14 @@ class Store:
         if row:
             if row[1] != fingerprint:
                 raise ValueError("Request key already belongs to a different request; use a new key")
+            removed = db.execute(
+                "SELECT COUNT(*) FROM batch_jobs b LEFT JOIN jobs j ON j.id=b.job_id "
+                "WHERE b.batch_id=? AND j.id IS NULL",
+                (row[0],),
+            ).fetchone()[0]
+            # Replaying would otherwise return an incomplete batch, or tempt a caller to run it again.
+            if removed:
+                raise ValueError(f"The jobs of request {request_key} were removed by cleanup; use a new key")
             return cls._batch(db, row[0], replayed=True)
         return None
 
@@ -416,7 +473,10 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN")
             where, args = self._filters(db, batch_id)
-            high = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+            # The highest ID ever given, which stays when that event's job is removed.
+            high = db.execute(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)"
+            ).fetchone()[0]
             if after > high:
                 raise ValueError(
                     "Cursor is ahead of this queue; use the original state directory or reset to 0"
@@ -456,6 +516,29 @@ class Store:
                 [*states, *collected],
             ).fetchall()
         return [JobRecord.model_validate_json(row[0]) for row in rows]
+
+    def forget(self, job_ids) -> list[str]:
+        """Remove finished jobs' records, events and output receipts; return the IDs removed.
+
+        Their run numbers stay, so a number is never given twice, and so do their batch entries,
+        so replaying their request key is refused rather than run again. See cleanup, "record".
+        """
+        terminal = ",".join("?" * len(TERMINAL))
+        removed = []
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for job_id in job_ids:
+                deleted = db.execute(
+                    f"DELETE FROM jobs WHERE id=? AND state IN ({terminal})", (job_id, *sorted(TERMINAL))
+                ).rowcount
+                if deleted:
+                    db.execute("DELETE FROM events WHERE job_id=?", (job_id,))
+                    db.execute("DELETE FROM outputs WHERE job_id=?", (job_id,))
+                    removed.append(job_id)
+        if removed:
+            with self.connection() as db:
+                vacuum(db)
+        return removed
 
     def counts_by_account(self) -> dict[str, dict[str, int]]:
         """How many jobs each account has in each state: {account: {state: count}}."""

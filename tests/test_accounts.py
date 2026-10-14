@@ -114,9 +114,10 @@ def test_busy_slots_move_only_as_many_jobs_as_the_other_account_can_start(two_ac
         ("kaggle:tester", "queued"),
     ]
     assert placed[2].suggested_account is None and "CPU capacity on kaggle:tester" in placed[2].wait_reason
+    # Only a job's latest event is kept; the moved job waits on the other account's processing.
     with sqlite3.connect(client.store.db) as db:
         events = [row[0] for row in db.execute("SELECT detail FROM events WHERE job_id=?", (jobs[1].id,))]
-    assert "Moved from kaggle:tester: Waiting for CPU capacity on kaggle:tester" in events
+    assert events == ["Waiting for dataset processing"]
 
 
 def test_moved_job_uploads_its_inputs_to_the_new_account(two_accounts, tmp_path):

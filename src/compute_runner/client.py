@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .bundle import describe, snapshot, snapshot_bundle
+from .bundle import bundle_payload, describe, snapshot, snapshot_bundle
 from .models import SSH_PATH, BatchRecord, Config, JobRecord, JobSpec, input_reference
 from .providers import Provider, connect, safe_message
 from .results import experiment_dir, outputs_dir, verified_checkpoint
@@ -344,7 +344,7 @@ class Client:
 
     def _check_saved(self, job):
         for bundle in [job.snapshot["source"], *job.snapshot["inputs"].values()]:
-            if not (self.config.state_dir / "bundles" / bundle["digest"] / "payload.zip").is_file():
+            if not bundle_payload(self.config.state_dir, bundle["digest"]).is_file():
                 raise ValueError("Saved bundle is missing; submit a new workload")
 
     def continue_run(self, job_id, *, request_key: str | None = None, account: str | None = None):

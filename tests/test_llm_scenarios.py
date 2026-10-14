@@ -2,10 +2,10 @@
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace as Obj
 from urllib.parse import urlsplit
@@ -17,6 +17,7 @@ import urllib3
 from typer.testing import CliRunner
 
 from compute_runner import Account, JobSpec
+from compute_runner.bundle import bundle_payload
 from compute_runner.cli import app
 from compute_runner.providers import RemoteError
 from compute_runner.providers.downloads import download_outputs
@@ -122,10 +123,15 @@ def test_llm_submit_monitor_wait_and_read_results(setup, workload, monkeypatch):
         record["job_id"] == train_id and record["state"] == "succeeded" and record["downloads"] == "complete"
     )
 
-    # A finished job's persisted log replaces the live snapshot once, then serves from cache.
+    # A finished job's log is the run.log its download saved: no second copy, no remote read.
     finished_log = command("logs", train_id)
-    assert finished_log["fetched"] and not finished_log["live"] and finished_log["text"] == "example log\n"
-    assert not command("logs", train_id)["fetched"]
+    assert (
+        not finished_log["fetched"] and not finished_log["live"] and finished_log["text"] == "example log\n"
+    )
+    assert finished_log["path"] == str(run_dir / "run.log")
+    # A refresh still reads the provider, into the private cache.
+    refreshed = command("logs", train_id, "--refresh")
+    assert refreshed["fetched"] and refreshed["path"] != finished_log["path"]
 
 
 def test_failed_run_is_diagnosable_and_retry_is_explicit_and_idempotent(setup):
@@ -229,7 +235,10 @@ def test_runtime_outputs_exclude_source_copies_but_keep_new_files(setup, tmp_pat
     job = client.submit(JobSpec(source=project, module="pkg.main"))
     job.upload_refs["source"] = backend.ensure_bundle(job.snapshot["source"])
     mount = tmp_path / "input" / job.upload_refs["source"].split("/")[1]
-    shutil.copytree(client.config.state_dir / "bundles" / job.snapshot["source"]["digest"] / "files", mount)
+    with zipfile.ZipFile(
+        bundle_payload(client.config.state_dir, job.snapshot["source"]["digest"])
+    ) as archive:
+        archive.extractall(mount)
     script = staged_launcher(backend, job)
     working = tmp_path / "working"
     script.write_text(
@@ -339,10 +348,10 @@ def test_log_tail_ignores_carriage_return_progress_bars(setup):
     client, backend, spec = setup
     job = client.submit(spec)
     client.worker().tick()
-    finish(client, backend)
     backend.logs = lambda ref, follow=False: iter(
         ["".join(f"\r{i}%" for i in range(100)) + "\nloss=0.1\nError: boom\n"]
     )
+    finish(client, backend)
     text = client.agent().logs(job.id, tail=3)["text"]
     assert text.startswith("\r0%") and text.endswith("loss=0.1\nError: boom\n")
 

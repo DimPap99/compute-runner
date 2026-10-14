@@ -92,7 +92,7 @@ RESULTS/NAME/
     working/                 other files it left in its working directory
 ```
 
-`job.json` and `runs.md` are regenerated from the queue whenever the job changes; treat them as read-only. A new conversation can find earlier work with `compute-runner agent status`, which lists jobs newest first with their `run_dir`; follow `next_offset` for older ones.
+`job.json` and `runs.md` are regenerated from the queue whenever the job changes; treat them as read-only. A new conversation can find earlier work with `compute-runner agent status`, which lists jobs newest first with their `run_dir`; follow `next_offset` for older ones. Jobs whose records a cleanup removed are no longer listed, but their run folders and `runs.md` rows remain.
 
 ## Observe efficiently
 
@@ -130,4 +130,4 @@ To continue a stopped resumable run, use `compute-runner agent continue JOB_ID -
 
 `compute-runner agent cancel JOB_ID` cancels pending work locally, or asks the provider to stop a running job; several IDs or `--batch BATCH_ID` cancel together, and `not_cancelled` lists any that could not be. The job then shows `reason: Cancellation requested on ACCOUNT` until it becomes `cancelled`, and its partial outputs are still collected. A job still queued on the provider is removed before it starts and becomes `cancelled` at once, with `reason: Cancelled before it started on ACCOUNT`. On Kaggle, a job that is starting but has not logged its session yet cannot be cancelled; try again a few seconds later. The queue starts jobs as capacity becomes available; timed or recurring schedules are not implemented.
 
-`compute-runner agent cleanup` reports what the runner left behind (launch notebooks, bundle datasets, SSH run folders, local staging and snapshots) and what could be deleted, with sizes and reasons. It deletes nothing. When the user wants the space back, tell them to run `compute-runner cleanup --delete`; deleting is their decision.
+`compute-runner agent cleanup` reports what the runner left behind (launch notebooks, bundle datasets, SSH run folders, local staging and snapshots, and old job records) and what could be deleted, with sizes and reasons. It deletes nothing. When the user wants the space back, tell them to run `compute-runner cleanup --delete`; deleting is their decision.
