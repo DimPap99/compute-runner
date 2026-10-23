@@ -17,6 +17,7 @@ Ruff enforces PEP 8 (pycodestyle), bugbear checks, import order and a McCabe com
 | `models.py` | Job specifications and records, and job lifecycle rules (`JobRecord.outstanding`, `movable`, `settled()`, `pool`) |
 | `store.py` | The queue database: transactions, filters, each job's latest event, and removing finished jobs' records |
 | `client.py`, `agent.py` | The Python API, and its bounded JSON form for agents |
+| `credentials.py`, `account_export.py` | The credentials file, and the passphrase-encrypted account exports that move accounts between computers |
 | `views.py`, `logcache.py`, `cleanup.py` | Read views across accounts, the log cache, and cleanup planning |
 | `worker/` | The scheduler, one class per responsibility: `capacity` (the admission rule, shared with the views), `datasets`, `preparation`, `submission`, `polling`, `dispatch`, `downloads`, `retention` (the daily cleanup when `retention_days` is set), and `loop` (the `Worker`) |
 | `providers/` | `base.Provider` and the adapters: `kaggle/` (client, bundles, notebooks, provider) and `ssh.py` with its remote helper `ssh_remote.py` |

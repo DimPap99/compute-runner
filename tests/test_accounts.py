@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from compute_runner import Account, Config
 from compute_runner.cli import app
-from compute_runner.credentials import account_secrets, credentials_path, kaggle_secrets
+from compute_runner.credentials import account_secrets, credentials_path, kaggle_secrets, login_secrets
 from compute_runner.providers import RemoteError
 from compute_runner.providers.kaggle import KaggleProvider, api_class
 
@@ -306,10 +306,10 @@ def test_providers_read_the_credentials_file_before_older_settings(tmp_path, mon
     older = tmp_path / "old.json"
     older.write_text(json.dumps({"username": "alice", "key": "o" * 32}))
     provider = KaggleProvider(Account(user="alice", credentials=older), tmp_path)
-    assert provider._secrets() == {"username": "alice", "key": "o" * 32}
+    assert login_secrets(provider.account) == {"username": "alice", "key": "o" * 32}
     credentials_path().parent.mkdir(parents=True)
     credentials_path().write_text(json.dumps({"kaggle:alice": {"username": "alice", "key": "n" * 32}}))
-    assert provider._secrets()["key"] == "n" * 32
+    assert login_secrets(provider.account)["key"] == "n" * 32
     credentials_path().write_text(json.dumps({"kaggle:alice": {"password": "x"}}))
     with pytest.raises(RemoteError, match="take text fields: key, token, username") as error:
         _ = provider.api

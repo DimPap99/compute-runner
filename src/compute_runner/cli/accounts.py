@@ -9,11 +9,13 @@ from typing import Annotated
 
 import typer
 
+from ..account_export import AccountExport, envelope, exported, install_secrets, seal, unseal
 from ..agent import ERRORS
 from ..credentials import account_secrets, credentials_path, kaggle_secrets, save_secrets
 from ..models import Account
-from ..providers import connect, safe_message
-from ..store import config_path
+from ..providers import RemoteError, connect, safe_message
+from ..providers.ssh import import_host_keys
+from ..store import atomic_write, config_path
 from .common import client, output, save_settings
 from .views import account_list
 
@@ -108,9 +110,9 @@ def _read_file(path: Path, label: str) -> str:
     return path.read_text()
 
 
-def _secret_input(label: str) -> str:
-    """Typed without echo; the prompt goes to stderr, so --json output stays parseable."""
-    value = typer.prompt(label, hide_input=True, err=True).strip()
+def _secret_input(label: str, *, confirm=False) -> str:
+    """Typed without echo, twice to confirm; the prompt goes to stderr, so --json output stays parseable."""
+    value = typer.prompt(label, hide_input=True, confirmation_prompt=confirm, err=True).strip()
     if not value:
         raise ValueError(f"{label} is empty")
     return value
@@ -175,6 +177,20 @@ def _account_values(
     return values
 
 
+def _placed(
+    accounts: list[Account], provider: str, user: str, *, default=False, **options
+) -> tuple[Account, list[Account]]:
+    """The account with options applied over its saved settings (see _account_values), and the
+    accounts with it in place: where it was, else last, or first as the default."""
+    key_id = f"{provider}:{user}".casefold()
+    index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key_id), len(accounts))
+    saved = accounts[index].model_dump() if index < len(accounts) else {}
+    account = Account.model_validate(_account_values(provider, user, saved, **options))
+    others = [a for a in accounts if a.id.casefold() != key_id]
+    others.insert(0 if default else index, account)
+    return account, others
+
+
 def account_add(
     ctx: typer.Context,
     provider: Annotated[str, typer.Argument(help="kaggle or ssh")],
@@ -233,25 +249,19 @@ def account_add(
         if provider == "kaggle"
         else _ssh_secrets(user, key, password_file, enter_password)
     )
-    accounts = client(ctx).config.accounts
-    key_id = f"{provider}:{user}".casefold()
-    index = next((i for i, a in enumerate(accounts) if a.id.casefold() == key_id), len(accounts))
-    saved = accounts[index].model_dump() if index < len(accounts) else {}
-    values = _account_values(
+    account, accounts = _placed(
+        client(ctx).config.accounts,
         provider,
         user,
-        saved,
+        default=default,
         limits=dict(cpu_limit=cpu_limit, gpu_limit=gpu_limit),
         ssh=dict(host=host, port=port, username=login, workdir=workdir, python=python),
         new_secrets=secrets is not None,
     )
-    account = Account.model_validate(values)
     result = dict(account=account.id)
     if secrets is not None:
         result["credentials_file"] = str(save_secrets(account.id, secrets))
-    others = [a.model_dump() for a in accounts if a.id.casefold() != key_id]
-    others.insert(0 if default else index, account.model_dump())
-    config = save_settings(ctx, accounts=others)
+    config = save_settings(ctx, accounts=[a.model_dump() for a in accounts])
     result["accounts"] = [a.id for a in config.accounts]
     if trust_new_host:
         result["host_key"] = connect(account, config).trust_host()
@@ -276,8 +286,91 @@ def account_remove(ctx: typer.Context, account_id: str):
     output(ctx).emit(dict(removed=account.id, accounts=[a.id for a in config.accounts]))
 
 
+def account_export(
+    ctx: typer.Context,
+    path: Annotated[Path, typer.Argument(help="The file to write; it must not exist yet")],
+    account: Annotated[
+        list[str] | None, typer.Option("--account", help="Export only this account; repeatable")
+    ] = None,
+):
+    """Save accounts, their secrets and SSH host keys in a passphrase-encrypted file for account import.
+
+    Accounts that log in with their provider's defaults (~/.kaggle, ssh-agent) are saved without secrets.
+    """
+    path = path.expanduser().absolute()
+    if path.exists():
+        raise ValueError(f"{path} already exists; remove it or choose another file")
+    config = client(ctx).config
+    named = {config.account(name).id for name in account or ()}
+    accounts = [a for a in config.accounts if not named or a.id in named]
+    if not accounts:
+        raise ValueError("No account is configured")
+    # Every secret is read before the passphrase is asked for, so a missing key file fails first.
+    entries = [exported(a) for a in accounts]
+    passphrase = _secret_input("Passphrase to encrypt the export", confirm=True)
+    atomic_write(path, seal(AccountExport(accounts=entries), passphrase))
+    result = dict(file=str(path), accounts=[a.id for a in accounts])
+    if defaults := {e.account.id: _credentials_source(e.account) for e in entries if not e.secrets}:
+        result["without_secrets"] = defaults
+    if unknown := [e.account.id for e in entries if e.account.provider == "ssh" and not e.host_keys]:
+        result["without_host_keys"] = unknown
+    output(ctx).emit(result)
+
+
+def account_import(
+    ctx: typer.Context,
+    path: Annotated[Path, typer.Argument(help="A file written by account export")],
+):
+    """Add or update the accounts of an export, with their secrets and SSH host keys.
+
+    Accounts already here keep their place and ID and take the export's settings; new ones follow them
+    in the export's order. Secrets replace the saved ones, except for accounts exported without secrets.
+    """
+    sealed = envelope(path)
+    export = unseal(sealed, _secret_input("Passphrase of the export"))
+    accounts = client(ctx).config.accounts
+    known = {a.id.casefold() for a in accounts}
+    placed = []
+    for entry in export.accounts:  # All are checked before anything is saved.
+        settings = entry.account
+        ssh = settings.ssh.model_dump(exclude={"key", "password_file"}) if settings.ssh else {}
+        account, accounts = _placed(
+            accounts,
+            settings.provider,
+            settings.user,
+            limits=dict(cpu_limit=settings.cpu_limit, gpu_limit=settings.gpu_limit),
+            ssh=ssh,
+            new_secrets=bool(entry.secrets),
+        )
+        placed.append((account, entry))
+    for account, entry in placed:
+        if entry.secrets:
+            install_secrets(account.id, entry.secrets)
+    config = save_settings(ctx, accounts=[a.model_dump() for a in accounts])
+    ids = [account.id for account, _ in placed]
+    result = dict(
+        added=[i for i in ids if i.casefold() not in known],
+        updated=[i for i in ids if i.casefold() in known],
+        accounts=[a.id for a in config.accounts],
+        credentials_file=str(credentials_path()),
+    )
+    if hosts := {a.id: _trusted(a, e.host_keys) for a, e in placed if a.provider == "ssh"}:
+        result["host_keys"] = hosts
+    output(ctx).emit(result)
+
+
+def _trusted(account: Account, host_keys: dict) -> str:
+    """What became of an imported machine's host keys; a refusal does not stop the import."""
+    try:
+        return "saved" if import_host_keys(account, host_keys) else "already known"
+    except RemoteError as error:
+        return safe_message(error)
+
+
 account_app.command("add")(account_add)
 account_app.command("remove")(account_remove)
+account_app.command("export")(account_export)
+account_app.command("import")(account_import)
 
 
 # Checks ---------------------------------------------------------------------------------------

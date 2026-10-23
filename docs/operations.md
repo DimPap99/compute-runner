@@ -158,7 +158,8 @@ Default locations:
 | --- | --- |
 | `~/.config/compute-runner/config.json` | Account and worker configuration, without secrets |
 | `~/.config/compute-runner/credentials.json` | Every account's keys, tokens and passwords; see [Credentials](accounts.md#credentials) |
-| `~/.config/compute-runner/known_hosts` | SSH host keys accepted with `--trust-new-host` |
+| `~/.config/compute-runner/known_hosts` | SSH host keys accepted with `--trust-new-host` or `account import` |
+| `~/.config/compute-runner/keys/` | SSH private keys saved by `account import`; see [Moving accounts to another computer](accounts.md#moving-accounts-to-another-computer) |
 | `~/.local/share/compute-runner/queue.sqlite3` | Jobs, batches, request receipts, each job's latest event, run numbers, downloaded-file receipts, and dataset copies |
 | `~/.local/share/compute-runner/bundles/DIGEST/payload.zip` | Immutable source, input, and dataset-copy snapshots, each one archive |
 | `~/.local/share/compute-runner/uploads/DIGEST/` | Kaggle bundle datasets: the files uploaded (`dataset/`) and each account's creation receipts |

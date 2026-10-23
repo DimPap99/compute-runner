@@ -7,6 +7,7 @@ bundles, start runs detached from the connection, and report their state. Downlo
 
 from __future__ import annotations
 
+import base64
 import codecs
 import contextlib
 import hashlib
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from .. import runtime
 from ..bundle import PAYLOAD, bundle_payload
-from ..credentials import account_secrets, credentials_path
+from ..credentials import credentials_path, login_secrets
 from ..models import Account, JobRecord, JobSpec
 from ..security import redact_secrets
 from ..store import atomic_json, atomic_write, config_path
@@ -48,8 +49,86 @@ STATES = {"queued", "running", "succeeded", "failed", "cancelled"}
 
 
 def known_hosts_path() -> Path:
-    """Host keys accepted with --trust-new-host, beside the configuration."""
+    """Host keys accepted with --trust-new-host or account import, beside the configuration."""
     return config_path().parent / "known_hosts"
+
+
+def _need_paramiko():
+    if paramiko is None:
+        raise RemoteError("SSH accounts need the ssh extra: pip install 'compute-runner[ssh]'", "invalid")
+
+
+def _host_key_name(settings) -> str:
+    """The machine's name in known_hosts."""
+    return settings.host if settings.port == 22 else f"[{settings.host}]:{settings.port}"
+
+
+def _changed_host_key(name: str) -> RemoteError:
+    return RemoteError(
+        f"The host key of {name} does not match the saved one. If the machine was reinstalled, "
+        "remove its old key from known_hosts and trust it again; otherwise do not connect",
+        "auth",
+        definitive=True,
+    )
+
+
+def _known_host_keys(name: str) -> dict:
+    """The host keys known for a machine, by type: ~/.ssh/known_hosts and the runner's own."""
+    known = paramiko.HostKeys()
+    for path in (Path("~/.ssh/known_hosts").expanduser(), known_hosts_path()):
+        if path.is_file():
+            known.load(str(path))
+    return dict(known.lookup(name) or {})
+
+
+def _remember_host_keys(name: str, keys: dict) -> bool:
+    """Save a machine's host keys unless keys are known for it already; True when saved.
+
+    Known keys must share a type with these and match them: a host key that changed is refused.
+    """
+    saved = _known_host_keys(name)
+    if saved:
+        shared = saved.keys() & keys.keys()
+        if not shared or any(saved[kind] != keys[kind] for kind in shared):
+            raise _changed_host_key(name)
+        return False
+    own = paramiko.HostKeys()
+    path = known_hosts_path()
+    if path.is_file():
+        own.load(str(path))
+    for kind, key in keys.items():
+        own.add(name, kind, key)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    own.save(str(path))
+    path.chmod(0o600)
+    return True
+
+
+def exported_host_keys(account: Account) -> dict[str, str]:
+    """The host keys known for an SSH account's machine as known_hosts writes them: {type: base64}."""
+    _need_paramiko()
+    return {kind: key.get_base64() for kind, key in _known_host_keys(_host_key_name(account.ssh)).items()}
+
+
+def import_host_keys(account: Account, exported: dict[str, str]) -> bool:
+    """Trust host keys from exported_host_keys for an SSH account's machine; True when saved."""
+    _need_paramiko()
+    name = _host_key_name(account.ssh)
+    keys = {}
+    for kind, text in exported.items():
+        try:
+            keys[kind] = paramiko.PKey.from_type_string(kind, base64.b64decode(text, validate=True))
+        except paramiko.pkey.UnknownKeyType:  # Such as DSA, which paramiko 4 no longer reads.
+            continue
+        except (ValueError, paramiko.SSHException) as error:
+            raise RemoteError(f"The exported {kind} host key of {name} is damaged", "invalid") from error
+    if not keys:
+        raise RemoteError(
+            f"No usable host key of {name} was exported. Check its fingerprint, then run: "
+            f"compute-runner account add ssh {account.user} --trust-new-host",
+            "auth",
+        )
+    return _remember_host_keys(name, keys)
 
 
 # NAME:/PATH#FINGERPRINT as resolve_dataset pins it; NAME: and #FINGERPRINT are optional.
@@ -73,8 +152,7 @@ class SshProvider(Provider):
     stop_grace_seconds = 20
 
     def __init__(self, account: Account, state_dir: Path, *, strict=False):
-        if paramiko is None:
-            raise RemoteError("SSH accounts need the ssh extra: pip install 'compute-runner[ssh]'", "invalid")
+        _need_paramiko()
         super().__init__(account, state_dir, strict=strict)
         self.settings = account.ssh
         self._client = None
@@ -86,28 +164,7 @@ class SshProvider(Provider):
 
     @property
     def _host_key_name(self):
-        host, port = self.settings.host, self.settings.port
-        return host if port == 22 else f"[{host}]:{port}"
-
-    def _changed_host_key(self):
-        return RemoteError(
-            f"The host key of {self._host_key_name} does not match the saved one. If the machine "
-            "was reinstalled, remove its old key from known_hosts and trust it again; otherwise "
-            "do not connect",
-            "auth",
-            definitive=True,
-        )
-
-    def _secrets(self):
-        """The credentials file's entry, else the key or password file of an older configuration.
-
-        With neither, the login uses ssh-agent and the default keys in ~/.ssh.
-        """
-        if secrets := account_secrets(self.account.id):
-            return secrets
-        if self.settings.password_file is not None:
-            return {"password": self.settings.password_file.expanduser().read_text().rstrip("\n")}
-        return {"key": str(self.settings.key)} if self.settings.key else {}
+        return _host_key_name(self.settings)
 
     def _connect(self, policy):
         client = paramiko.SSHClient()
@@ -116,7 +173,7 @@ class SshProvider(Provider):
             client.load_host_keys(str(known_hosts_path()))
         client.set_missing_host_key_policy(policy)
         try:
-            secrets = self._secrets()
+            secrets = login_secrets(self.account)  # {}: ssh-agent and the default keys in ~/.ssh.
         except (OSError, ValueError) as error:  # Messages name the file, never its contents.
             raise RemoteError(
                 f"Cannot read the credentials of {self.account.id}: {error}", "auth", definitive=True
@@ -138,7 +195,7 @@ class SshProvider(Provider):
                 auth_timeout=30,
             )
         except paramiko.BadHostKeyException as error:
-            raise self._changed_host_key() from error
+            raise _changed_host_key(self._host_key_name) from error
         except paramiko.AuthenticationException as error:
             raise RemoteError(
                 f"SSH login to {self.settings.username}@{self._host_key_name} was refused; check the key or "
@@ -174,11 +231,7 @@ class SshProvider(Provider):
         The key is read without logging in, so no password or key reaches an unverified host.
         A key that differs from a known one is refused, as on every connection.
         """
-        known = paramiko.HostKeys()
-        for path in (Path("~/.ssh/known_hosts").expanduser(), known_hosts_path()):
-            if path.is_file():
-                known.load(str(path))
-        saved = known.lookup(self._host_key_name) or {}
+        saved = _known_host_keys(self._host_key_name)
         try:
             with socket.create_connection((self.settings.host, self.settings.port), timeout=30) as sock:
                 transport = paramiko.Transport(sock)
@@ -195,17 +248,7 @@ class SshProvider(Provider):
                     transport.close()
         except TRANSPORT_ERRORS as error:
             raise RemoteError(f"Cannot read the host key of {self._host_key_name}: {error}") from error
-        if saved and saved.get(key.get_name()) != key:
-            raise self._changed_host_key()
-        if not saved:
-            own = paramiko.HostKeys()
-            path = known_hosts_path()
-            if path.is_file():
-                own.load(str(path))
-            own.add(self._host_key_name, key.get_name(), key)
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            own.save(str(path))
-            path.chmod(0o600)
+        _remember_host_keys(self._host_key_name, {key.get_name(): key})
         return key.fingerprint
 
     def _exec(self, command, *, timeout=COMMAND_SECONDS):

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from ...credentials import account_secrets, credentials_path, kaggle_secrets
+from ...credentials import credentials_path, login_secrets
 from ...models import Account, JobRecord, JobSpec
 from ...security import redact_secrets
 from ...store import atomic_json
@@ -52,14 +52,6 @@ class KaggleProvider(Provider):
 
     # Authentication ---------------------------------------------------------------------------
 
-    def _secrets(self):
-        """The credentials file's entry, else an older per-account file, else Kaggle's discovery."""
-        if secrets := account_secrets(self.account.id):
-            return secrets
-        if self.account.credentials is not None:
-            return kaggle_secrets(self.account.credentials.expanduser().read_text())
-        return None
-
     @property
     def api(self):
         if self._api is None:
@@ -68,11 +60,11 @@ class KaggleProvider(Provider):
 
     def _authenticate(self):
         try:
-            secrets = self._secrets()
+            secrets = login_secrets(self.account)
         except (OSError, ValueError) as error:  # Messages name the file, never its contents.
             raise RemoteError(f"Cannot read the credentials of {self.account.id}: {error}", "auth") from error
         try:
-            api = api_class(secrets)()
+            api = api_class(secrets or None)()  # None: Kaggle's own discovery.
             with quiet():
                 api.authenticate()
         except (SystemExit, Exception) as error:

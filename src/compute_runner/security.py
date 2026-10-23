@@ -27,6 +27,8 @@ SECRET_FILE_NAMES = {
     "service-account.json",
 }
 SECRET_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx", ".tfstate"}
+# The format field of an account export (see account_export), which never enters a bundle either.
+ACCOUNT_EXPORT_FORMAT = "compute-runner-accounts"
 
 _SECRET_ENV_NAME = re.compile(
     r"(?:^|[_-])(?:API[_-]KEY|AUTH|CREDENTIALS?|KEY|PASSWORD|PASSWD|PRIVATE[_-]KEY|SECRET|TOKEN)(?:$|[_-])"
@@ -44,6 +46,7 @@ _SECRET_PATTERNS = (
             rb"(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)?"
         ),
     ),
+    ("account export", re.compile(rb'"format"\s*:\s*"' + ACCOUNT_EXPORT_FORMAT.encode() + rb'"')),
     ("Kaggle token", re.compile(rb"(?i)(?<![A-Za-z0-9])KGAT_[A-Za-z0-9._~+/=-]{12,}")),
     ("Kaggle API key", re.compile(rb"(?i)KAGGLE_KEY\s*[:=]\s*['\"]?[0-9a-f]{32}")),
     ("AWS access key", re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")),

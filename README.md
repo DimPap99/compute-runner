@@ -35,7 +35,7 @@ compute-runner doctor                                                    # check
 compute-runner service install                                           # start the background worker
 ```
 
-Keys, tokens and passwords are kept in one private file, `~/.config/compute-runner/credentials.json`, which never leaves your machine. See [Accounts and failover](docs/accounts.md) and [SSH machines](docs/ssh.md).
+Keys, tokens and passwords are kept in one private file, `~/.config/compute-runner/credentials.json`, which never leaves your machine. `compute-runner account export` and `account import` move your accounts to another computer in a passphrase-encrypted file. See [Accounts and failover](docs/accounts.md) and [SSH machines](docs/ssh.md).
 
 ## Quick start
 
@@ -68,7 +68,7 @@ Any agent that can run shell commands can drive `compute-runner agent`, which pr
 
 | Guide | Contents |
 | --- | --- |
-| [Accounts and failover](docs/accounts.md) | Connecting accounts, the credentials file, failover between accounts, datasets across accounts |
+| [Accounts and failover](docs/accounts.md) | Connecting accounts, the credentials file, moving accounts to another computer, failover between accounts, datasets across accounts |
 | [SSH machines](docs/ssh.md) | Running on your own machines, and how they differ from Kaggle |
 | [Workloads](docs/workloads.md) | Workload YAML and submit options, packaging and runtime, resumable training |
 | [Results](docs/results.md) | Run folders, `job.json` and `runs.md` |

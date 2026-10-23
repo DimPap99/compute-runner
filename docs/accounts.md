@@ -52,7 +52,24 @@ Every account's secrets live in one file, `~/.config/compute-runner/credentials.
 }
 ```
 
-The file is created readable by you alone and never leaves this machine: it is not uploaded, stored with jobs, logged, or shown in any response, and `account remove` deletes the account's entry. An account without an entry uses its provider's defaults: Kaggle's `~/.kaggle` and `KAGGLE_*` variables, or ssh-agent and the keys in `~/.ssh`. Configurations from earlier versions that name a credentials, key or password file keep working until `account add` saves new secrets for the account. `compute-runner doctor --offline` shows where each account's login comes from, without the secrets.
+The file is created readable by you alone and never leaves this machine, except in an [encrypted export](#moving-accounts-to-another-computer) you make: it is not uploaded, stored with jobs, logged, or shown in any response, and `account remove` deletes the account's entry. An account without an entry uses its provider's defaults: Kaggle's `~/.kaggle` and `KAGGLE_*` variables, or ssh-agent and the keys in `~/.ssh`. Configurations from earlier versions that name a credentials, key or password file keep working until `account add` saves new secrets for the account. `compute-runner doctor --offline` shows where each account's login comes from, without the secrets.
+
+## Moving accounts to another computer
+
+`account export` saves accounts, their secrets and the SSH host keys this computer trusts in one file, encrypted with a passphrase you choose. `account import` adds them on another computer:
+
+```bash
+compute-runner account export ~/accounts.export                    # every account; asks for a passphrase twice
+compute-runner account export ~/lab.export --account ssh:lab       # only some accounts; repeatable
+compute-runner account import ~/accounts.export                    # on the other computer
+compute-runner service restart                                     # if a worker runs there
+```
+
+The export holds each account's settings and its secrets, whether they are in the credentials file or in files an older configuration names. An SSH key travels as the key file itself; import saves it as `~/.config/compute-runner/keys/ssh-NAME`, readable by you alone, and `account remove` deletes it. The machines' host keys, from `~/.ssh/known_hosts` or the runner's own `known_hosts`, are trusted on the other computer too, so it needs no `--trust-new-host`. Accounts that log in with their provider's defaults (`~/.kaggle`, `KAGGLE_*`, ssh-agent or the keys in `~/.ssh`) are exported without secrets and listed under `without_secrets`: set up those defaults on the other computer, or add the secrets there with `account add`. Worker-wide settings from `init` are not exported.
+
+Import adds the accounts the computer does not have, after its own and in the export's order. An account it already has keeps its place and ID, and takes the export's settings and secrets; one exported without secrets keeps the secrets it has. A machine whose host key the computer already knows keeps that key, and if the keys differ, `host_keys` says so and the account's key is not changed. Importing the same file again changes nothing.
+
+The file is encrypted with AES-256-GCM under a key derived from the passphrase with scrypt, so a wrong passphrase or a damaged file is refused. Anyone with both the file and the passphrase can use your accounts: choose a long passphrase (at least 8 characters), keep the file private, and delete it once it is imported. It is written readable by you alone, and a submission whose source or inputs contain it is refused, as for any credential.
 
 ## Datasets across accounts
 

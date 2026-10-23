@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .models import Account
 from .store import atomic_json, config_path
 
 FIELDS = {"kaggle": {"username", "key", "token"}, "ssh": {"key", "password", "passphrase"}}
@@ -49,18 +50,40 @@ def account_secrets(account_id: str) -> dict:
     return found
 
 
+def imported_key_path(account_id: str) -> Path:
+    """Where account import keeps an SSH account's private key: beside the credentials file."""
+    return credentials_path().parent / "keys" / account_id.casefold().replace(":", "-")
+
+
 def save_secrets(account_id: str, secrets: dict | None) -> Path:
-    """Replace one account's secrets; None forgets them. The file is readable by this user only."""
+    """Replace one account's secrets; None forgets them. The file is readable by this user only.
+
+    A key that account import saved for the account is deleted once its secrets no longer name it.
+    """
     saved = _load()
     data = {key: value for key, value in saved.items() if key.casefold() != account_id.casefold()}
     if secrets:
         data[account_id] = secrets
     path = credentials_path()
-    if data == saved:
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    atomic_json(path, data)
+    if data != saved:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_json(path, data)
+    imported = imported_key_path(account_id)
+    if (secrets or {}).get("key") != str(imported):
+        imported.unlink(missing_ok=True)
     return path
+
+
+def login_secrets(account: Account) -> dict:
+    """The secrets an account logs in with: its credentials file entry, else the key, password or
+    credentials file an older configuration names; {} when the provider's defaults apply."""
+    if secrets := account_secrets(account.id):
+        return secrets
+    if account.credentials is not None:
+        return kaggle_secrets(account.credentials.expanduser().read_text())
+    if account.ssh and account.ssh.password_file is not None:
+        return {"password": account.ssh.password_file.expanduser().read_text().rstrip("\n")}
+    return {"key": str(account.ssh.key)} if account.ssh and account.ssh.key else {}
 
 
 def kaggle_secrets(text: str) -> dict:

@@ -23,7 +23,7 @@ from typer.testing import CliRunner
 from compute_runner import Account, Client, Config, JobSpec
 from compute_runner.bundle import snapshot_bundle
 from compute_runner.cli import app
-from compute_runner.credentials import account_secrets, credentials_path
+from compute_runner.credentials import account_secrets, credentials_path, login_secrets
 from compute_runner.models import SshSettings, input_reference
 from compute_runner.providers import Artifact, RemoteError, ssh_remote
 from compute_runner.providers.ssh import HELPER, SshProvider
@@ -679,10 +679,10 @@ def test_logins_use_the_credentials_file_then_an_older_password_file(lab, tmp_pa
     password.write_text("older\n")
     settings = lab.machine.settings.model_copy(update={"password_file": password})
     machine = SshProvider(lab.machine.account.model_copy(update={"ssh": settings}), lab.tmp)
-    assert machine._secrets() == {"password": "older"}
+    assert login_secrets(machine.account) == {"password": "older"}
     credentials_path().parent.mkdir(parents=True, exist_ok=True)
     credentials_path().write_text(json.dumps({"ssh:lab": {"key": "~/.ssh/lab", "passphrase": "p"}}))
-    assert machine._secrets() == {"key": "~/.ssh/lab", "passphrase": "p"}
+    assert login_secrets(machine.account) == {"key": "~/.ssh/lab", "passphrase": "p"}
     credentials_path().write_text("{broken")
     with pytest.raises(RemoteError, match="not valid JSON") as error:
         machine._connect(None)
